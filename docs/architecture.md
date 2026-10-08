@@ -29,6 +29,28 @@ IPC (`qs -c friday ipc call friday <fn>`): `toggle`, `show`, `hide`, `ask <text>
 
 `CLAUDE.md` is Friday's operating manual. It imports `me.md` (private), `device-profile.md` and `memory/notes.md`.
 
+## Voice (`brain/voice/friday_voice.py`, via `friday-voice`)
+
+A child process of the shell, speaking JSON lines over stdio, so the UI and the audio never block each other.
+
+```
+pw-record 16 kHz ─▶ IDLE: Vosk (Indian English) grammar ["hey friday", "okay friday", "hi friday", "friday"]
+   ─(hit)─▶ Whisper small.en re-reads the last 2 s, silently ─(really you)─▶ chime + panel, LISTEN
+            (nothing is shown until it's confirmed; audio keeps buffering, so "Friday, open Chrome" in one breath works)
+LISTEN: Vosk partials, then Whisper re-reading every ~1.2 s → "partial" events (live words)
+        raw-mic RMS vs a percentile noise floor → ends after 1.1 s of quiet
+     ─▶ Whisper small.en (beam 5, vocabulary prompt) → "final" → Brain.ask(text) with FRIDAY_VOICE=1
+answer streams in ─▶ each block's first paragraph ─▶ "say+" ─▶ Piper, clause by clause with real pauses
+     ─▶ pacat; a "word" event as each word is heard (word-by-word highlight) ─▶ listens again for a follow-up
+```
+
+The mic is ignored while Friday speaks (and doesn't move the automatic gain), so it never wakes itself.
+
+Events: `hello`, `ready`, `unavailable`, `muted`, `prewake`, `wake`, `level`, `partial`, `transcribing`, `final`, `cancel`, `speaking`, `words`, `word`, `error`.
+Commands: `listen [followup]`, `cancel`, `stop`, `mute`, `unmute`, `say <json>`, `say+ <json>`, `say-end`, `quit`.
+Models live in `brain/.voice/`, the Python env in `brain/.venv/` (both git-ignored, created by `friday-voice-setup`).
+Debug log: `brain/.voice/voice.log` (set `FRIDAY_VOICE_DEBUG=1` for every wake-word guess).
+
 ## 3. The ii hooks (`friday-integrate`)
 
 Small, marked insertions into illogical-impulse:

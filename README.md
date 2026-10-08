@@ -15,9 +15,11 @@ Built for **Arch + Hyprland + [illogical-impulse](https://github.com/end-4/dots-
 | **Knows what you're doing** | The focused app, workspace, media, battery, Wi-Fi and clipboard shape its suggestions ("Explain the error on my screen" in a terminal, "Summarize this page" in a browser). |
 | **Sees your screen** | Takes a screenshot when you ask "what's this?" and reasons about what's actually there. |
 | **Acts, not just answers** | Opens apps, tabs and searches in your browser, arranges windows, controls media and volume, sets reminders, runs focus sessions, reads logs, inspects repos. |
+| **Talk to it** | <kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>Space</kbd> (or "Hey Friday" when you switch the wake word on). Your words appear live, Whisper turns them into an accurate request, and Friday answers out loud. Say "Friday" or "Hey Friday". By voice it's conversational (short and casual for small talk, calm and focused for real work); typed, it's regular Claude. After it answers it keeps listening for a few seconds so you can just keep talking, "thanks" / "never mind" work like you'd expect, and it gets out of the way when you're done. Approval cards take a spoken "yes" / "no". 100% local. |
 | **Writing tools** | Highlight text anywhere and press <kbd>Super</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> to explain, summarize, proofread, rewrite, make it professional, or translate. |
 | **Made for one person** | A greeting and one status line about your world, plus rows for what you actually do: jump back into your latest Claude Code sessions (auto-titled like *Continue Friday Overlay Polish*, with project and time) right where you left them, see what's on your connected phone (adb/fastboot), or start a 90-minute deep-work block. |
-| **One-tap music** | A row split five ways: House · Afro · Fred · Techno · Chill. Pick one (← → or click) and a long mix starts in your browser, controllable from the bar. |
+| **One-tap music** | A row split five ways: House · Afro · Fred · Techno · Chill. Pick one (← → or click) and a long mix starts playing: in the background with `mpv` + `yt-dlp` if you have them (`sudo pacman -S mpv yt-dlp mpv-mpris`), otherwise the first YouTube result opens already playing. "Play some Fred again" works too. |
+| **Uses your mouse and keyboard** | For apps with no command line, Friday looks at the screen, clicks and types (`friday-input`, needs `wtype` for typing and `ydotool` or `wlrctl` for clicks). Moving and scrolling are free; every click or keystroke shows an approval card unless you set `FRIDAY_INPUT_TRUST=1`. |
 | **Deep work** | A live countdown card with a progress ring, plus a notification when you're done. |
 | **Safe by design** | Every action passes a policy hook: read-only runs silently, changes need your approval, and `sudo` or disk-wiping commands are refused. All of it is logged. |
 | **Claude limits in your bar** | Your 5-hour and weekly plan usage appear as rings next to CPU and RAM. The ring is usage; the dot is how far through the window you are. |
@@ -48,18 +50,37 @@ Edit **`brain/me.md`** to tell Friday who you are. It's git-ignored, as are your
 
 To remove everything cleanly: `./uninstall.sh`.
 
+### Voice (optional, one command)
+
+```bash
+~/.local/share/friday/bin/friday-voice-setup     # ~700 MB of local models, one time
+pkill -f "qs -c friday"; qs -c friday -d
+~/.local/share/friday/bin/friday-voice --test    # say something; it should repeat it back
+```
+
+| Piece | What | Why |
+|---|---|---|
+| Wake word | [Vosk](https://alphacephei.com/vosk/) small **Indian-English** model, grammar locked to "hey friday", then Whisper confirms it was really you before anything shows | off by default (toggle **Hey Friday** in Friday's footer); when on it costs a few % of one core, and the double check kills most false wakes |
+| Live words | Vosk streaming partials, corrected by Whisper every ~1 s | what you see while talking is what gets sent |
+| Final transcript | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `small.en` (int8 on CPU, float16 on CUDA), biased with your own vocabulary | accurate on accents and jargon (Hyprland, PixelOS, fastboot…) |
+| Voice | [Piper](https://github.com/OHF-Voice/piper1-gpl) `en_GB-jenny_dioco-medium` | natural, fast, offline; pauses at commas and full stops, and each word lights up as you hear it |
+
+Tune it in `brain/config.env` (model size, voice, silence before it stops listening, wake word on/off).
+
 ## Keys
 
 | Key | Action |
 |---|---|
 | <kbd>Super</kbd>+<kbd>Space</kbd> | Open / close Friday |
 | <kbd>Super</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> | Friday on your highlighted text |
+| "Hey Friday" · <kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>Space</kbd> · <kbd>Ctrl</kbd>+<kbd>M</kbd> | Talk to Friday |
 | <kbd>↑</kbd> <kbd>↓</kbd> · <kbd>↵</kbd> | Pick a suggestion · run it / send |
-| <kbd>Ctrl</kbd>+<kbd>N</kbd> | New chat (the old one stays one row away as *Continue*) |
+| <kbd>Ctrl</kbd>+<kbd>N</kbd> | New chat (closing Friday also ends the chat) |
+| <kbd>Ctrl</kbd>+<kbd>H</kbd> | History: your last 10 chats; type to filter, <kbd>↵</kbd> to continue one, <kbd>Del</kbd> to remove, or *Clear history* |
 | <kbd>↵</kbd> / <kbd>Esc</kbd> on an approval | Allow / don't allow (high-risk needs <kbd>Ctrl</kbd>+<kbd>↵</kbd>) |
 | <kbd>Esc</kbd> | Clear input → clear selection → close |
 
-Coming back after more than 3 minutes starts a fresh chat automatically.
+Every time you close Friday the chat is filed into History, so it always opens fresh; your last chat is one row away as *Continue*.
 
 ## Layout
 
