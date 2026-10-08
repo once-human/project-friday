@@ -13,3 +13,7 @@ __pycache__/
 *.bak-*
 *.swp
 .DS_Store
+
+# Voice: local env + models (friday-voice-setup recreates them)
+brain/.venv/
+brain/.voice/
