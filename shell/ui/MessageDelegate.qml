@@ -11,6 +11,32 @@ Item {
     required property string body
     required property string stepsJson
     required property bool done
+    required property string spokenJson
+
+    // live speech: what Friday says out loud, sentence by sentence, lit up as you hear it
+    readonly property var spoken: {
+        if (!spokenJson) return null;
+        try { return JSON.parse(spokenJson); } catch (e) { return null; }
+    }
+    readonly property bool live: Brain.speakingMsg === index
+    // word by word: what's been said is solid, the word you're hearing glows, the rest waits its turn
+    readonly property string karaoke: {
+        if (!d.spoken || !d.spoken.words || d.spoken.words.length === 0) return "";
+        const cur = d.live ? Brain.spokenIdx : 99999;
+        const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        return d.spoken.words.map((w, i) => {
+            const c = i < cur ? Theme.text : (i === cur ? Theme.accent : Theme.textTertiary);
+            return '<span style="color:' + c + '">' + esc(w) + "</span>";
+        }).join(" ");
+    }
+    // everything that wasn't spoken (details, code, lists) stays as normal formatted text below
+    readonly property string rest: {
+        let b = d.body;
+        // only cut the spoken paragraphs out once they're actually being shown as speech
+        const r = (d.karaoke.length > 0 && d.spoken.ranges) ? d.spoken.ranges : [];
+        for (let k = r.length - 1; k >= 0; k--) b = b.slice(0, r[k][0]) + b.slice(r[k][1]);
+        return b.trim();
+    }
 
     readonly property bool isUser: role === "user"
     readonly property bool isLast: ListView.view ? index === ListView.view.count - 1 : false
@@ -164,12 +190,24 @@ Item {
             }
         }
 
+        // ---------------------------------------------------------------- what Friday said out loud
+        Text {
+            visible: !d.isUser && d.karaoke.length > 0
+            Layout.fillWidth: true
+            text: d.karaoke
+            textFormat: Text.RichText
+            wrapMode: Text.Wrap
+            font.family: Theme.sans
+            font.pixelSize: 16
+            lineHeight: 1.4
+        }
+
         // ---------------------------------------------------------------- the answer
         Text {
-            visible: !d.isUser && d.body.length > 0
+            visible: !d.isUser && (d.karaoke.length > 0 ? d.rest.length > 0 : d.body.length > 0)
             Layout.fillWidth: true
             // headings read as shouting in a small panel: render them as bold lines
-            text: d.body.replace(/^#{1,6}\s+(.+)$/gm, "**$1**")
+            text: (d.karaoke.length > 0 ? d.rest : d.body).replace(/^#{1,6}\s+(.+)$/gm, "**$1**")
             textFormat: Text.MarkdownText
             wrapMode: Text.Wrap
             color: Theme.text
