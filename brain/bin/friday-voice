@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# friday-voice          : the voice daemon (started and owned by the Friday shell)
+# friday-voice --test       : record 5 s, transcribe, say it back (checks mic, models, speaker)
+# friday-voice --wake-test  : 45 s live view of the wake word: levels, what it hears, accept/reject
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export FRIDAY_HOME="$HERE"
+[ -f "$HERE/config.env" ] && set -a && . "$HERE/config.env" && set +a
+PY="$HERE/.venv/bin/python"
+if [ ! -x "$PY" ]; then
+  echo '{"ev":"unavailable","reason":"Voice is not set up yet. Run friday-voice-setup."}'
+  [ "$1" = "--test" ] && { echo "Run: $HERE/bin/friday-voice-setup" >&2; exit 1; }
+  # stay quiet and alive so the shell doesn't restart-loop us
+  exec cat >/dev/null
+fi
+case "${1:-}" in
+  --test|--wake-test) exec "$PY" -u "$HERE/voice/friday_voice.py" "$@" ;;
+esac
+# daemon: keep a small log of what it hears / rejects (tail -f ~/.local/share/friday/.voice/voice.log)
+LOG="$HERE/.voice/voice.log"
+[ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 1000000 ] && mv -f "$LOG" "$LOG.1"
+exec "$PY" -u "$HERE/voice/friday_voice.py" "$@" 2>>"$LOG"
