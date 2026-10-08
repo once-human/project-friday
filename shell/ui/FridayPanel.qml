@@ -48,6 +48,16 @@ PanelWindow {
         { k: "techno", t: "Techno" },
         { k: "chill", t: "Chill" }
     ]
+    // changes once a minute, not every tick, so the rows don't rebuild under your cursor
+    readonly property int minuteTick: Math.floor(Brain.now / 60000)
+    function ago(epochSec) {
+        const s = Math.max(0, Math.round(win.minuteTick * 60 - epochSec));
+        if (s < 60) return "just now";
+        if (s < 3600) return Math.floor(s / 60) + "m ago";
+        if (s < 86400) return Math.floor(s / 3600) + "h ago";
+        if (s < 172800) return "yesterday";
+        return Math.floor(s / 86400) + "d ago";
+    }
     // one quiet line about your world, most useful first
     readonly property string statusLine: {
         const p = [];
@@ -139,10 +149,6 @@ PanelWindow {
         }
         if (Brain.resumable)
             out.push({ kind: "resume", icon: "history", title: Brain.archived.title, hint: "Continue", accent: false });
-        if (win.cx.media && win.cx.media.title)
-            out.push({ kind: "media", icon: win.cx.media.status === "Playing" ? "pause" : "play_arrow",
-                       title: win.cx.media.title, hint: win.cx.media.artist ? win.cx.media.artist : "Now playing", accent: false });
-        out.push({ kind: "vibes", icon: "graphic_eq", title: "Music", hint: "", accent: false });
         if (win.cx.clip && win.cx.clip.preview)
             out.push({ kind: "clip", icon: win.cx.clip.kind === "image" ? "image" : "content_paste",
                        title: win.cx.clip.kind === "image" ? "What's in the image I copied?" : "Work with what I copied",
@@ -154,21 +160,22 @@ PanelWindow {
                            ? "My phone is in fastboot. Run `fastboot devices` and `fastboot getvar all`, tell me its state (slot, unlocked, current partition info) and what I can do from here. Don't flash anything."
                            : "My phone is connected over adb. Tell me what's on it right now: model, Android version and build fingerprint, ROM name/version, battery, storage, and anything off in the last few minutes of logcat errors. Don't change anything." });
         for (let c = 0; c < win.contextual.length && out.length < 4; c++) out.push(all[c]);
-        const repos = win.cx.repos ? win.cx.repos : [];
-        for (let r = 0; r < repos.length && r < 2; r++)
-            out.push({ kind: "ask", icon: "folder_code", accent: false,
-                       title: "Pick up " + repos[r].name,
-                       hint: (repos[r].dirty > 0 ? repos[r].dirty + " changed  ·  " : "") + repos[r].ago,
-                       prompt: "Catch me up on " + repos[r].path + ": what changed recently, what's uncommitted, and what I was in the middle of. Then the single next thing I should do. Don't commit anything." });
-        if (win.cx.rom)
-            out.push({ kind: "ask", icon: "android", accent: win.cx.rom.building,
-                       title: win.cx.rom.building ? "PixelOS build is running: how's it going?" : "Check on my PixelOS build",
-                       hint: "sky",
-                       prompt: "Check my PixelOS build in " + win.cx.rom.dir + ": is a build running, how far along, and if the last one failed, find the actual first error in the logs (out/error.log, soong/ninja logs) and tell me the fix. Don't start or stop builds." });
+        const ss = Brain.sessions ? Brain.sessions : [];
+        for (let r = 0; r < ss.length && r < 3; r++)
+            out.push({ kind: "session", icon: "terminal", accent: r === 0, session: ss[r],
+                       title: ss[r].named ? "Continue " + ss[r].title : ss[r].title,
+                       hint: ss[r].project + "  ·  " + win.ago(ss[r].last) });
         if (!Brain.focusActive)
             out.push({ kind: "focus", icon: "timer", title: "Deep work: 90 minutes, no distractions", hint: "", accent: false });
-        for (let m = win.contextual.length; m < all.length && out.length < 8; m++) out.push(all[m]);
-        return out.slice(0, 8);
+        for (let m = win.contextual.length; m < all.length && out.length < 7; m++) out.push(all[m]);
+        // music lives at the bottom: what's playing, then the five vibes
+        const playing = win.cx.media && win.cx.media.title;
+        const top = out.slice(0, playing ? 6 : 7);
+        if (playing)
+            top.push({ kind: "media", icon: win.cx.media.status === "Playing" ? "pause" : "play_arrow",
+                       title: win.cx.media.title, hint: win.cx.media.artist ? win.cx.media.artist : "Now playing", accent: false });
+        top.push({ kind: "vibes", icon: "graphic_eq", title: "Music", hint: "", accent: false });
+        return top;
     }
     onRowsChanged: if (win.sel > win.rows.length - 1) win.sel = Math.max(0, win.rows.length - 1)
 
@@ -178,7 +185,8 @@ PanelWindow {
         else if (r.kind === "media") Brain.act("media-toggle");
         else if (r.kind === "vibes") { Brain.playVibe(win.vibes[win.vibeSel].k); return; }
         else if (r.kind === "clip") Brain.useClipboard(r.clipKind);
-        else if (r.kind === "focus") Brain.startFocus(90, win.cx.repos && win.cx.repos.length > 0 ? "Deep work on " + win.cx.repos[0].name : "Deep work");
+        else if (r.kind === "session") Brain.continueSession(r.session);
+        else if (r.kind === "focus") Brain.startFocus(90, Brain.sessions && Brain.sessions.length > 0 ? "Deep work on " + Brain.sessions[0].project : "Deep work");
         else if (r.kind === "sel") {
             const sel = Brain.selection;
             const label = r.title + "\n“" + (sel.length > 90 ? sel.slice(0, 90) + "…" : sel) + "”";

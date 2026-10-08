@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Your most recent Claude Code sessions (terminal, desktop Code tab), nicely named.
+
+  friday-sessions [-n 3]   JSON: [{id, cwd, project, title, named, last, first}]
+  friday-sessions --name   give the newest unnamed sessions a short title with a fast model (cached)
+  friday-sessions --debug  human-readable
+
+Reads ~/.claude/projects/*/*.jsonl locally. claude.ai / Claude Desktop *chats* aren't stored on disk,
+so they can't appear here. Friday's own chats are skipped (they have their own Continue row).
+"""
+import glob, json, os, re, subprocess, sys, time
+sys.dont_write_bytecode = True
+
+HOME = os.path.expanduser("~")
+PROJ = os.path.join(HOME, ".claude", "projects")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "friday")
+CACHE = os.path.join(CACHE_DIR, "session-titles.json")
+NAMER = os.path.join(CACHE_DIR, "namer")
+SKIP = {os.path.realpath(p) for p in (os.path.join(HOME, ".local/share/friday"), NAMER)}
+os.environ["PATH"] = ":".join([HOME + "/.local/bin", HOME + "/.claude/local", "/usr/local/bin", "/usr/bin", os.environ.get("PATH", "")])
+
+
+def load_cache():
+    try:
+        with open(CACHE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cache(c):
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    tmp = CACHE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(c, f)
+    os.replace(tmp, CACHE)
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text" and b.get("text"):
+                return b["text"]
+    return ""
+
+
+def is_noise(t):
+    t = t.strip()
+    return (not t or t.startswith("<") or t.startswith("Caveat:") or t.startswith("[Request interrupted")
+            or t.startswith("This session is being continued"))
+
+
+def scan(path):
+    info = {"cwd": "", "first": "", "summary": "", "title": ""}
+    try:
+        with open(path, errors="replace") as f:
+            for i, line in enumerate(f):
+                if i > 400 and info["cwd"] and info["first"]:
+                    break
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                t = o.get("type")
+                if t == "summary" and o.get("summary"):
+                    info["summary"] = o["summary"]
+                elif t in ("custom-title", "title") and (o.get("customTitle") or o.get("title")):
+                    info["title"] = o.get("customTitle") or o.get("title")
+                if not info["cwd"] and o.get("cwd"):
+                    info["cwd"] = o["cwd"]
+                if not info["first"] and t == "user" and not o.get("isMeta"):
+                    txt = text_of((o.get("message") or {}).get("content"))
+                    if not is_noise(txt):
+                        info["first"] = txt.strip()
+    except OSError:
+        pass
+    return info
+
+
+def heuristic(t):
+    t = re.sub(r"[`*_#>\[\]]", "", t.split("\n")[0]).strip()
+    t = re.sub(r"\s+", " ", t)
+    if len(t) > 52:
+        t = t[:52].rsplit(" ", 1)[0] + "…"
+    return t[:1].upper() + t[1:]
+
+
+def sessions(n):
+    cache = load_cache()
+    files = sorted(glob.glob(os.path.join(PROJ, "*", "*.jsonl")), key=lambda p: os.path.getmtime(p), reverse=True)
+    out = []
+    for p in files[:25]:
+        info = scan(p)
+        cwd = info["cwd"]
+        if not info["first"] or not cwd or os.path.realpath(cwd) in SKIP:
+            continue
+        sid = os.path.splitext(os.path.basename(p))[0]
+        cached = cache.get(sid)
+        title = info["title"] or (cached if cached and not cached.startswith("~") else "") or info["summary"]
+        out.append({
+            "id": sid,
+            "cwd": cwd,
+            "project": os.path.basename(cwd.rstrip("/")) or cwd,
+            "title": title or heuristic(info["first"]),
+            "named": bool(title),
+            "last": int(os.path.getmtime(p)),
+            "first": info["first"][:400],
+        })
+        if len(out) >= n:
+            break
+    return out
+
+
+def name_them(items):
+    cache = load_cache()
+    os.makedirs(NAMER, exist_ok=True)
+    for s in items:
+        if s["named"] or s["id"] in cache:
+            continue
+        prompt = ("Give this coding session a short title: 2 to 5 words, Title Case, a noun phrase that reads "
+                  "naturally after the word 'Continue' (e.g. 'Friday Overlay Polish', 'PixelOS Sky Build Fix'). "
+                  "Reply with the title only, no quotes or punctuation.\n\nProject folder: %s\nFirst request: %s"
+                  % (s["project"], s["first"]))
+        title = ""
+        try:
+            r = subprocess.run(["claude", "-p", "--model", "haiku", prompt], cwd=NAMER,
+                               capture_output=True, text=True, timeout=45)
+            title = r.stdout.strip().splitlines()[0].strip().strip('"\'.') if r.returncode == 0 and r.stdout.strip() else ""
+        except Exception:
+            pass
+        if title and len(title) <= 48 and not title.lower().startswith(("i ", "sorry", "error")):
+            cache[s["id"]] = title
+        else:
+            cache[s["id"]] = "~" + heuristic(s["first"])   # "~" = tried; don't spend again
+        save_cache(cache)
+
+
+def main():
+    n = 3
+    if "-n" in sys.argv:
+        n = int(sys.argv[sys.argv.index("-n") + 1])
+    items = sessions(n)
+    if "--name" in sys.argv:
+        name_them(items)
+        items = sessions(n)
+    if "--debug" in sys.argv:
+        for s in items:
+            print("%-28s %-22s %s  (%s)" % (s["title"][:28], s["project"][:22], time.strftime("%d %b %H:%M", time.localtime(s["last"])), "named" if s["named"] else "draft"))
+        return
+    print(json.dumps(items))
+
+
+if __name__ == "__main__":
+    main()

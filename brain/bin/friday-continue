@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# friday-continue <session-id> <dir>: reopen a Claude Code session right where you left it.
+export PATH="$HOME/.local/bin:$HOME/.claude/local:/usr/local/bin:/usr/bin:$PATH"
+ID="$1"; DIR="${2:-$HOME}"; [ -d "$DIR" ] || DIR="$HOME"
+if command -v kitty >/dev/null; then setsid -f kitty --directory "$DIR" claude --resume "$ID"
+elif command -v foot >/dev/null; then setsid -f foot -D "$DIR" claude --resume "$ID"
+elif command -v alacritty >/dev/null; then setsid -f alacritty --working-directory "$DIR" -e claude --resume "$ID"
+elif command -v wezterm >/dev/null; then setsid -f wezterm start --cwd "$DIR" -- claude --resume "$ID"
+else notify-send -a Friday "No terminal found" "cd $DIR && claude --resume $ID"; fi

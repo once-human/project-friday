@@ -15,6 +15,7 @@ Singleton {
     property var approval: null                 // {id, tool, command, reason, risk} while a card is up
     property string queued: ""
     property var ctx: ({})                      // live desktop snapshot from friday-context
+    property string ctxRaw: ""
     property var history: []                    // prompts, newest last (Up arrow in the input)
     property string authState: "unknown"        // unknown | ok | needed
     property string pendingAfterLogin: ""
@@ -24,6 +25,7 @@ Singleton {
     readonly property int staleMs: 3 * 60 * 1000
     property string selection: ""               // text highlighted elsewhere (Super+Shift+Space)
     property var usage: ({})                    // Claude plan limits from friday-usage
+    property var sessions: []                   // your latest Claude Code sessions (friday-sessions)
     property var focus: ({})                    // active focus session from friday-focus
     property double now: Date.now()             // ticks while something on screen is counting down
     readonly property bool focusActive: !!(root.focus && root.focus.ends && root.focus.ends * 1000 > root.now)
@@ -50,6 +52,7 @@ Singleton {
             root.archiveChat();
         root.shown = true;
         root.refreshContext();
+        if (!sessionsProc.running) sessionsProc.running = true;
         if (root.authState === "unknown") root.checkAuth();
     }
     function withSelection(text) {
@@ -71,6 +74,31 @@ Singleton {
         stdout: StdioCollector {
             id: clipOut
             onStreamFinished: root.withSelection(clipOut.text)
+        }
+    }
+
+    function continueSession(s) {
+        Quickshell.execDetached([root.binDir + "friday-continue", s.id, s.cwd]);
+        root.hide();
+    }
+    Process {
+        id: sessionsProc
+        command: [root.binDir + "friday-sessions", "-n", "3"]
+        stdout: StdioCollector {
+            id: sessionsOut
+            onStreamFinished: {
+                try { root.sessions = JSON.parse(sessionsOut.text); } catch (e) { return; }
+                // give fresh sessions a proper name in the background (cached, so this runs once per session)
+                if (root.sessions.some(x => !x.named) && !namerProc.running) namerProc.running = true;
+            }
+        }
+    }
+    Process {
+        id: namerProc
+        command: [root.binDir + "friday-sessions", "-n", "3", "--name"]
+        stdout: StdioCollector {
+            id: namerOut
+            onStreamFinished: { try { root.sessions = JSON.parse(namerOut.text); } catch (e) { } }
         }
     }
 
@@ -346,7 +374,11 @@ Singleton {
         command: [root.ctxBin]
         stdout: SplitParser {
             onRead: data => {
-                try { root.ctx = JSON.parse(data); } catch (e) { }
+                if (data === root.ctxRaw) return;      // nothing changed: don't rebuild the UI
+                try {
+                    root.ctx = JSON.parse(data);
+                    root.ctxRaw = data;
+                } catch (e) { }
             }
         }
     }
