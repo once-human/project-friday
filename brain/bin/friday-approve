@@ -170,7 +170,17 @@ def policy_segment(toks, followed_by_pipe_from_fetch):
     if followed_by_pipe_from_fetch and prog in SHELLS: return D("piping a download straight into a shell")
     if prog in WRITERS: return worst(redirect_verdict, writer_policy(prog, args))
     if prog.startswith("friday-") or os.path.realpath(toks[0]).startswith(os.path.realpath(JH) + "/bin/"):
-        return redirect_verdict if prog != "friday-integrate" else Q("re-patching the shell config")
+        if prog == "friday-integrate":
+            return Q("re-patching the shell config")
+        if prog == "friday-input":
+            # Driving your mouse/keyboard. Looking (move, scroll, screen info) is fine; clicking and typing ask,
+            # unless you've said you trust it (FRIDAY_INPUT_TRUST=1 in config.env).
+            sub = args[0] if args else ""
+            if sub in ("move", "scroll", "where", "info") or os.environ.get("FRIDAY_INPUT_TRUST") == "1":
+                return redirect_verdict
+            what = " ".join(args)[:80]
+            return Q("will %s on your screen: %s" % ("type" if sub in ("type", "key") else "click", what))
+        return redirect_verdict
     # --- per-program rules ---
     v = None
     if prog in PURE_RO: v = A()
