@@ -16,16 +16,44 @@ Singleton {
     property string queued: ""
     property var ctx: ({})                      // live desktop snapshot from friday-context
     property string ctxRaw: ""
-    property var history: []                    // prompts, newest last (Up arrow in the input)
+    property var promptHistory: []              // prompts, newest last
     property string authState: "unknown"        // unknown | ok | needed
     property string pendingAfterLogin: ""
     property double lastActivity: 0             // ms; drives "fresh chat on summon"
-    property var archived: null                 // {items, sessionId, title}: the chat you can Resume
-    readonly property bool resumable: archived !== null
-    readonly property int staleMs: 3 * 60 * 1000
+    // chat history: your last 10 conversations, newest first, kept across restarts
+    property var history: []                    // [{id, title, sessionId, updated, count, items}]
+    readonly property bool resumable: root.history.length > 0
+    readonly property var archived: root.history.length > 0 ? root.history[0] : null
+    property bool historyDirty: false
+    readonly property string historyPath: (Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")) + "/friday/history.json"
     property string selection: ""               // text highlighted elsewhere (Super+Shift+Space)
     property var usage: ({})                    // Claude plan limits from friday-usage
     property var sessions: []                   // your latest Claude Code sessions (friday-sessions)
+
+    // voice ("Hey Friday"): state mirrors the friday-voice daemon
+    property string voiceState: "off"           // off | unavailable | idle | muted | listening | transcribing | speaking
+    property string voicePartial: ""            // live words while you talk
+    property real voiceLevel: 0                 // mic level 0..1 while listening
+    property bool voiceTurn: false              // the current request was spoken -> speak the answer
+    property bool wakeEnabled: false            // "Hey Friday" listening; off by default, remembered across restarts
+    property bool voiceBooted: false            // wait for that setting before starting the voice process
+    property bool voiceSession: false           // this panel was opened by voice: tidy it away when the exchange ends
+    property bool expectReply: false            // keep the conversation open after Friday speaks
+    // live speech: sentences are spoken as they stream in, and the one being heard is highlighted
+    property int speakingMsg: -1                // message index being read aloud (-1: none)
+    property int spokenIdx: -1                  // sentence currently being heard
+    property var speechParts: []                // sentences sent to the voice, in order
+    property var speechRanges: []               // [start, end) spans of the message body they came from
+    property int speechFed: 0                   // how far into the current text block we've fed
+    property int blockStart: 0                  // where the current text block starts in the body
+    property bool blockDone: false              // the current block's spoken paragraph is finished
+    property int speechChars: 0
+    property int speechBase: 0                  // words already spoken in earlier utterances of this answer
+    property var speechWords: []                // exactly the words Friday says, for word-by-word highlighting
+    readonly property string restState: root.wakeEnabled ? "idle" : "muted"
+    readonly property string wakeFile: (Quickshell.env("XDG_STATE_HOME") || (root.home + "/.local/state")) + "/friday/wake"
+    readonly property bool voiceOn: ["idle", "listening", "transcribing", "speaking"].indexOf(root.voiceState) >= 0
+    readonly property bool hearing: root.voiceState === "listening" || root.voiceState === "transcribing"
     property var focus: ({})                    // active focus session from friday-focus
     property double now: Date.now()             // ticks while something on screen is counting down
     readonly property bool focusActive: !!(root.focus && root.focus.ends && root.focus.ends * 1000 > root.now)
@@ -46,10 +74,8 @@ Singleton {
 
     // ---------------------------------------------------------------- visibility
     function show() {
-        // Siri-style: if you come back after a while, you get a clean slate (previous chat stays one key away).
-        if (!root.shown && !proc.running && !root.approval && root.messages.count > 0
-                && Date.now() - root.lastActivity > root.staleMs)
-            root.archiveChat();
+        // A chat that finished while you were away is filed into History; you open to a fresh one.
+        if (!root.shown && !proc.running && !root.approval && root.messages.count > 0) root.archiveChat();
         root.shown = true;
         root.refreshContext();
         if (!sessionsProc.running) sessionsProc.running = true;
@@ -127,13 +153,29 @@ Singleton {
 
     function hide() {
         if (root.approval) root.resolveApproval(false);
+        if (root.hearing || root.voiceState === "speaking") root.voiceCmd("cancel");
+        root.voiceSession = false;
+        root.expectReply = false;
+        dismissTimer.stop();
         root.shown = false;
         root.selection = "";
+        root.voiceTurn = false;                 // dismissed: whatever is still coming in isn't read aloud
+        // Closing ends the chat. If Friday is still working, it finishes in the background (you get a
+        // notification) and the chat is filed into History the moment it's done.
+        if (proc.running) root.archiveWhenDone = true;
+        else if (root.messages.count > 0) root.archiveChat();
+        console.log("[Friday] hidden; chat " + (proc.running ? "files itself when the answer finishes" : "filed, next open is fresh"));
     }
     function toggle() { root.shown ? root.hide() : root.show(); }
 
     // ---------------------------------------------------------------- conversation
+    property string chatId: ""                  // set when you reopen a chat from History, so it's updated in place
+    property bool archiveWhenDone: false        // closed mid-answer: file the chat as soon as it finishes
     function newChat() {
+        root.chatId = "";
+        root.archiveWhenDone = false;
+        root.speakingMsg = -1;
+        root.spokenIdx = -1;
         root.queued = "";
         if (proc.running) proc.running = false;
         root.messages.clear();
@@ -147,24 +189,69 @@ Singleton {
         const items = [];
         for (let i = 0; i < root.messages.count; i++) {
             const m = root.messages.get(i);
-            items.push({ role: m.role, body: m.body, stepsJson: m.stepsJson, done: true });
+            items.push({ role: m.role, body: m.body, stepsJson: m.stepsJson, done: true, spokenJson: m.spokenJson ?? "" });
         }
-        root.archived = { items: items, sessionId: root.sessionId, title: items.length > 0 ? items[0].body : "" };
+        const first = items.find(x => x.role === "user");
+        const title = String(first ? first.body : "Chat").split("\n")[0].replace(/\s+/g, " ").trim();
+        const entry = {
+            id: root.chatId || (Date.now().toString(36) + Math.random().toString(36).slice(2, 6)),
+            title: title.length > 70 ? title.slice(0, 70) + "…" : title,
+            sessionId: root.sessionId,
+            updated: Date.now(),
+            count: items.filter(x => x.role === "user").length,
+            items: items
+        };
+        root.history = [entry, ...root.history.filter(h => h.id !== entry.id)].slice(0, 10);
+        root.saveHistory();
         root.newChat();
+    }
+    function openHistory(id) {
+        const h = root.history.find(x => x.id === id);
+        if (!h) return;
+        if (proc.running) root.stop();
+        if (root.messages.count > 0) root.archiveChat();
+        root.newChat();
+        for (let i = 0; i < h.items.length; i++) root.messages.append(h.items[i]);
+        root.sessionId = h.sessionId;          // Claude remembers the whole conversation: just keep talking
+        root.chatId = h.id;
+        root.lastActivity = Date.now();
+    }
+    function deleteHistory(id) {
+        root.history = root.history.filter(h => h.id !== id);
+        root.saveHistory();
+    }
+    function clearHistory() {
+        root.history = [];
+        root.saveHistory();
+    }
+    function saveHistory() {
+        if (historyWriter.running) { root.historyDirty = true; return; }
+        root.historyDirty = false;
+        historyWriter.stdinEnabled = true;
+        historyWriter.running = true;
+    }
+    Process {
+        id: historyWriter
+        command: ["bash", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1.tmp\" && mv -f \"$1.tmp\" \"$1\"", "_", root.historyPath]
+        onRunningChanged: {
+            if (historyWriter.running) {
+                historyWriter.write(JSON.stringify(root.history));
+                stdinEnabled = false;
+            }
+        }
+        onExited: if (root.historyDirty) root.saveHistory()
+    }
+    FileView {
+        path: root.historyPath
+        onLoaded: { try { root.history = JSON.parse(text()); } catch (e) { root.history = []; } }
     }
     function fresh() {                          // Ctrl+N / the new-chat button: keep the old one resumable
         if (proc.running) root.stop();
         if (root.messages.count > 0) root.archiveChat();
         else root.newChat();
     }
-    function resume() {
-        const a = root.archived;
-        if (!a) return;
-        root.archived = null;
-        root.newChat();
-        for (let i = 0; i < a.items.length; i++) root.messages.append(a.items[i]);
-        root.sessionId = a.sessionId;
-        root.lastActivity = Date.now();
+    function resume() {                          // the most recent chat
+        if (root.history.length > 0) root.openHistory(root.history[0].id);
     }
     function copy(text) { Quickshell.execDetached(["wl-copy", "--", String(text)]); }
     function plain(md) {
@@ -179,13 +266,14 @@ Singleton {
     function ask(text, label) {
         const t = (text ?? "").trim();
         if (t.length === 0) return;
-        root.history = [...root.history.filter(h => h !== t), t].slice(-40);
+        root.promptHistory = [...root.promptHistory.filter(h => h !== t), t].slice(-40);
         root.show();
         if (root.authState === "needed") {      // signed out: park the request, the sign-in card is showing
             root.pendingAfterLogin = t;
             return;
         }
         if (proc.running) {          // interrupt the current turn, then run the new one
+            root.voiceTurn = false;
             root.queued = t;
             proc.running = false;
             return;
@@ -195,15 +283,29 @@ Singleton {
 
     function start(t, label) {
         root.lastActivity = Date.now();
-        root.messages.append({ role: "user", body: (label && label.length > 0) ? label : t, stepsJson: "[]", done: true });
-        root.messages.append({ role: "assistant", body: "", stepsJson: "[]", done: false });
+        root.messages.append({ role: "user", body: (label && label.length > 0) ? label : t, stepsJson: "[]", done: true, spokenJson: "" });
+        root.messages.append({ role: "assistant", body: "", stepsJson: "[]", done: false, spokenJson: "" });
         root.assistantIndex = root.messages.count - 1;
+        if (root.voiceTurn) {
+            root.voiceCmd("stop");
+            root.speakingMsg = root.assistantIndex;
+            root.spokenIdx = -1;
+            root.speechParts = [];
+            root.speechRanges = [];
+            root.speechFed = 0;
+            root.blockStart = 0;
+            root.blockDone = false;
+            root.speechChars = 0;
+            root.speechBase = 0;
+            root.speechWords = [];
+        }
         root.steps = [];
         root.gotText = false;
         proc.environment = ({
             "FRIDAY_PROMPT": t,
             "FRIDAY_SESSION": root.sessionId,
-            "FRIDAY_SURFACE": "overlay"
+            "FRIDAY_SURFACE": "overlay",
+            "FRIDAY_VOICE": root.voiceTurn ? "1" : ""
         });
         proc.command = [root.askBin];
         proc.running = true;
@@ -278,11 +380,16 @@ Singleton {
         if (ev.type === "stream_event") {
             const se = ev.event ?? {};
             if (se.type === "content_block_start" && se.content_block?.type === "text" && root.gotText) {
+                root.feedSpeech(true);                         // finish speaking the previous block's paragraph
                 const cur = root.messages.get(root.assistantIndex)?.body ?? "";
                 if (!cur.endsWith("\n\n")) root.addText("\n\n");
+                root.blockStart = (root.messages.get(root.assistantIndex)?.body ?? "").length;
+                root.speechFed = 0;
+                root.blockDone = false;
             } else if (se.type === "content_block_delta" && se.delta?.type === "text_delta" && se.delta.text) {
                 root.gotText = true;
                 root.addText(se.delta.text);
+                root.feedSpeech(false);
             }
         } else if (ev.type === "assistant") {
             const blocks = ev.message?.content ?? [];
@@ -336,12 +443,37 @@ Singleton {
                     Quickshell.execDetached(["notify-send", "-a", "Friday", "Friday", snippet.length > 160 ? snippet.slice(0, 160) + "…" : snippet]);
                 }
             }
+            // A spoken question gets a spoken answer, already playing sentence by sentence; close it out.
+            if (root.voiceTurn && root.shown && root.queued === "" && i >= 0 && i < root.messages.count) {
+                root.feedSpeech(true);
+                // A spoken exchange stays open: once Friday finishes talking it listens for your next line,
+                // like a person would. Silence for a few seconds ends it.
+                root.expectReply = true;
+                if (root.speechParts.length > 0) {
+                    root.voiceCmd("say-end");
+                } else {
+                    const body = root.messages.get(i).body;
+                    const said = root.speakable(body);
+                    if (said.length > 0) {
+                        // the spoken part is shown word by word instead of as plain text
+                        const paras = body.split(/\n\s*\n/);
+                        const end = paras.length > 1 ? paras[0].length + body.slice(paras[0].length).search(/\S/) + paras[1].length : body.length;
+                        root.speechRanges = [[0, Math.min(body.length, Math.max(0, end))]];
+                        root.saveSpoken();
+                        root.voiceCmd("say " + JSON.stringify(said));
+                    } else root.afterSpeaking();
+                }
+            }
+            if (root.queued === "") root.voiceTurn = false;
             root.lastActivity = Date.now();
             if (root.queued !== "") {
                 const q = root.queued;
                 root.queued = "";
                 root.start(q);
+            } else if (root.archiveWhenDone && !root.shown) {
+                root.archiveChat();                    // you closed the panel while it worked: file it now
             }
+            root.archiveWhenDone = false;
         }
     }
 
@@ -354,6 +486,19 @@ Singleton {
             return;
         }
         root.show();
+        // In a spoken conversation, ask out loud and listen for the answer.
+        if (root.voiceTurn || root.voiceSession) root.askApprovalAloud(false);
+    }
+    function askApprovalAloud(again) {
+        const a = root.approval;
+        if (!a) return;
+        const why = String(a.reason ?? "").replace(/\.$/, "");
+        const q = a.risk === "high"
+            ? (again ? "This one's high risk, so say confirm if you want me to do it." : "Heads up, this one's high risk: " + why + ". Say confirm to go ahead, or no to skip it.")
+            : (again ? "Sorry, should I go ahead? Yes or no." : "I need your okay for this: " + why + ". Should I go ahead?");
+        root.expectReply = true;
+        root.voiceCmd("say+ " + JSON.stringify(q));
+        root.voiceCmd("say-end");
     }
     function resolveApproval(allow) {
         const a = root.approval;
@@ -456,6 +601,200 @@ Singleton {
         }
     }
 
+    // ---------------------------------------------------------------- voice
+    function voiceCmd(c) { if (voiceProc.running) voiceProc.write(c + "\n"); }
+    function listen() {
+        root.show();
+        if (root.voiceState === "unavailable" || root.voiceState === "off") return;
+        root.voiceCmd(root.hearing ? "cancel" : "listen");
+    }
+    function toggleWake() {
+        root.wakeEnabled = !root.wakeEnabled;
+        root.voiceCmd(root.wakeEnabled ? "unmute" : "mute");
+        Quickshell.execDetached(["bash", "-c", "mkdir -p \"$(dirname \"$1\")\" && echo \"$2\" > \"$1\"", "_", root.wakeFile, root.wakeEnabled ? "on" : "off"]);
+    }
+    // The conversational bit: what happens when Friday finishes talking.
+    function afterSpeaking() {
+        if (root.expectReply && root.shown) {
+            root.expectReply = false;
+            root.voiceCmd("listen followup");      // no wake word needed: it just asked you something
+        } else if (root.voiceSession) {
+            dismissTimer.restart();                // like Siri: step out of the way when the exchange is done
+        }
+    }
+    Timer {
+        id: dismissTimer
+        interval: 9000
+        onTriggered: {
+            if (root.voiceSession && !root.hearing && !root.running && !root.approval && root.voiceState !== "speaking")
+                root.hide();
+        }
+    }
+    FileView {
+        path: root.wakeFile
+        onLoaded: { root.wakeEnabled = text().trim() === "on"; root.voiceBooted = true; }
+        onLoadFailed: root.voiceBooted = true      // never set: wake word stays off
+    }
+    // Speak the first paragraph of each text block as one whole piece, as soon as that paragraph is complete
+    // (natural phrasing beats shaving off a second). Code and later paragraphs stay on screen only.
+    function feedSpeech(blockEnd) {
+        if (!root.voiceTurn || root.speakingMsg !== root.assistantIndex || root.assistantIndex < 0) return;
+        if (root.blockDone) return;
+        const body = root.messages.get(root.assistantIndex)?.body ?? "";
+        const block = body.slice(root.blockStart);
+        const lead = block.length - block.replace(/^\s+/, "").length;
+        let stop = -1;
+        const para = block.indexOf("\n\n", lead + 1);
+        const fence = block.indexOf("```", lead);
+        if (para >= 0) stop = para;
+        if (fence >= 0 && (stop < 0 || fence < stop)) stop = fence;
+        if (!blockEnd && stop < 0) return;                 // paragraph still being written
+        const end = stop >= 0 ? stop : block.length;
+        root.blockDone = true;
+        const said = root.speakable(block.slice(lead, end));
+        if (said.length === 0 || root.speechChars > 900) return;
+        root.speechChars += said.length;
+        root.speechParts = [...root.speechParts, said];
+        root.speechRanges = [...root.speechRanges, [root.blockStart + lead, root.blockStart + end]];
+        root.saveSpoken();
+        root.voiceCmd("say+ " + JSON.stringify(said));
+    }
+    function saveSpoken() {
+        if (root.speakingMsg < 0 || root.speakingMsg >= root.messages.count) return;
+        root.messages.setProperty(root.speakingMsg, "spokenJson",
+            JSON.stringify({ words: root.speechWords, ranges: root.speechRanges }));
+    }
+
+    // First paragraph or two, as plain sentences, capped so Friday doesn't read an essay aloud.
+    function speakable(md) {
+        let t = String(md ?? "").replace(/```[\s\S]*?```/g, " ").replace(/^\*\*Error:\*\*/, "Sorry, something went wrong.");
+        t = t.split(/\n\s*\n/).slice(0, 2).join(" ");
+        t = t.replace(/`([^`]*)`/g, "$1").replace(/[*_#>|]/g, "").replace(/\[(.*?)\]\(.*?\)/g, "$1").replace(/^\s*[-•]\s+/gm, "").replace(/\s+/g, " ").trim();
+        if (t.length > 420) {
+            const cut = t.slice(0, 420);
+            const end = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("? "), cut.lastIndexOf("! "));
+            t = end > 120 ? cut.slice(0, end + 1) : cut + "…";
+        }
+        return t;
+    }
+    function onVoiceEvent(line) {
+        let e;
+        try { e = JSON.parse(line); } catch (err) { return; }
+        switch (e.ev) {
+        case "hello": break;
+        case "ready": root.voiceState = root.restState; break;
+        case "muted": root.voiceState = "muted"; break;
+        case "unavailable": root.voiceState = "unavailable"; break;
+        case "prewake":
+            if (!root.shown) root.voiceSession = true;
+            dismissTimer.stop();
+            root.show();
+            root.voiceState = "listening";
+            root.voicePartial = "";
+            root.voiceLevel = 0;
+            break;
+        case "wake":
+            if (!root.shown) root.voiceSession = true;
+            dismissTimer.stop();
+            root.show();
+            root.voiceState = "listening";
+            root.voicePartial = "";
+            root.voiceLevel = 0;
+            break;
+        case "level": root.voiceLevel = e.v; break;
+        case "words":
+            if (root.speakingMsg >= 0) {
+                root.speechWords = [...root.speechWords, ...(e.words ?? [])];
+                root.saveSpoken();
+            }
+            break;
+        case "word": root.spokenIdx = root.speechBase + e.i; break;
+        case "partial": root.voicePartial = e.text; break;
+        case "transcribing": root.voiceState = "transcribing"; root.voiceLevel = 0; break;
+        case "final": {
+            root.voiceState = root.restState;
+            const t = String(e.text ?? "").trim();
+            root.voicePartial = "";
+            if (t.length === 0) break;
+            if (root.approval) {                 // answer an approval card out loud
+                const high = root.approval.risk === "high";
+                if (/^\W*(no|nope|nah|don'?t|do not|deny|stop|cancel|wait|hold on|not now|skip)\b/i.test(t)) {
+                    root.resolveApproval(false);
+                    root.voiceCmd("say " + JSON.stringify("Okay, skipped."));
+                } else if (high && /\b(confirm(ed)?|i'?m sure|yes,? i'?m sure|definitely)\b/i.test(t)) {
+                    root.resolveApproval(true);
+                } else if (!high && /\b(yes|yeah|yep|yup|sure|okay|ok|allow|approve|go ahead|do it|run it|go for it|proceed|haan|please)\b/i.test(t)) {
+                    root.resolveApproval(true);
+                } else {
+                    root.askApprovalAloud(true);           // didn't catch a clear yes/no: ask again
+                }
+                break;
+            }
+            // Little phrases a person would just say, handled like a person would.
+            if (/^(never ?mind|cancel|forget it|nothing|that'?s all|that'?s it|stop)\W*$/i.test(t)) { root.hide(); break; }
+            if (/^(thanks?|thank you|cool|perfect|great|nice|awesome|got it),?( friday)?\W*$/i.test(t)) {
+                root.voiceCmd("say " + JSON.stringify("Anytime."));
+                root.expectReply = false;
+                break;
+            }
+            if (/^(new chat|start over|fresh start)\W*$/i.test(t)) { root.fresh(); break; }
+            root.voiceTurn = true;
+            root.ask(t);
+            break;
+        }
+        case "cancel":
+            root.voiceState = root.restState;
+            root.voicePartial = "";
+            root.voiceLevel = 0;
+            if (e.reason === "false wake" && root.voiceSession && root.messages.count === 0) { root.hide(); break; }
+            if (root.voiceSession) dismissTimer.restart();   // you went quiet: let it go
+            break;
+        case "speaking":
+            root.voiceState = e.on ? "speaking" : root.restState;
+            if (!e.on) {
+                root.speechBase = root.speechWords.length;
+                if (!root.running) { root.spokenIdx = 9999; root.speakingMsg = -1; }
+            }
+            if (!e.on) root.afterSpeaking();
+            break;
+        case "error":
+            console.log("[Friday voice]", e.msg);
+            break;
+        }
+    }
+    Process {
+        id: voiceProc
+        command: [root.binDir + "friday-voice"]
+        environment: ({ "FRIDAY_WAKE": root.wakeEnabled ? "on" : "off" })
+        stdinEnabled: true
+        running: root.voiceBooted
+        stdout: SplitParser { onRead: data => root.onVoiceEvent(data) }
+        onExited: (code, status) => {
+            if (root.voiceState !== "unavailable") {
+                root.voiceState = "off";
+                voiceRestart.restart();          // crashed? come back in a few seconds
+            }
+        }
+    }
+    Timer { id: voiceRestart; interval: 4000; onTriggered: voiceProc.running = true }
+    // When the voice code is updated, restart it so the shell and the voice never speak different protocols.
+    FileView {
+        path: root.home + "/.local/share/friday/voice/friday_voice.py"
+        watchChanges: true
+        onFileChanged: voiceReload.restart()
+    }
+    Timer {
+        id: voiceReload
+        interval: 1500
+        onTriggered: {
+            if (voiceProc.running) {
+                voiceProc.running = false;           // onExited brings it back with the new code
+            } else {
+                voiceProc.running = true;
+            }
+        }
+    }
+
     Timer {
         id: cloakTimer
         onTriggered: root.cloaked = false
@@ -475,6 +814,9 @@ Singleton {
         function resume(): void { root.show(); root.resume(); }
         function newChat(): void { root.fresh(); }
         function ping(): string { return "pong"; }
+        function listen(): void { root.listen(); }
+        function toggleWake(): void { root.toggleWake(); }
+        function stopSpeaking(): void { root.voiceCmd("stop"); }
         function withSelection(text: string): void { root.withSelection(text); }
         function approval(payload: string): void { root.requestApproval(payload); }
         function cloak(ms: int): void {
