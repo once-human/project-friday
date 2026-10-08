@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# friday-web open <url> | search <query…> | tab [url] | window [url] | private [url]
+# Uses your default browser; detaches so the browser outlives Friday.
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+DESK="$(xdg-settings get default-web-browser 2>/dev/null)"
+case "$DESK" in
+  *google-chrome*) BIN=google-chrome-stable; FAM=chrome ;;
+  *chromium*)      BIN=chromium; FAM=chrome ;;
+  *brave*)         BIN=brave; FAM=chrome ;;
+  *vivaldi*)       BIN=vivaldi-stable; FAM=chrome ;;
+  *microsoft-edge*) BIN=microsoft-edge-stable; FAM=chrome ;;
+  *zen*)           BIN=zen-browser; FAM=firefox ;;
+  *librewolf*)     BIN=librewolf; FAM=firefox ;;
+  *firefox*)       BIN=firefox; FAM=firefox ;;
+  *)               BIN=""; FAM="" ;;
+esac
+[ -n "$BIN" ] && ! command -v "$BIN" >/dev/null 2>&1 && BIN=""
+urlify() { case "$1" in *://*|about:*|chrome:*) echo "$1" ;; "") echo "" ;; *) echo "https://$1" ;; esac; }
+enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote_plus(" ".join(sys.argv[1:])))' "$@"; }
+run() { setsid -f "$@" >/dev/null 2>&1; }
+cmd="$1"; shift
+case "$cmd" in
+  open)    run xdg-open "$(urlify "$1")" ;;
+  search)  run xdg-open "https://www.google.com/search?q=$(enc "$@")" ;;
+  tab)     u="$(urlify "$1")"
+           if [ "$FAM" = chrome ]; then run "$BIN" --new-tab ${u:-"chrome://newtab"}
+           elif [ "$FAM" = firefox ]; then run "$BIN" --new-tab "${u:-about:newtab}"
+           else run xdg-open "${u:-https://www.google.com}"; fi ;;
+  window)  u="$(urlify "$1")"
+           if [ -n "$BIN" ]; then run "$BIN" --new-window $u; else run xdg-open "${u:-https://www.google.com}"; fi ;;
+  private) u="$(urlify "$1")"
+           if [ "$FAM" = chrome ]; then run "$BIN" --incognito $u
+           elif [ "$FAM" = firefox ]; then run "$BIN" --private-window $u
+           else echo "private windows need a known browser" >&2; exit 2; fi ;;
+  which)   echo "${DESK:-unknown} -> ${BIN:-xdg-open}" ;;
+  *) echo "usage: friday-web open|search|tab|window|private|which" >&2; exit 2 ;;
+esac

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# friday-toggle             : show/hide Friday
+# friday-toggle --selection : open Friday with the text you've highlighted anywhere (writing tools)
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+ensure() {
+  qs -c friday ipc call friday ping >/dev/null 2>&1 && return 0
+  qs -c friday -d >/dev/null 2>&1
+  for _ in $(seq 1 12); do sleep 0.25; qs -c friday ipc call friday ping >/dev/null 2>&1 && return 0; done
+  notify-send -a Friday "Friday didn't start" "Run: qs -c friday   (to see the error)"; exit 1
+}
+ensure
+if [ "$1" = "--selection" ]; then
+  SEL="$(wl-paste --primary --no-newline 2>/dev/null | head -c 6000)"
+  [ -z "$SEL" ] && SEL="$(wl-paste --no-newline 2>/dev/null | head -c 6000)"
+  if [ -n "$SEL" ]; then exec qs -c friday ipc call friday withSelection "$SEL"; fi
+fi
+exec qs -c friday ipc call friday toggle

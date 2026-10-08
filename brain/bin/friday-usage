@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Your Claude plan limits (5-hour session + weekly) -> $XDG_RUNTIME_DIR/friday/usage.json.
+
+Reads the access token Claude Code already stored for you and asks Anthropic's usage endpoint,
+the same one Claude Code's /usage screen uses. Read-only; the token never leaves this machine
+except to api.anthropic.com. NOTE: undocumented endpoint, so it may change without notice.
+Usage: friday-usage [--debug]
+"""
+import json, os, sys, time, urllib.request, urllib.error
+from datetime import datetime
+sys.dont_write_bytecode = True
+
+HOME = os.path.expanduser("~")
+OUTDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "friday")
+OUT = os.path.join(OUTDIR, "usage.json")
+DEBUG = "--debug" in sys.argv
+
+
+def write(d):
+    os.makedirs(OUTDIR, exist_ok=True)
+    d["updated"] = int(time.time())
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(d, f)
+    os.replace(tmp, OUT)
+    if DEBUG:
+        print(json.dumps(d, indent=2))
+
+
+def epoch(iso):
+    if not iso:
+        return None
+    s = str(iso).replace("Z", "+00:00")
+    if "." in s:                                   # trim fractional seconds for older Pythons
+        head, rest = s.split(".", 1)
+        tz = ""
+        for sep in ("+", "-"):
+            if sep in rest:
+                tz = sep + rest.split(sep, 1)[1]
+                break
+        s = head + tz
+    try:
+        return int(datetime.fromisoformat(s).timestamp())
+    except ValueError:
+        return None
+
+
+def main():
+    try:
+        with open(os.path.join(HOME, ".claude/.credentials.json")) as f:
+            tok = json.load(f)["claudeAiOauth"]["accessToken"]
+    except Exception:
+        write({"ok": False, "error": "Not signed in to Claude Code"})
+        return 1
+    req = urllib.request.Request(
+        "https://api.anthropic.com/api/oauth/usage",
+        headers={
+            "Authorization": "Bearer " + tok,
+            "anthropic-beta": "oauth-2025-04-20",
+            "Content-Type": "application/json",
+            "User-Agent": "friday-usage/1.0",
+        },
+    )
+    try:
+        raw = urllib.request.urlopen(req, timeout=12).read().decode()
+    except urllib.error.HTTPError as e:
+        write({"ok": False, "error": "HTTP %d" % e.code + (" (sign-in expired, open Claude Code once)" if e.code == 401 else "")})
+        if DEBUG:
+            print(e.read().decode(errors="replace")[:600])
+        return 1
+    except Exception as e:
+        write({"ok": False, "error": "offline: %s" % type(e).__name__})
+        return 1
+    j = json.loads(raw)
+    if DEBUG:
+        print("raw keys:", list(j.keys()))
+    out = {"ok": True}
+    for key in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"):
+        v = j.get(key)
+        if isinstance(v, dict) and v.get("utilization") is not None:
+            out[key] = {"pct": round(float(v["utilization"]), 1), "resets_at": epoch(v.get("resets_at"))}
+    if "five_hour" not in out and "seven_day" not in out:
+        out = {"ok": False, "error": "Unexpected response from Anthropic"}
+    write(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

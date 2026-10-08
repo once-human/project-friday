@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# friday-login --check : prints ok | no | unknown
+# friday-login         : opens a small terminal running Claude's own sign-in flow
+export PATH="$HOME/.local/bin:$HOME/.claude/local:$HOME/.npm-global/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:$PATH"
+CLAUDE="${CLAUDE_BIN:-$(command -v claude)}"
+[ -x "$CLAUDE" ] || { echo "no-cli"; exit 3; }
+
+if [ "$1" = "--check" ]; then
+  OUT="$(timeout 8 "$CLAUDE" auth status </dev/null 2>&1)"; RC=$?
+  if echo "$OUT" | grep -qiE "not logged in|logged out|no .*credentials|please (run|log)"; then echo no; exit 0; fi
+  if [ $RC -eq 0 ] && echo "$OUT" | grep -qiE "logged in|authenticated|email|account|method"; then echo ok; exit 0; fi
+  if [ -s "$HOME/.claude/.credentials.json" ] || [ -n "$ANTHROPIC_API_KEY" ] || [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then echo ok; exit 0; fi
+  echo unknown; exit 0
+fi
+
+export CLAUDE
+INNER='
+echo "  Project Friday  ·  sign in to Claude"; echo
+if "$CLAUDE" auth --help 2>&1 | grep -qi login; then
+  "$CLAUDE" auth login
+else
+  echo "  A browser tab will open. If Claude asks, type /login, finish in the browser, then /exit."; echo
+  "$CLAUDE"
+fi
+echo; read -n1 -s -r -p "  Done. Press any key to close."'
+for T in "kitty --class friday-login --title Friday-signin -e" "foot -a friday-login -e" "alacritty --class friday-login -e" "wezterm start --class friday-login --" "xterm -e"; do
+  set -- $T; command -v "$1" >/dev/null 2>&1 && exec $T bash -c "$INNER"
+done
+notify-send -a Friday "No terminal found" "Run 'claude' in any terminal and use /login."

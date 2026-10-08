@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# friday-profile [--if-stale] — snapshot of this machine so Friday already knows it. Writes device-profile.md.
+FRIDAY_HOME="${FRIDAY_HOME:-$HOME/.local/share/friday}"
+OUT="$FRIDAY_HOME/device-profile.md"
+if [ "${1:-}" = "--if-stale" ] && [ -f "$OUT" ] && [ -z "$(find "$OUT" -mmin +1440 2>/dev/null)" ]; then exit 0; fi
+mkdir -p "$FRIDAY_HOME"
+have() { command -v "$1" >/dev/null 2>&1; }
+tmp="$(mktemp)"
+{
+echo "# Device profile (auto-generated $(date '+%Y-%m-%d %H:%M %Z'); run friday-profile to refresh)"
+echo
+echo "## System"
+. /etc/os-release 2>/dev/null; echo "- OS: ${PRETTY_NAME:-unknown}, kernel $(uname -r)"
+echo "- Host: $(cat /sys/devices/virtual/dmi/id/product_name 2>/dev/null || hostname)"
+echo "- CPU: $(lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | head -1) ($(nproc) threads)"
+echo "- RAM: $(free -h 2>/dev/null | awk '/^Mem:/{print $2}'), swap $(free -h 2>/dev/null | awk '/^Swap:/{print $2}')"
+have lspci && lspci 2>/dev/null | grep -Ei 'vga|3d|display' | sed 's/^[^ ]* /- GPU: /'
+for b in /sys/class/power_supply/BAT*; do [ -d "$b" ] && echo "- Battery: $(cat $b/capacity)% ($(cat $b/status))"; done
+echo "- Session: ${XDG_SESSION_TYPE:-?}, shell $(basename "${SHELL:-?}"), locale ${LANG:-?}, timezone $(timedatectl show -p Timezone --value 2>/dev/null)"
+echo
+echo "## Displays"
+have hyprctl && hyprctl monitors 2>/dev/null | awk '/^Monitor/{n=$2} /^\t[0-9]+x[0-9]+@/{print "- " n ": " $1 " at " $3} /scale:/{print "  scale " $2}'
+have hyprctl && echo "- Compositor: $(hyprctl version 2>/dev/null | head -1)"
+echo
+echo "## Storage"
+echo '```'; lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS 2>/dev/null | head -30; echo '```'
+df -h / /home 2>/dev/null | awk 'NR>1{print "- " $6 ": " $3 " used of " $2 " (" $5 ")"}' | sort -u
+echo
+echo "## Dev tools"
+for t in git gh node npm pnpm bun python3 uv go cargo rustc java flutter dart adb fastboot docker nvim code zed; do
+  have $t && echo "- $t: $($t --version 2>&1 | head -1 | cut -c1-70)"
+done
+echo "- editors/IDEs seen: $(ls "$HOME/.local/share" 2>/dev/null | grep -Ei 'antigravity|cursor|zed|vscode' | tr '\n' ' ')"
+echo
+echo "## Apps"
+for b in google-chrome-stable chromium firefox zen-browser brave librewolf; do have $b && echo "- browser: $b"; done
+for a in kitty foot alacritty wezterm konsole; do have $a && echo "- terminal: $a"; done
+for a in discord telegram-desktop spotify obsidian steam prismlauncher vlc mpv figma-linux; do have $a && echo "- app: $a"; done
+echo "- Claude desktop: $(have claude-desktop && echo installed || echo not found); Claude Code CLI: $(PATH="$HOME/.local/bin:$PATH" command -v claude || echo not on PATH)"
+echo
+echo "## Packages"
+if have pacman; then
+  echo "- explicit: $(pacman -Qqe | wc -l), foreign/AUR: $(pacman -Qqm | wc -l), total: $(pacman -Q | wc -l)"
+  echo "- AUR/foreign: $(pacman -Qqm | tr '\n' ' ' | head -c 1500)"
+  echo "- explicitly installed: $(pacman -Qqe | tr '\n' ' ' | head -c 5000)"
+fi
+have flatpak && echo "- flatpaks: $(flatpak list --app --columns=application 2>/dev/null | tr '\n' ' ' | head -c 800)"
+echo
+echo "## Network / audio / services"
+have nmcli && nmcli -t -f DEVICE,TYPE,STATE device 2>/dev/null | sed 's/^/- net: /' | head -8
+have wpctl && wpctl status 2>/dev/null | sed -n '/Sinks:/,/Sources:/p' | sed 's/^[ │├└─]*//' | grep -E '^\*?\s*[0-9]+\.' | head -6 | sed 's/^/- audio sink: /'
+echo "- user services running: $(systemctl --user list-units --type=service --state=running --no-legend 2>/dev/null | awk '{print $1}' | sed 's/\.service//' | tr '\n' ' ' | head -c 600)"
+echo
+echo "## Android devices (adb)"
+have adb && adb devices -l 2>/dev/null | tail -n +2 | sed '/^$/d;s/^/- /' || echo "- adb not installed"
+echo
+echo "## Dotfiles & configs"
+echo "- Hyprland: ~/.config/hypr (user overrides in ~/.config/hypr/custom/, don't edit hyprland/ defaults)"
+echo "- Shell: Quickshell configs in ~/.config/quickshell/: $(ls "$HOME/.config/quickshell" 2>/dev/null | tr '\n' ' ') (illogical-impulse = ii; its settings: ~/.config/illogical-impulse/config.json)"
+echo "- hypr custom files: $(ls "$HOME/.config/hypr/custom" 2>/dev/null | grep -v bak | tr '\n' ' ')"
+echo
+echo "## Home layout"
+ls -1 "$HOME" 2>/dev/null | head -60 | tr '\n' ' '; echo
+echo
+echo "## Git repos (depth<=3)"
+timeout 20 find "$HOME" -maxdepth 3 -name .git -type d \
+  -not -path '*/.cache/*' -not -path '*/.local/*' -not -path '*/node_modules/*' -not -path '*/.npm/*' -not -path '*/.cargo/*' 2>/dev/null | head -40 | while read -r g; do
+  r="$(dirname "$g")"
+  printf -- '- ~%s — branch %s, last commit %s%s\n' "${r#$HOME}" "$(git -C "$r" branch --show-current 2>/dev/null)" "$(git -C "$r" log -1 --format=%cr 2>/dev/null)" "$( [ -n "$(git -C "$r" status --porcelain 2>/dev/null | head -1)" ] && echo ', uncommitted changes')"
+done
+} 2>/dev/null | head -c 22000 > "$tmp"
+mv "$tmp" "$OUT"
+echo "wrote $OUT"

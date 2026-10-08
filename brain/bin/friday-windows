@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# friday-windows — compact list of open windows: workspace, class, title, flags.
+hyprctl clients -j | python3 -c '
+import json,sys
+cs=sorted(json.load(sys.stdin), key=lambda c:(c["workspace"]["id"], c["class"]))
+for c in cs:
+    f=[x for x,k in (("floating","floating"),("fullscreen","fullscreen"),("pinned","pinned")) if c.get(k)]
+    print("ws %s | %s | %s | %s%s" % (c["workspace"]["id"], c["class"], c["title"][:80], c["monitor"], (" | "+",".join(f)) if f else ""))
+'

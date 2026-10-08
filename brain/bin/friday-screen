@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# friday-screen [--window] — screenshot the focused monitor (or focused window); prints the image path.
+# Friday can then Read the image to see what you see. The Friday overlay hides itself for the shot.
+mkdir -p /tmp/friday
+out="/tmp/friday/screen-$(date +%s).jpg"
+qs -c friday ipc call friday cloak 900 >/dev/null 2>&1 && sleep 0.35
+if [ "${1:-}" = "--window" ] && command -v hyprctl >/dev/null; then
+  geo="$(hyprctl activewindow -j | python3 -c 'import json,sys;w=json.load(sys.stdin);print("%d,%d %dx%d"%(w["at"][0],w["at"][1],w["size"][0],w["size"][1]))' 2>/dev/null)"
+  [ -n "$geo" ] && grim -t jpeg -q 85 -g "$geo" "$out" || grim -t jpeg -q 85 "$out"
+else
+  mon="$(hyprctl monitors -j 2>/dev/null | python3 -c 'import json,sys;print(next((m["name"] for m in json.load(sys.stdin) if m.get("focused")),""))' 2>/dev/null)"
+  if [ -n "$mon" ]; then grim -t jpeg -q 85 -o "$mon" "$out"; else grim -t jpeg -q 85 "$out"; fi
+fi
+echo "$out"

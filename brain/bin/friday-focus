@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# friday-focus start <minutes> [what you're focusing on…] | stop | status | done
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+D="${XDG_RUNTIME_DIR:-/tmp}/friday"; S="$D/focus.json"; mkdir -p "$D"
+case "$1" in
+  start)
+    M="${2:-25}"; shift 2 2>/dev/null; TASK="${*:-Focus}"
+    systemctl --user stop friday-focus.timer >/dev/null 2>&1
+    NOW=$(date +%s); END=$((NOW + M * 60))
+    python3 -c 'import json,sys;json.dump({"task":sys.argv[1],"started":int(sys.argv[2]),"ends":int(sys.argv[3]),"minutes":int(sys.argv[4])},open(sys.argv[5],"w"))' "$TASK" "$NOW" "$END" "$M" "$S"
+    systemd-run --user --quiet --unit friday-focus --on-active="${M}m" --timer-property=AccuracySec=1s "$0" done
+    echo "focus: ${M}m on \"$TASK\" (ends $(date -d "@$END" +%H:%M))" ;;
+  stop)
+    systemctl --user stop friday-focus.timer >/dev/null 2>&1; rm -f "$S"; echo "focus stopped" ;;
+  done)
+    T="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["task"])' "$S" 2>/dev/null)"
+    rm -f "$S"
+    /usr/bin/notify-send -a Friday -u critical -i alarm "Focus session done" "${T:-Nice work.} Take a short break." ;;
+  status|*) [ -f "$S" ] && cat "$S" || echo '{}' ;;
+esac

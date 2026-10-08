@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# friday-notify <title> [body] — desktop notification attributed to Friday.
+exec notify-send -a Friday "${1:-Friday}" "${2:-}"

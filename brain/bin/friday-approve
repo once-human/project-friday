@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""Friday permission policy — a Claude Code PreToolUse hook.
+
+Every tool call Friday wants to make passes through here and gets one of:
+  allow  read-only inspection and small reversible actions: runs silently
+  ask    anything that changes state: the Friday overlay shows an approval card
+  deny   credentials, privilege escalation, disk-destroying commands: refused outright
+Every decision is appended to ~/.local/share/friday/audit.log.
+"""
+import json, os, re, shlex, subprocess, sys, time, uuid
+
+HOME = os.path.expanduser("~")
+JH = os.environ.get("FRIDAY_HOME", os.path.join(HOME, ".local/share/friday"))
+RT = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "friday")
+AUDIT = os.path.join(JH, "audit.log")
+APPROVAL_TIMEOUT = 120
+RANK = {"allow": 0, "ask": 1, "deny": 2}
+RISK = {"low": 0, "medium": 1, "high": 2}
+
+# ------------------------------------------------------------------ helpers
+def audit(decision, tool, summary, reason):
+    try:
+        with open(AUDIT, "a") as f:
+            f.write(json.dumps({"t": time.strftime("%Y-%m-%d %H:%M:%S"), "decision": decision,
+                                "tool": tool, "what": summary[:300], "why": reason}) + "\n")
+    except Exception:
+        pass
+
+def emit(decision, reason, tool="", summary=""):
+    audit(decision, tool, summary, reason)
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse",
+                                              "permissionDecision": decision,
+                                              "permissionDecisionReason": reason}}))
+    sys.exit(0)
+
+def rp(p):
+    p = os.path.expandvars(os.path.expanduser(str(p)))
+    return os.path.realpath(p)
+
+def under(p, *roots):
+    p = rp(p)
+    return any(p == r or p.startswith(r.rstrip("/") + "/") for r in map(os.path.realpath, roots))
+
+SAFE_WRITE_ROOTS = ("/tmp", JH)
+
+SENSITIVE = [re.compile(x, re.I) for x in (
+    r"/\.ssh(/|$)", r"/\.gnupg(/|$)", r"/\.claude/\.credentials", r"/\.claude\.json$",
+    r"/\.config/(google-chrome|chromium|BraveSoftware|vivaldi|microsoft-edge|zen|discord|Claude|1Password|Bitwarden)(/|$)",
+    r"/\.(mozilla|zen|librewolf)(/|$)", r"/\.local/share/keyrings", r"/\.local/share/kwalletd",
+    r"(^|/)(Login Data|Cookies|Web Data|logins\.json|key[34]\.db|cookies\.sqlite)$",
+    r"/etc/(shadow|gshadow|sudoers)", r"\.kdbx?$", r"(^|/)id_(rsa|ed25519|ecdsa|dsa)(\.|$)",
+    r"/\.aws/credentials", r"/\.netrc$", r"/\.config/gh/hosts\.yml$", r"/\.docker/config\.json$",
+    r"/\.npmrc$", r"/\.pypirc$", r"/\.config/rclone/", r"/\.git-credentials$",
+)]
+def sensitive(s):
+    s = os.path.expanduser(str(s))
+    return any(r.search(s) for r in SENSITIVE)
+
+def worst(a, b):
+    """combine two (decision, reason, risk) tuples, keeping the stricter one"""
+    if RANK[b[0]] > RANK[a[0]]: return b
+    if RANK[b[0]] == RANK[a[0]] and RISK[b[2]] > RISK[a[2]]: return b
+    return a
+
+A = lambda why="read-only": ("allow", why, "low")
+Q = lambda why, risk="medium": ("ask", why, risk)
+D = lambda why: ("deny", why, "high")
+
+# ------------------------------------------------------------------ bash policy
+PURE_RO = set("""ls cat head tail wc du df free uptime uname date whoami id hostname hostnamectl lsblk lscpu lspci
+lsusb lsmod sensors nproc printenv echo printf pwd which whereis type file stat tree basename dirname realpath
+readlink sort uniq cut tr awk grep egrep fgrep rg fd fdfind jq column nl tac diff cmp md5sum sha1sum sha256sum
+sleep true false test [ wl-paste fc-list ps pgrep pidof lsof ss findmnt blkid timedatectl localectl loginctl
+xxd od strings ldd cd export unset set read dmesg lsns numfmt expr seq rev fold paste comm join tee-never
+fastfetch neofetch grim slurp notify-send wl-copy gtk-launch playerctl journalctl""".split())
+DENY_PROGS = {"sudo", "doas", "su", "pkexec", "run0"}
+DISK_DESTROY = {"dd", "mkfs", "fdisk", "sfdisk", "gdisk", "parted", "wipefs", "shred", "cryptsetup",
+                "mkswap", "blkdiscard", "mkfs.ext4", "mkfs.btrfs", "mkfs.vfat", "mkfs.xfs", "mkfs.fat"}
+POWER = {"reboot", "shutdown", "poweroff", "halt"}
+SHELLS = {"sh", "bash", "zsh", "fish", "dash", "python", "python3", "node", "perl", "ruby", "php", "lua"}
+WRITERS = {"mkdir", "touch", "cp", "mv", "rm", "ln", "chmod", "chown", "truncate", "install", "rsync",
+           "tar", "unzip", "zip", "7z", "tee", "rmdir", "mktemp"}
+HYPR_READ = {"clients", "monitors", "workspaces", "activewindow", "activeworkspace", "devices", "version",
+             "binds", "layers", "getoption", "splash", "cursorpos", "animations", "globalshortcuts",
+             "layouts", "configerrors", "descriptions", "rollinglog", "systeminfo", "notify", "workspacerules", "-j"}
+HYPR_DISPATCH_SAFE = {"workspace", "focuswindow", "togglefloating", "fullscreen", "fullscreenstate", "movefocus",
+                      "cyclenext", "togglespecialworkspace", "movetoworkspace", "movetoworkspacesilent",
+                      "pin", "centerwindow", "resizeactive", "moveactive", "focusmonitor", "swapnext",
+                      "togglesplit", "focuscurrentorlast", "focusworkspaceoncurrentmonitor", "bringactivetotop"}
+
+def rm_target_is_catastrophic(args):
+    for a in args:
+        if a.startswith("-"): continue
+        p = os.path.expandvars(os.path.expanduser(a))
+        if a in ("/", "/*", "~", "~/", "$HOME", "*", ".", "..") or p.rstrip("/") in ("", HOME) or p in ("/*", HOME + "/*"):
+            return True
+        if os.path.realpath(p).count("/") <= 1 and os.path.realpath(p) not in ("/tmp",):
+            return True
+    return False
+
+def writer_policy(prog, args):
+    paths = [a for a in args if not a.startswith("-") and not re.fullmatch(r"\d+(\.\d+)?|[ugoa]*[+-=][rwxXst]+|[0-7]{3,4}|[\w.-]+:[\w.-]+", a)]
+    flags = "".join(a for a in args if a.startswith("-"))
+    if prog in ("rm", "rmdir") and ("r" in flags or "R" in flags or "f" in flags or "recursive" in flags) and rm_target_is_catastrophic(args):
+        return D("refusing a recursive/forced delete of a top-level or home path")
+    if prog in ("chmod", "chown") and ("R" in flags) and any(a in ("/", "~", HOME, "/*") for a in paths):
+        return D("refusing recursive permission change on / or home")
+    if prog in ("tar", "unzip", "zip", "7z", "rsync", "cp", "mv", "install", "ln") and not paths:
+        return A("no path args")
+    if prog == "mktemp": return A("temp file")
+    if paths and all(under(p, *SAFE_WRITE_ROOTS) for p in paths):
+        return A("scratch space only")
+    risk = "high" if prog in ("rm", "rmdir", "truncate", "shred") or ("r" in flags and prog == "rm") else "medium"
+    return Q(f"{prog} changes files outside scratch space", risk)
+
+def split_segments(cmd):
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    toks = list(lex)
+    segs, cur = [], []
+    for t in toks:
+        if t in (";", "&&", "||", "|", "&", "|&"):
+            if cur: segs.append((cur, t))
+            cur = []
+        else:
+            cur.append(t)
+    if cur: segs.append((cur, None))
+    return segs
+
+REDIR = re.compile(r"^[0-9]*(>>?|<<?<?|>&|<&|&>>?|>\|)$")
+
+def policy_segment(toks, followed_by_pipe_from_fetch):
+    # strip redirects (judge their targets) and env assignments / wrappers
+    out, redirect_verdict, i = [], A(), 0
+    while i < len(toks):
+        t = toks[i]
+        if t in ("(", ")", "((", "))", "<(", ">("):
+            return Q("subshell / process substitution")
+        if REDIR.match(t):
+            op = t
+            tgt = toks[i + 1] if i + 1 < len(toks) else ""
+            i += 2
+            if op.endswith("<<") or op.endswith("<<<") or op == "<<<":
+                return Q("heredoc / here-string")
+            if op.startswith("<"):
+                if sensitive(tgt): return D("reads a credential/browser-data path")
+                continue
+            if re.fullmatch(r"&?\d+|-", tgt) and op.endswith("&"): continue
+            if tgt == "/dev/null" or under(tgt, *SAFE_WRITE_ROOTS): continue
+            if tgt.startswith("/dev/sd") or tgt.startswith("/dev/nvme") or tgt.startswith("/dev/mmcblk"):
+                return D("redirect onto a block device")
+            redirect_verdict = worst(redirect_verdict, Q("redirects output into a file outside scratch space"))
+            continue
+        out.append(t); i += 1
+    toks = out
+    while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]): toks = toks[1:]
+    while toks and os.path.basename(toks[0]) in ("env", "command", "nice", "ionice", "time", "nohup", "setsid", "stdbuf", "timeout", "builtin"):
+        w = os.path.basename(toks[0]); toks = toks[1:]
+        while toks and (toks[0].startswith("-") or (w == "timeout" and re.fullmatch(r"[\d.]+[smhd]?", toks[0])) or re.match(r"^[A-Za-z_]\w*=", toks[0])): toks = toks[1:]
+    if not toks: return redirect_verdict
+    prog, args = os.path.basename(toks[0]), toks[1:]
+    joined = " ".join(args)
+
+    if any(sensitive(x) for x in [prog] + args):
+        return D("touches credentials / browser data / key material")
+    if prog in DENY_PROGS: return D(f"{prog}: privilege escalation can't be approved from here. Give the user the exact command to run in a terminal instead")
+    if prog in DISK_DESTROY or prog.startswith("mkfs"): return D(f"{prog} can destroy disks")
+    if prog in POWER: return Q(f"{prog} will end your session", "high")
+    if followed_by_pipe_from_fetch and prog in SHELLS: return D("piping a download straight into a shell")
+    if prog in WRITERS: return worst(redirect_verdict, writer_policy(prog, args))
+    if prog.startswith("friday-") or os.path.realpath(toks[0]).startswith(os.path.realpath(JH) + "/bin/"):
+        return redirect_verdict if prog != "friday-integrate" else Q("re-patching the shell config")
+    # --- per-program rules ---
+    v = None
+    if prog in PURE_RO: v = A()
+    elif prog == "sed":
+        v = Q("sed -i edits files") if any(a == "-i" or a.startswith("-i") or a == "--in-place" for a in args) else A()
+    elif prog == "find":
+        v = Q("find with an action (-exec/-delete)") if any(a in ("-exec", "-execdir", "-ok", "-delete", "-fprint", "-fprintf") for a in args) else A()
+    elif prog in ("curl", "wget"):
+        bad = {"-o", "-O", "-d", "-F", "-T", "-K", "-X", "--output", "--data", "--data-raw", "--data-binary", "--form", "--upload-file", "-P", "--post-data", "--post-file", "--config"}
+        v = Q("download/upload with curl/wget") if any(a in bad or a.startswith(("--data", "--output", "-o", "-O")) for a in args) else A("plain fetch")
+    elif prog == "ip":
+        v = Q("changes network config") if re.search(r"\b(add|del|delete|set|flush|change|replace)\b", joined) else A()
+    elif prog == "nmcli":
+        ok = re.fullmatch(r"(-\S+\s+)*(general( status)?|radio( all)?|device( status| show.*| wifi list.*)?|connection( show.*)?|networking connectivity)?\s*", joined)
+        v = A() if ok else Q("changes network state")
+    elif prog == "bluetoothctl":
+        v = A() if args and args[0] in ("show", "devices", "info", "paired-devices") else Q("bluetooth action")
+    elif prog == "pactl":
+        v = A() if args and (args[0] in ("list", "info", "stat") or args[0].startswith(("get-", "set-sink-volume", "set-sink-mute", "set-source-volume", "set-source-mute"))) else Q("audio config change", "low")
+    elif prog == "wpctl":
+        v = A() if args and args[0] in ("status", "inspect", "get-volume", "set-volume", "set-mute") else Q("audio routing change", "low")
+    elif prog == "brightnessctl":
+        v = A() if (not args or args[0] in ("get", "info", "max", "set", "-s", "-r", "s", "-d", "--device", "-l", "i", "g", "m")) else Q("brightness", "low")
+    elif prog == "systemctl":
+        sub = [a for a in args if not a.startswith("-")]
+        v = A() if sub and sub[0] in ("status", "is-active", "is-enabled", "is-failed", "list-units", "list-unit-files", "list-timers", "show", "cat", "list-dependencies", "list-sockets") else Q("changes a service")
+    elif prog in ("pacman", "paru", "yay"):
+        v = A() if args and re.fullmatch(r"-(Q\w*|Si|Ss|Sl|Sii|F\w*|T|Qi|Ql)|--query|--search", args[0]) else Q("package change (installs/removals)")
+    elif prog == "flatpak":
+        v = A() if args and args[0] in ("list", "info", "search", "remotes", "remote-ls") else Q("flatpak change")
+    elif prog == "git":
+        a2 = list(args)
+        while a2 and (a2[0].startswith("-") or a2[0] in ()):
+            if a2[0] in ("-C", "-c"): a2 = a2[2:]
+            else: a2 = a2[1:]
+        sub = a2[0] if a2 else ""
+        rest = " ".join(a2[1:])
+        if sub in ("status", "log", "diff", "show", "rev-parse", "ls-files", "blame", "describe", "shortlog", "reflog", "grep", "ls-remote", "rev-list", "cat-file", "check-ignore", "whatchanged", "ls-tree", "name-rev", "var", "count-objects"):
+            v = A()
+        elif sub in ("branch", "tag", "remote", "stash", "config") and not re.search(r"(^| )(-d|-D|-m|-M|add|remove|rm|set-url|rename|prune|drop|pop|apply|push|clear|--unset|--add|--global|--system)\b", rest) and (sub != "config" or "--get" in rest or "--list" in rest or "-l" in rest.split()):
+            v = A()
+        else:
+            hi = sub in ("push", "reset", "clean", "rebase", "checkout", "restore", "merge", "pull", "commit")
+            v = Q(f"git {sub or '?'} changes the repo (you asked me not to commit/push unless told to)", "high" if hi else "medium")
+    elif prog == "hyprctl":
+        a2 = [a for a in args if not a.startswith("-")]
+        sub = a2[0] if a2 else ""
+        if sub in HYPR_READ: v = A()
+        elif sub == "dispatch":
+            d = a2[1] if len(a2) > 1 else ""
+            if d in HYPR_DISPATCH_SAFE: v = A("window/workspace navigation")
+            elif d == "exec": v = Q("launches a program: " + " ".join(a2[2:])[:120], "medium")
+            elif d in ("exit",): v = Q("ends your Hyprland session", "high")
+            elif d in ("killactive", "closewindow", "forcerendererreload", "dpms"): v = Q(f"dispatch {d}", "medium")
+            else: v = Q(f"hyprctl dispatch {d}", "medium")
+        elif sub == "reload": v = Q("reloads Hyprland config", "low")
+        else: v = Q(f"hyprctl {sub}", "medium")
+    elif prog == "adb":
+        a2 = [a for a in args if not a.startswith("-")]
+        if a2[:1] in (["devices"], ["get-state"], ["get-serialno"], ["version"]) or (a2[:2] == ["shell", "getprop"]) or (a2[:1] == ["logcat"] and "-d" in args) or a2[:2] == ["shell", "dumpsys"]:
+            v = A()
+        else:
+            v = Q("adb action on your phone: " + joined[:100], "high" if a2[:1] in (["sideload"], ["reboot"], ["uninstall"]) else "medium")
+    elif prog == "fastboot":
+        v = A() if args[:1] in (["devices"], ["getvar"]) else Q("FASTBOOT can brick/wipe the device: " + joined[:100], "high")
+    elif prog == "gh":
+        v = A() if re.match(r"^(auth status|(repo|pr|issue|run|release|workflow) (view|list|status)|status|search)", joined) else Q("GitHub action")
+    elif prog == "docker":
+        v = A() if args and args[0] in ("ps", "images", "logs", "inspect", "info", "version", "stats", "volume", "network") and not re.search(r"\b(rm|prune|create|connect)\b", joined) else Q("docker action")
+    elif prog in ("npm", "pnpm", "yarn", "pip", "pip3", "uv", "cargo", "go", "make", "cmake", "gradle", "flutter", "dart", "bun", "npx", "node", "python", "python3", "pipx"):
+        if joined in ("--version", "-v", "-V", "version") or re.match(r"^(ls|list|view|outdated|config get|info|why|doctor|--help|-h)\b", joined): v = A()
+        else: v = Q(f"{prog} runs code / modifies the project")
+    elif prog in ("xdg-open",):
+        v = A("opens in your default app") if args and not args[0].startswith("-") and (re.match(r"^https?://", args[0]) or under(args[0], HOME)) else Q("xdg-open on something unusual", "low")
+    elif prog in ("kill", "pkill", "killall", "xkill"):
+        v = Q("ends processes", "medium")
+    elif prog in SHELLS:
+        v = A() if joined in ("--version", "-V") else Q(f"{prog} runs arbitrary code")
+    else:
+        v = Q(f"{prog} isn't on the auto-approve list")
+    return worst(redirect_verdict, v)
+
+def policy_bash(cmd):
+    if not cmd.strip(): return A("empty")
+    if "\n" in cmd.strip():
+        return Q("multi-line script")
+    if "$(" in cmd or "`" in cmd:
+        # allow only simple, obviously harmless substitutions
+        if not re.fullmatch(r"[^`$]*(\$\((date|whoami|hostname|pwd|uname[^)]*|id -un)\))?[^`$]*", cmd):
+            return Q("command substitution")
+    try:
+        segs = split_segments(cmd)
+    except ValueError:
+        return Q("couldn't parse this command safely")
+    verdict, prev_fetch = A(), False
+    for toks, sep in segs:
+        v = policy_segment(toks, prev_fetch and sep is not None or prev_fetch)
+        verdict = worst(verdict, v)
+        # track "curl ... |" feeding a shell
+        base = os.path.basename(toks[0]) if toks else ""
+        prev_fetch = base in ("curl", "wget") and sep in ("|", "|&")
+    return verdict
+
+# ------------------------------------------------------------------ tool policy
+def policy(tool, inp):
+    if tool == "Bash":
+        cmd = inp.get("command", "")
+        return policy_bash(cmd), cmd
+    if tool in ("Read", "Glob", "Grep", "LS", "NotebookRead"):
+        vals = [str(v) for v in inp.values()]
+        if any(sensitive(v) for v in vals): return D("that path holds credentials / browser data"), " ".join(vals)
+        if any(re.search(r"(^|/)\.env(\.|$)", v) for v in vals): return Q("reading a .env file (may contain secrets)", "low"), " ".join(vals)
+        return A(), " ".join(vals)
+    if tool in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        path = inp.get("file_path") or inp.get("notebook_path") or ""
+        if sensitive(path): return D("that path holds credentials"), path
+        if under(path, *SAFE_WRITE_ROOTS): return A("Friday scratch/memory"), path
+        sysish = under(path, "/etc", "/usr", "/boot", "/bin", "/sbin", "/lib")
+        return Q(f"{tool} {path}", "high" if sysish else "medium"), f"{tool}: {path}"
+    if tool in ("WebFetch", "WebSearch", "TodoWrite", "Task", "ExitPlanMode", "BashOutput", "KillShell", "SlashCommand"):
+        return A(), json.dumps(inp)[:200]
+    if tool.startswith("mcp__"):
+        return Q(f"MCP tool {tool}", "medium"), tool
+    return Q(f"unknown tool {tool}", "medium"), tool
+
+# ------------------------------------------------------------------ approval round-trip
+def ask_user(tool, summary, reason, risk):
+    rid = uuid.uuid4().hex
+    os.makedirs(os.path.join(RT, "res"), exist_ok=True)
+    payload = json.dumps({"id": rid, "tool": tool, "command": summary, "reason": reason, "risk": risk})
+    ok = False
+    try:
+        r = subprocess.run(["qs", "-c", "friday", "ipc", "call", "friday", "approval", payload],
+                           capture_output=True, timeout=6)
+        ok = (r.returncode == 0)
+    except Exception:
+        ok = False
+    if not ok:
+        try: subprocess.run(["notify-send", "-a", "Friday", "Friday needs approval", "overlay isn't running, so I denied: " + summary[:140]], timeout=3)
+        except Exception: pass
+        return "deny", "No approval UI is running, so the action was not allowed. Tell the user to start Friday (qs -c friday) or run it themselves."
+    res = os.path.join(RT, "res", rid)
+    end = time.time() + APPROVAL_TIMEOUT
+    while time.time() < end:
+        if os.path.exists(res):
+            try:
+                v = open(res).read().strip()
+                os.unlink(res)
+            except Exception:
+                v = "deny"
+            if v == "allow": return "allow", "approved by the user"
+            return "deny", "The user declined this action. Do not retry it; offer an alternative or ask what they'd prefer."
+        time.sleep(0.15)
+    return "deny", "Approval timed out with no answer. Do not retry unless the user asks again."
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:
+        emit("ask", "hook input unreadable")
+    tool, inp = data.get("tool_name", ""), data.get("tool_input", {}) or {}
+    (decision, reason, risk), summary = policy(tool, inp)
+    if decision == "ask":
+        d, why = ask_user(tool, summary, reason, risk)
+        emit(d, why if d == "deny" else f"{reason} — {why}", tool, summary)
+    emit(decision, reason, tool, summary)
+
+if __name__ == "__main__":
+    main()

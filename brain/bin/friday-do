@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Instant native controls used by the Friday UI (no AI round-trip).
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+case "$1" in
+  media-toggle) playerctl play-pause ;;
+  media-next)   playerctl next ;;
+  media-prev)   playerctl previous ;;
+  vol-up)       wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+ ;;
+  vol-down)     wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%- ;;
+  mute)         wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle ;;
+  bright-up)    brightnessctl set 5%+ ;;
+  bright-down)  brightnessctl set 5%- ;;
+  *) echo "unknown action: $1" >&2; exit 2 ;;
+esac

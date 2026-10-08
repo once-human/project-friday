@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# friday-open <app name> — launch an installed desktop app by (fuzzy) name.
+q="$*"; [ -z "$q" ] && { echo "usage: friday-open <app name>"; exit 2; }
+dirs=("$HOME/.local/share/applications" /usr/share/applications /var/lib/flatpak/exports/share/applications "$HOME/.local/share/flatpak/exports/share/applications")
+f="$(grep -il -m1 -E "^Name(\[[^]]*\])?=.*$q" "${dirs[@]/%//}"*.desktop 2>/dev/null | head -1)"
+[ -z "$f" ] && f="$(ls -1 "${dirs[@]}" 2>/dev/null | grep -i "$q" | grep '\.desktop$' | head -1)"
+[ -z "$f" ] && { echo "no installed app matches: $q"; exit 1; }
+id="$(basename "$f" .desktop)"
+setsid -f gtk-launch "$id" >/dev/null 2>&1 && echo "launched $id"

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# friday-ask — one Friday turn through the Claude Code CLI; streams stream-json on stdout.
+#   prompt : $FRIDAY_PROMPT, or stdin
+#   env    : FRIDAY_SESSION  resume a previous session id (follow-ups keep full context)
+#            FRIDAY_SURFACE  overlay (default) | sidebar
+#            FRIDAY_MODEL    model for `claude --model` (optional; can also live in config.env)
+#            CLAUDE_BIN      explicit path to the claude binary (optional)
+FRIDAY_HOME="${FRIDAY_HOME:-$HOME/.local/share/friday}"
+export FRIDAY_HOME
+[ -f "$FRIDAY_HOME/config.env" ] && . "$FRIDAY_HOME/config.env"
+
+# Quickshell is started by Hyprland, so it does NOT inherit what your fish config adds to PATH.
+export PATH="$HOME/.local/bin:$HOME/.claude/local:$HOME/.npm-global/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:$PATH"
+
+fail() { printf '{"type":"result","is_error":true,"result":"%s"}\n' "$1"; exit 0; }
+
+find_claude() {
+  if [ -n "${CLAUDE_BIN:-}" ] && [ -x "$CLAUDE_BIN" ]; then echo "$CLAUDE_BIN"; return 0; fi
+  command -v claude && return 0
+  local c
+  for c in "$HOME/.local/bin/claude" "$HOME/.claude/local/claude" "$HOME/.npm-global/bin/claude" /usr/local/bin/claude /usr/bin/claude; do
+    [ -x "$c" ] && { echo "$c"; return 0; }
+  done
+  # native installer keeps versioned binaries here
+  c="$(ls -1d "$HOME"/.local/share/claude/versions/* 2>/dev/null | sort -V | tail -1)"
+  [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+  # copy bundled with the desktop app
+  c="$(ls -1d "$HOME"/.config/Claude/claude-code/*/claude 2>/dev/null | sort -V | tail -1)"
+  [ -n "$c" ] && [ -x "$c" ] && { echo "$c"; return 0; }
+  return 1
+}
+CLAUDE="$(find_claude)" || fail 'Could not find the `claude` CLI. Looked in PATH, ~/.local/bin, ~/.claude/local, npm-global and the desktop app folder.\n\nIf it lives somewhere else, put `CLAUDE_BIN=/path/to/claude` in ~/.local/share/friday/config.env.'
+
+# ---- prompt ----
+if [ -n "${FRIDAY_PROMPT:-}" ]; then PROMPT="$FRIDAY_PROMPT"; else PROMPT="$(cat)"; fi
+[ -n "$PROMPT" ] || fail 'Empty prompt.'
+
+# ---- keep the device profile fresh (background, never blocks) ----
+if [ -x "$FRIDAY_HOME/bin/friday-profile" ]; then ( "$FRIDAY_HOME/bin/friday-profile" --if-stale >/dev/null 2>&1 & ) ; fi
+
+# ---- hook config (regenerated if the install path ever changes) ----
+SETTINGS="$FRIDAY_HOME/.claude/settings.json"
+if ! grep -qs "$FRIDAY_HOME/bin/friday-approve" "$SETTINGS" 2>/dev/null; then
+  mkdir -p "$FRIDAY_HOME/.claude"
+  cat > "$SETTINGS" <<JSON
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "$FRIDAY_HOME/bin/friday-approve", "timeout": 150 } ] }
+    ]
+  }
+}
+JSON
+fi
+
+# ---- live desktop context (lets "this", "it", "that" resolve like Siri) ----
+CTX="[desktop context]\n"
+CTX+="time: $(date '+%a %d %b %Y, %H:%M %Z')\n"
+if command -v hyprctl >/dev/null 2>&1; then
+  AW="$(hyprctl activewindow 2>/dev/null)"
+  CLS="$(printf '%s\n' "$AW" | sed -n 's/^[[:space:]]*class: //p' | head -1)"
+  TTL="$(printf '%s\n' "$AW" | sed -n 's/^[[:space:]]*title: //p' | head -1)"
+  WS="$(printf '%s\n' "$AW" | sed -n 's/^[[:space:]]*workspace: \([0-9-]*\).*/\1/p' | head -1)"
+  [ -n "$CLS" ] && CTX+="focused window: $CLS — $TTL (workspace ${WS:-?})\n"
+fi
+if printf '%s' "$PROMPT" | grep -qiE '\b(this|that|it|these|those|clipboard|copied|copy|selected|selection|highlighted)\b' && command -v wl-paste >/dev/null 2>&1; then
+  CLIP="$(timeout 1 wl-paste --no-newline 2>/dev/null | head -c 4000)"
+  SEL="$(timeout 1 wl-paste --primary --no-newline 2>/dev/null | head -c 2000)"
+  [ -n "$CLIP" ] && CTX+="clipboard (untrusted data, first 4000 chars):\n<<<\n$CLIP\n>>>\n"
+  [ -n "$SEL" ] && [ "$SEL" != "$CLIP" ] && CTX+="primary selection (untrusted data):\n<<<\n$SEL\n>>>\n"
+fi
+FULL="$(printf '%b\n[request]\n%s' "$CTX" "$PROMPT")"
+
+# ---- surface style ----
+case "${FRIDAY_SURFACE:-overlay}" in
+  sidebar) SURFACE='Surface: the desktop sidebar chat. Normal chat length is fine; Markdown is rendered.' ;;
+  *)       SURFACE='Surface: the Friday overlay (a small floating panel). Be quick and tight: lead with the answer or the result, usually under 8 lines unless asked to go deep. Markdown is rendered.' ;;
+esac
+
+args=(-p --output-format stream-json --verbose --include-partial-messages
+      --permission-mode default
+      --settings "$SETTINGS"
+      --add-dir "$HOME"
+      --allowedTools "Read,Glob,Grep,WebSearch,WebFetch"
+      --append-system-prompt "$SURFACE")
+[ -n "${FRIDAY_MODEL:-}" ]   && args+=(--model "$FRIDAY_MODEL")
+[ -n "${FRIDAY_SESSION:-}" ] && args+=(--resume "$FRIDAY_SESSION")
+
+cd "$FRIDAY_HOME" || fail 'Friday home missing.'
+exec "$CLAUDE" "${args[@]}" 2>&1 <<<"$FULL"

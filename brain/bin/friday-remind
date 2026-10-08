@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# friday-remind <when> <message…>   when: 10m | 1h30m | 45s | 18:30 | tomorrow 09:00
+# friday-remind --list | --cancel <id>
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+if [ "$1" = "--list" ]; then systemctl --user list-timers 'friday-remind-*' --no-pager; exit; fi
+if [ "$1" = "--cancel" ]; then systemctl --user stop "friday-remind-$2.timer"; exit; fi
+WHEN="$1"; shift
+[ "$WHEN" = "tomorrow" ] && { WHEN="tomorrow $1"; shift; }
+MSG="${*:-Reminder}"
+ID="$(date +%s)"
+if [[ "$WHEN" =~ ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$ ]] && [ -n "$WHEN" ]; then
+  SPEC=(--on-active="$WHEN")
+else
+  T="$(date -d "$WHEN" +%s 2>/dev/null)" || { echo "can't understand time: $WHEN" >&2; exit 2; }
+  [ "$T" -le "$(date +%s)" ] && T="$(date -d "tomorrow $WHEN" +%s)"
+  SPEC=(--on-calendar="$(date -d "@$T" '+%Y-%m-%d %H:%M:%S')")
+fi
+systemd-run --user --quiet --unit "friday-remind-$ID" "${SPEC[@]}" --timer-property=AccuracySec=1s \
+  /usr/bin/notify-send -a Friday -u critical -i alarm "Reminder" "$MSG" \
+  && echo "reminder $ID set ($WHEN): $MSG"
