@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+"""Idempotent, reversible hooks from Friday into illogical-impulse (ii).
+
+Principles:
+  * ii stays stock on disk unless every anchor matches exactly once (else: skip the whole file).
+  * Every inserted chunk is marked `friday-integration`; revert restores the exact stock text.
+  * Re-run at login: after an ii update wipes the hooks, they are re-applied (or skipped if ii changed).
+  * Friday itself (Super+Space) never depends on these hooks.
+"""
+import argparse, os, shutil, subprocess, sys, hashlib
+from pathlib import Path
+sys.dont_write_bytecode = True
+
+HOME = Path.home()
+STATE = HOME / ".local/state/friday"
+
+ROW = '''        // >>> friday-integration
+        const jvQuery = root.query.trim();
+        const jvWords = jvQuery.length > 0 ? jvQuery.split(/\\s+/).length : 0;
+        if ((jvWords >= 2 || jvQuery.endsWith("?")) && !/^[\\/>;:=$?]/.test(jvQuery)) {
+            const jvRow = resultComp.createObject(null, {
+                name: jvQuery,
+                verb: Translation.tr("Ask"),
+                type: "Friday",
+                iconName: "star",
+                iconType: LauncherSearchResult.IconType.Material,
+                execute: () => {
+                    Quickshell.execDetached(["qs", "-c", "friday", "ipc", "call", "friday", "ask", jvQuery]);
+                }
+            });
+            const jvFirst = jvQuery.endsWith("?") || jvWords >= 5 || (jvWords >= 3 && appResultObjects.length === 0);
+            if (jvFirst) result.unshift(jvRow); else result.push(jvRow);
+        }
+        // <<< friday-integration
+'''
+
+MODEL = '''        // >>> friday-integration
+        "friday": aiModelComponent.createObject(this, {
+            "name": "Friday",
+            "icon": "claude-symbolic",
+            "description": Translation.tr("Project Friday | Powered by Claude | Claude Code CLI | Sees your desktop and can act on it (asks before risky actions)"),
+            "homepage": "https://claude.com/claude-code",
+            "endpoint": "",
+            "model": "claude",
+            "requires_key": false,
+            "key_id": "friday",
+            "api_format": "claude-cli",
+        }),
+        // <<< friday-integration
+'''
+
+TOOLS = '''        },
+        // >>> friday-integration
+        "claude-cli": { "functions": [], "search": [], "none": [] },
+        // <<< friday-integration
+'''
+
+
+BAR_ITEMS = """        // >>> friday-integration
+        Resource {
+            id: fridayCpu
+            iconName: "planner_review"
+            percentage: ResourceUsage.cpuUsage
+            shown: Config.options.bar.resources.alwaysShowCpu || 
+                !(MprisController.activePlayer?.trackTitle?.length > 0) ||
+                root.alwaysShowAllResources
+            warningThreshold: Config.options.bar.resources.cpuWarningThreshold
+        }
+
+        Resource {
+            iconName: "memory"
+            percentage: ResourceUsage.memoryUsedPercentage
+            Layout.leftMargin: fridayCpu.shown ? 6 : 0
+            warningThreshold: Config.options.bar.resources.memoryWarningThreshold
+        }
+
+        FridayLimit {
+            Layout.leftMargin: shown ? 6 : 0
+            shown: root.fridayUsage.ok === true && !!root.fridayUsage.five_hour
+            filledIcon: true
+            used: root.fridayUsage.five_hour ? root.fridayUsage.five_hour.pct / 100 : 0
+            elapsed: root.fridayElapsed(root.fridayUsage.five_hour, 5 * 3600)
+        }
+
+        FridayLimit {
+            Layout.leftMargin: shown ? 6 : 0
+            shown: root.fridayUsage.ok === true && !!root.fridayUsage.seven_day
+            filledIcon: false
+            used: root.fridayUsage.seven_day ? root.fridayUsage.seven_day.pct / 100 : 0
+            elapsed: root.fridayElapsed(root.fridayUsage.seven_day, 7 * 86400)
+        }
+        // <<< friday-integration
+"""
+
+BAR_ROOT = """    // >>> friday-integration
+    // Claude plan limits: ring = how much you've used; the small dot = how far through the window you are.
+    // Fill ahead of the dot means you're burning faster than it refills.
+    component FridayLimit: Item {
+        id: lim
+        property real used: 0
+        property real elapsed: -1
+        property bool filledIcon: true
+        property bool shown: true
+        readonly property bool hot: lim.used >= 0.85
+        visible: lim.shown
+        implicitWidth: lim.shown ? limRow.implicitWidth : 0
+        implicitHeight: Appearance.sizes.barHeight
+
+        RowLayout {
+            id: limRow
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: 2
+
+            Item {
+                Layout.alignment: Qt.AlignVCenter
+                implicitWidth: 20
+                implicitHeight: 20
+                ClippedFilledCircularProgress {
+                    id: limRing
+                    anchors.centerIn: parent
+                    lineWidth: Appearance.rounding.unsharpen
+                    value: lim.used
+                    implicitSize: 20
+                    colPrimary: lim.hot ? Appearance.colors.colError : Appearance.colors.colOnSecondaryContainer
+                    accountForLightBleeding: !lim.hot
+                    enableAnimation: false
+                    Item {
+                        anchors.centerIn: parent
+                        width: limRing.implicitSize
+                        height: limRing.implicitSize
+                        MaterialSymbol {
+                            anchors.centerIn: parent
+                            font.weight: Font.DemiBold
+                            fill: lim.filledIcon ? 1 : 0
+                            text: "star"
+                            iconSize: Appearance.font.pixelSize.normal
+                            color: Appearance.m3colors.m3onSecondaryContainer
+                        }
+                    }
+                }
+                Rectangle {
+                    visible: lim.elapsed >= 0
+                    width: 6
+                    height: 6
+                    radius: 3
+                    color: Appearance.colors.colOnLayer1
+                    border.width: 1
+                    border.color: Appearance.colors.colLayer1
+                    x: 10 + 8 * Math.sin(lim.elapsed * 2 * Math.PI) - 3
+                    y: 10 - 8 * Math.cos(lim.elapsed * 2 * Math.PI) - 3
+                }
+            }
+
+            Item {
+                Layout.alignment: Qt.AlignVCenter
+                implicitWidth: limMetrics.width
+                implicitHeight: limText.implicitHeight
+                TextMetrics {
+                    id: limMetrics
+                    text: "100"
+                    font.pixelSize: Appearance.font.pixelSize.small
+                }
+                StyledText {
+                    id: limText
+                    anchors.centerIn: parent
+                    color: lim.hot ? Appearance.colors.colError : Appearance.colors.colOnLayer1
+                    font.pixelSize: Appearance.font.pixelSize.small
+                    text: Math.round(lim.used * 100).toString()
+                }
+            }
+        }
+    }
+
+    property var fridayUsage: ({})
+    property double fridayNow: Date.now()
+    function fridayElapsed(b, windowSecs) {
+        if (!b || !b.resets_at) return -1;
+        const f = (root.fridayNow / 1000 - (b.resets_at - windowSecs)) / windowSecs;
+        return Math.max(0, Math.min(1, f));
+    }
+    function fridayLeft(at) {
+        if (!at) return "";
+        const s = Math.round(at - root.fridayNow / 1000);
+        if (s <= 0) return "";
+        const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+        if (d > 0) return d + "d " + h + "h";
+        if (h > 0) return h + "h " + m + "m";
+        return m + "m";
+    }
+    function fridayDescribe(b, week) {
+        if (!b) return "—";
+        const when = week ? Qt.formatDateTime(new Date(b.resets_at * 1000), "ddd h:mm AP") : "in " + root.fridayLeft(b.resets_at);
+        return Math.round(b.pct) + "% used  ·  resets " + when;
+    }
+    Timer {
+        interval: 30000
+        running: true
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: {
+            root.fridayNow = Date.now();
+            fridayUsageFile.reload();
+        }
+    }
+    FileView {
+        id: fridayUsageFile
+        path: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/friday/usage.json"
+        watchChanges: true
+        onFileChanged: reload()
+        onLoaded: {
+            try { root.fridayUsage = JSON.parse(text()); } catch (e) { }
+        }
+    }
+    // <<< friday-integration
+"""
+
+POPUP_COL = """        // >>> friday-integration
+        Column {
+            visible: !!(root.hoverTarget && root.hoverTarget.fridayUsage && root.hoverTarget.fridayUsage.ok === true)
+            anchors.top: parent.top
+            spacing: 8
+
+            StyledPopupHeaderRow {
+                icon: "star"
+                label: "Claude"
+            }
+            Column {
+                spacing: 4
+                StyledPopupValueRow {
+                    icon: "timelapse"
+                    label: "5-hour:"
+                    value: root.hoverTarget && root.hoverTarget.fridayDescribe ? root.hoverTarget.fridayDescribe(root.hoverTarget.fridayUsage.five_hour, false) : ""
+                }
+                StyledPopupValueRow {
+                    icon: "date_range"
+                    label: "Weekly:"
+                    value: root.hoverTarget && root.hoverTarget.fridayDescribe ? root.hoverTarget.fridayDescribe(root.hoverTarget.fridayUsage.seven_day, true) : ""
+                }
+                StyledPopupValueRow {
+                    icon: "radio_button_checked"
+                    label: "Dot = time passed in the window"
+                    value: ""
+                }
+            }
+        }
+        // <<< friday-integration
+"""
+
+def build_patches(ii: Path):
+    a_launch = "        return result;\n    }\n\n    Component {\n        id: resultComp"
+    a_prop = "    property Component mistralApiStrategy: MistralApiStrategy {}\n"
+    a_strat = '        "mistral": mistralApiStrategy.createObject(this),\n'
+    a_tools = '            "none": [],\n        }\n    }\n    property list<var> availableTools'
+    a_models = "    property var models: Config.options.policies.ai === 2 ? {} : {\n"
+    a_bar_imp = "import QtQuick.Layouts\n"
+    a_bar_res = """        Resource {
+            iconName: "memory"
+            percentage: ResourceUsage.memoryUsedPercentage
+            warningThreshold: Config.options.bar.resources.memoryWarningThreshold
+        }
+
+        Resource {
+            iconName: "swap_horiz"
+            percentage: ResourceUsage.swapUsedPercentage
+            shown: (Config.options.bar.resources.alwaysShowSwap && percentage > 0) || 
+                (MprisController.activePlayer?.trackTitle == null) ||
+                root.alwaysShowAllResources
+            Layout.leftMargin: shown ? 6 : 0
+            warningThreshold: Config.options.bar.resources.swapWarningThreshold
+        }
+
+        Resource {
+            iconName: "planner_review"
+            percentage: ResourceUsage.cpuUsage
+            shown: Config.options.bar.resources.alwaysShowCpu || 
+                !(MprisController.activePlayer?.trackTitle?.length > 0) ||
+                root.alwaysShowAllResources
+            Layout.leftMargin: shown ? 6 : 0
+            warningThreshold: Config.options.bar.resources.cpuWarningThreshold
+        }
+"""
+    a_bar_root = "    ResourcesPopup {\n        hoverTarget: root\n    }\n"
+    a_popup = """                    value: `${Math.round(ResourceUsage.cpuUsage * 100)}%`
+                }
+            }
+        }
+"""
+    bar = ii / "modules/ii/bar"
+    return {
+        bar / "Resources.qml": [
+            (a_bar_imp, a_bar_imp + "import Quickshell // friday-integration\nimport Quickshell.Io // friday-integration\nimport qs.modules.common.widgets // friday-integration\n"),
+            (a_bar_res, BAR_ITEMS),
+            (a_bar_root, BAR_ROOT + a_bar_root),
+        ],
+        bar / "ResourcesPopup.qml": [(a_popup, a_popup + POPUP_COL)],
+        ii / "services/LauncherSearch.qml": [(a_launch, ROW + a_launch)],
+        ii / "services/Ai.qml": [
+            (a_prop, a_prop + "    property Component claudeCliApiStrategy: ClaudeCliApiStrategy {} // friday-integration\n"),
+            (a_strat, a_strat + '        "claude-cli": claudeCliApiStrategy.createObject(this), // friday-integration\n'),
+            (a_tools, '            "none": [],\n' + TOOLS + "    }\n    property list<var> availableTools"),
+            (a_models, a_models + MODEL),
+        ],
+    }
+
+
+def log(msg):
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / "integrate.log", "a") as f:
+        f.write(msg + "\n")
+
+
+def write_atomic(path: Path, text: str):
+    tmp = path.with_name(path.name + ".friday-tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def apply_file(path: Path, pairs):
+    if not path.exists():
+        return "missing", f"{path.name}: not found"
+    text = path.read_text()
+    if all(new in text for _, new in pairs):
+        return "present", f"{path.name}: already hooked"
+    if any(new in text for _, new in pairs):
+        return "skipped", f"{path.name}: partially hooked; run --revert first"
+    for old, _ in pairs:
+        n = text.count(old)
+        if n != 1:
+            return "skipped", f"{path.name}: anchor matched {n}x (ii changed?): {old.strip()[:50]!r}"
+    for old, new in pairs:
+        text = text.replace(old, new, 1)
+    shutil.copy2(path, path.with_name(path.name + ".bak-friday"))
+    write_atomic(path, text)
+    return "applied", f"{path.name}: hooked"
+
+
+def revert_file(path: Path, pairs):
+    if not path.exists():
+        return "missing", f"{path.name}: not found"
+    text = path.read_text()
+    changed = False
+    for old, new in pairs:
+        if new in text:
+            text = text.replace(new, old, 1)
+            changed = True
+    if changed:
+        write_atomic(path, text)
+        bak = path.with_name(path.name + ".bak-friday")
+        if bak.exists():
+            bak.unlink()
+        return "reverted", f"{path.name}: restored"
+    bak = path.with_name(path.name + ".bak-friday")
+    if "friday-integration" in text and bak.exists():
+        write_atomic(path, bak.read_text())
+        bak.unlink()
+        return "reverted", f"{path.name}: restored from backup (hook definitions had changed)"
+    return "present", f"{path.name}: nothing to revert"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--ii-dir", default=str(HOME / ".config/quickshell/ii"))
+    ap.add_argument("--friday-home", default=str(HOME / ".local/share/friday"))
+    ap.add_argument("--revert", action="store_true")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--no-sidebar", action="store_true")
+    ap.add_argument("--no-bar", action="store_true")
+    a = ap.parse_args()
+
+    ii, jh = Path(a.ii_dir), Path(a.friday_home)
+    out = []
+
+    def say(s):
+        out.append(s)
+
+    if (STATE / "no-integrate").exists() and not a.revert and not a.status:
+        say("disabled by ~/.local/state/friday/no-integrate")
+    elif not ii.is_dir():
+        say(f"ii not found at {ii}")
+    else:
+        patches = build_patches(ii)
+        tmpl = jh / "integration"
+        copies = [
+            (tmpl / "ClaudeCliApiStrategy.qml", ii / "services/ai/ClaudeCliApiStrategy.qml"),
+            (tmpl / "claude-symbolic.svg", ii / "assets/icons/claude-symbolic.svg"),
+        ]
+        if a.status:
+            for p, pairs in patches.items():
+                t = p.read_text() if p.exists() else ""
+                say(f"{p.name}: {'hooked' if all(n in t for _, n in pairs) else 'stock'}")
+        elif a.revert:
+            for p, pairs in patches.items():
+                say(revert_file(p, pairs)[1])
+            for _, dst in copies:
+                if dst.exists():
+                    dst.unlink()
+                    say(f"removed {dst.name}")
+        else:
+            # Launcher hook is independent of the sidebar hook.
+            st, m = apply_file(ii / "services/LauncherSearch.qml", patches[ii / "services/LauncherSearch.qml"])
+            say(m)
+            if not a.no_bar:
+                for f in ("Resources.qml", "ResourcesPopup.qml"):
+                    st, m = apply_file(ii / "modules/ii/bar" / f, patches[ii / "modules/ii/bar" / f])
+                    say(m)
+            if not a.no_sidebar:
+                missing = [s for s, _ in copies if not s.exists()]
+                if missing:
+                    say("sidebar skipped: missing template " + missing[0].name)
+                else:
+                    # Copy assets first so the hooked Ai.qml never references a missing component.
+                    for src, dst in copies:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src, dst)
+                    st, m = apply_file(ii / "services/Ai.qml", patches[ii / "services/Ai.qml"])
+                    say(m)
+                    if st == "skipped":
+                        for _, dst in copies:
+                            if dst.exists():
+                                dst.unlink()
+
+    text = "\n".join(out)
+    log(text)
+    if not a.quiet:
+        print(text)
+    elif any(w in text for w in ("anchor matched", "partially", "missing template")):
+        # Tell the user once per distinct problem, never spam each login.
+        STATE.mkdir(parents=True, exist_ok=True)
+        marker = STATE / "last-warning"
+        h = hashlib.sha1(text.encode()).hexdigest()
+        if not marker.exists() or marker.read_text() != h:
+            marker.write_text(h)
+            n = jh / "bin/friday-notify"
+            if n.exists():
+                subprocess.run([str(n), "Friday", "ii changed; some Friday hooks were skipped. Super+Space still works."])
+
+
+if __name__ == "__main__":
+    main()
