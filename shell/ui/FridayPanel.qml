@@ -72,7 +72,8 @@ PanelWindow {
     property int sel: 0
     property string query: ""
 
-    readonly property bool home: Brain.messages.count === 0 && Brain.authState !== "needed" && Brain.approval === null
+    property bool showHistory: false
+    readonly property bool home: (Brain.messages.count === 0 || win.showHistory) && Brain.authState !== "needed" && Brain.approval === null
     readonly property bool highRisk: Brain.approval !== null && Brain.approval.risk === "high"
 
     // ---------------------------------------------------------------- live context
@@ -123,6 +124,18 @@ PanelWindow {
     // Spotlight-style rows: typed question first, then anything relevant.
     readonly property var rows: {
         const q = win.query.trim();
+        // History: your last chats; type to filter, Enter to reopen, Delete to remove
+        if (win.showHistory) {
+            const ql = q.toLowerCase();
+            const hs = Brain.history.filter(h => ql.length === 0 || String(h.title).toLowerCase().indexOf(ql) >= 0);
+            const hout = hs.map(h => ({ kind: "history", icon: "chat_bubble", title: h.title, hid: h.id, accent: false,
+                                        hint: win.ago(Math.round(h.updated / 1000)) + (h.count > 1 ? "  ·  " + h.count + " messages" : "") }));
+            if (Brain.history.length > 0 && ql.length === 0)
+                hout.push({ kind: "clearhistory", icon: "delete_sweep", title: "Clear history", hint: "", accent: false });
+            if (hout.length === 0)
+                hout.push({ kind: "none", icon: "history", title: Brain.history.length ? "No chats match" : "No chats yet", hint: "", accent: false });
+            return hout;
+        }
         const out = [];
         const all = [];
         for (let i = 0; i < win.contextual.length; i++)
@@ -148,7 +161,8 @@ PanelWindow {
             return out;
         }
         if (Brain.resumable)
-            out.push({ kind: "resume", icon: "history", title: Brain.archived.title, hint: "Continue", accent: false });
+            out.push({ kind: "resume", icon: "history", title: Brain.archived.title, accent: false,
+                       hint: "Continue  ·  " + win.ago(Math.round(Brain.archived.updated / 1000)) });
         if (win.cx.clip && win.cx.clip.preview)
             out.push({ kind: "clip", icon: win.cx.clip.kind === "image" ? "image" : "content_paste",
                        title: win.cx.clip.kind === "image" ? "What's in the image I copied?" : "Work with what I copied",
@@ -181,6 +195,9 @@ PanelWindow {
 
     function activate(r) {
         if (!r) return;
+        if (r.kind === "none") return;
+        if (r.kind === "history") { Brain.openHistory(r.hid); win.showHistory = false; input.text = ""; return; }
+        if (r.kind === "clearhistory") { Brain.clearHistory(); win.showHistory = false; input.text = ""; return; }
         if (r.kind === "resume") Brain.resume();
         else if (r.kind === "media") Brain.act("media-toggle");
         else if (r.kind === "vibes") { Brain.playVibe(win.vibes[win.vibeSel].k); return; }
@@ -200,7 +217,12 @@ PanelWindow {
     readonly property var hints: {
         if (Brain.approval) return win.highRisk ? [["Ctrl ↵", "Allow"], ["esc", "Don't allow"]] : [["↵", "Allow"], ["esc", "Don't allow"]];
         if (Brain.authState === "needed") return [["↵", "Sign in"], ["esc", "Close"]];
-        if (win.home) return [["↑↓", "Select"], ["↵", "Open"], ["esc", Brain.selection.length > 0 ? "Clear" : "Close"]];
+        if (Brain.hearing) return [["esc", "Cancel"]];
+        if (win.showHistory) return [["↑↓", "Select"], ["↵", "Open"], ["Del", "Remove"], ["esc", "Back"]];
+        if (Brain.voiceState === "speaking") return [["esc", "Stop talking"]];
+        if (win.home) return (Brain.voiceOn || Brain.voiceState === "muted")
+            ? [["↑↓", "Select"], ["↵", "Open"], ["Ctrl M", "Talk"], ["esc", Brain.selection.length > 0 ? "Clear" : "Close"]]
+            : [["↑↓", "Select"], ["↵", "Open"], ["esc", Brain.selection.length > 0 ? "Clear" : "Close"]];
         return [["↵", Brain.running ? "Redirect" : "Reply"], ["Ctrl N", "New chat"], ["esc", "Close"]];
     }
 
@@ -210,6 +232,7 @@ PanelWindow {
         function onShownChanged() {
             if (Brain.shown) {
                 win.targetScreen = win.pickScreen();
+                win.showHistory = false;
                 closeAnim.stop();
                 openAnim.restart();
                 win.sel = 0;
@@ -396,8 +419,11 @@ PanelWindow {
                     spacing: 14
 
                     Mark {
-                        busy: Brain.running
+                        busy: Brain.running || Brain.voiceState === "transcribing"
                         waiting: Brain.approval !== null
+                        listening: Brain.voiceState === "listening"
+                        speaking: Brain.voiceState === "speaking"
+                        level: Brain.voiceLevel
                     }
 
                     TextInput {
@@ -415,6 +441,7 @@ PanelWindow {
                         onTextChanged: {
                             win.query = text;
                             win.sel = 0;
+                            if (text.length > 0) Brain.voiceSession = false;   // you're typing: don't auto-dismiss on you
                         }
                         cursorDelegate: Rectangle {
                             width: 2
@@ -430,14 +457,29 @@ PanelWindow {
                                 NumberAnimation { to: 1; duration: 140 }
                             }
                         }
+                        // while you talk, your words appear right here, live
                         Text {
-                            visible: input.text.length === 0
+                            visible: input.text.length === 0 && Brain.hearing
                             anchors.verticalCenter: parent.verticalCenter
-                            text: Brain.approval ? "Waiting for your go-ahead"
+                            width: parent.width
+                            elide: Text.ElideLeft
+                            text: Brain.voicePartial.length > 0 ? Brain.voicePartial
+                                : Brain.voiceState === "transcribing" ? "One sec…" : "Listening…"
+                            // live words are a rough draft (dimmer); the accurate transcript is what gets sent
+                            color: Brain.voicePartial.length > 0 ? Theme.textSecondary : Theme.textTertiary
+                            font: input.font
+                            Behavior on color { ColorAnimation { duration: Theme.fast } }
+                        }
+                        Text {
+                            visible: input.text.length === 0 && !Brain.hearing
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: win.showHistory ? "Search your chats"
+                                : Brain.approval ? "Waiting for your go-ahead"
                                 : Brain.authState === "needed" ? "Sign in to continue"
                                 : Brain.running ? "Working on it… type to redirect"
                                 : Brain.selection.length > 0 ? "What should I do with this?"
                             : Brain.messages.count > 0 ? "Reply to Friday"
+                                : Brain.voiceState === "idle" && Brain.wakeEnabled ? "Ask Friday, or say “Hey Friday”"
                                 : "Ask Friday, or tell it what to do"
                             color: Theme.textTertiary
                             font: input.font
@@ -447,9 +489,11 @@ PanelWindow {
                             const ctrl = (event.modifiers & Qt.ControlModifier) !== 0;
                             const enter = event.key === Qt.Key_Return || event.key === Qt.Key_Enter;
                             if (event.key === Qt.Key_Escape) {
-                                if (Brain.approval) Brain.resolveApproval(false);
+                                if (Brain.hearing || Brain.voiceState === "speaking") Brain.voiceCmd("cancel");
+                                else if (Brain.approval) Brain.resolveApproval(false);
                                 else if (input.text.length > 0) input.text = "";
                                 else if (Brain.selection.length > 0) Brain.selection = "";
+                                else if (win.showHistory) { win.showHistory = false; win.sel = 0; }
                                 else Brain.hide();
                                 event.accepted = true;
                             } else if (enter) {
@@ -464,6 +508,16 @@ PanelWindow {
                                     input.text = "";
                                     Brain.ask(t);
                                 }
+                                event.accepted = true;
+                            } else if (ctrl && event.key === Qt.Key_M) {
+                                Brain.listen();
+                                event.accepted = true;
+                            } else if (ctrl && event.key === Qt.Key_H) {
+                                win.showHistory = !win.showHistory;
+                                win.sel = 0;
+                                event.accepted = true;
+                            } else if (win.showHistory && event.key === Qt.Key_Delete && win.rows[win.sel] && win.rows[win.sel].kind === "history") {
+                                Brain.deleteHistory(win.rows[win.sel].hid);
                                 event.accepted = true;
                             } else if (ctrl && event.key === Qt.Key_N) {
                                 Brain.fresh();
@@ -484,13 +538,49 @@ PanelWindow {
                         }
                     }
 
+                    // live level while you talk
+                    Row {
+                        visible: Brain.hearing
+                        spacing: 3
+                        Layout.alignment: Qt.AlignVCenter
+                        Repeater {
+                            model: [0.45, 0.8, 1.0, 0.7, 0.4]
+                            delegate: Rectangle {
+                                required property var modelData
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 3
+                                radius: 1.5
+                                color: Theme.accent
+                                height: Brain.voiceState === "transcribing" ? 4 : 4 + 20 * modelData * Math.min(1, Brain.voiceLevel)
+                                Behavior on height { NumberAnimation { duration: 90; easing.type: Easing.OutQuad } }
+                            }
+                        }
+                    }
+                    Glyph {
+                        visible: !Brain.running && (Brain.voiceOn || Brain.voiceState === "muted")
+                        icon: Brain.hearing ? "stop" : Brain.voiceState === "speaking" ? "volume_off" : "mic"
+                        onClicked: {
+                            if (Brain.voiceState === "speaking") Brain.voiceCmd("stop");
+                            else Brain.listen();
+                            input.forceActiveFocus();
+                        }
+                    }
                     Glyph {
                         visible: Brain.running
                         icon: "stop_circle"
                         onClicked: Brain.stop()
                     }
+                    Glyph {                          // History
+                        visible: !Brain.hearing && (Brain.history.length > 0 || win.showHistory)
+                        icon: win.showHistory ? "close" : "history"
+                        onClicked: {
+                            win.showHistory = !win.showHistory;
+                            win.sel = 0;
+                            input.forceActiveFocus();
+                        }
+                    }
                     Glyph {
-                        visible: !Brain.running && Brain.messages.count > 0
+                        visible: !Brain.running && Brain.messages.count > 0 && !win.showHistory
                         icon: "edit_square"
                         onClicked: {
                             Brain.fresh();
@@ -503,7 +593,7 @@ PanelWindow {
 
                 // ======================================================== the text you highlighted
                 Rectangle {
-                    visible: win.home && Brain.selection.length > 0
+                    visible: win.home && !win.showHistory && Brain.selection.length > 0
                     Layout.fillWidth: true
                     Layout.leftMargin: 16
                     Layout.rightMargin: 16
@@ -550,7 +640,7 @@ PanelWindow {
                     id: focusCard
                     readonly property int remain: Brain.focusActive ? Math.max(0, Math.round(Brain.focus.ends - Brain.now / 1000)) : 0
                     readonly property real progress: Brain.focusActive ? 1 - focusCard.remain / Math.max(1, Brain.focus.minutes * 60) : 0
-                    visible: win.home && Brain.focusActive && Brain.selection.length === 0
+                    visible: win.home && !win.showHistory && Brain.focusActive && Brain.selection.length === 0
                     Layout.fillWidth: true
                     Layout.leftMargin: 12
                     Layout.rightMargin: 12
@@ -634,7 +724,7 @@ PanelWindow {
 
                 // ======================================================== your world, in one line
                 Text {
-                    visible: win.home && Brain.selection.length === 0 && win.query.length === 0 && !Brain.focusActive && win.statusLine.length > 0
+                    visible: win.home && !win.showHistory && Brain.selection.length === 0 && win.query.length === 0 && !Brain.focusActive && win.statusLine.length > 0
                     Layout.fillWidth: true
                     Layout.leftMargin: 22
                     Layout.rightMargin: 22
@@ -775,9 +865,16 @@ PanelWindow {
                                         font.pixelSize: 12
                                         color: Theme.textTertiary
                                     }
+                                    Glyph {
+                                        visible: row.modelData.kind === "history" && row.current
+                                        icon: "close"
+                                        implicitWidth: 26
+                                        implicitHeight: 26
+                                        onClicked: Brain.deleteHistory(row.modelData.hid)
+                                    }
                                     Keycap {
                                         label: "↵"
-                                        opacity: row.current ? 1 : 0
+                                        opacity: row.current && row.modelData.kind !== "none" ? 1 : 0
                                         Behavior on opacity { NumberAnimation { duration: Theme.fast } }
                                     }
                                 }
@@ -869,7 +966,7 @@ PanelWindow {
                 // ======================================================== conversation
                 ListView {
                     id: convo
-                    visible: Brain.messages.count > 0
+                    visible: Brain.messages.count > 0 && !win.showHistory
                     Layout.fillWidth: true
                     Layout.preferredHeight: Math.min(contentHeight + 36,
                         Math.max(140, win.height * 0.72 - 64 - 40 - (approvalSheet.visible ? approvalSheet.implicitHeight + 24 : 0)))
@@ -1010,7 +1107,7 @@ PanelWindow {
                     spacing: 6
 
                     Text {
-                        text: Brain.focusActive ? "timer" : win.appName.length > 0 ? "visibility" : "star"
+                        text: Brain.hearing ? "mic" : Brain.voiceState === "speaking" ? "graphic_eq" : Brain.focusActive ? "timer" : win.appName.length > 0 ? "visibility" : "star"
                         font.family: Theme.icons
                         font.pixelSize: 15
                         color: Theme.textTertiary
@@ -1018,13 +1115,57 @@ PanelWindow {
                     Text {
                         Layout.fillWidth: true
                         elide: Text.ElideRight
-                        text: Brain.focusActive ? "Focusing · " + Brain.fmtLeft(Brain.focus.ends) + " left"
+                        text: Brain.hearing ? "Listening on your mic, only on this laptop"
+                            : Brain.voiceState === "speaking" ? "Speaking"
+                            : Brain.focusActive ? "Focusing · " + Brain.fmtLeft(Brain.focus.ends) + " left"
                             : win.appName.length > 0
                             ? "Friday can see " + win.appName + ((win.cx.win && win.cx.win.ws) ? " on workspace " + win.cx.win.ws : "")
                             : "Friday · powered by Claude"
                         font.family: Theme.sans
                         font.pixelSize: 12
                         color: Theme.textTertiary
+                    }
+                    // "Hey Friday" on/off. Off = the mic is fully released; the hotkey and mic button still work.
+                    Rectangle {
+                        id: wakeToggle
+                        visible: Brain.voiceState !== "unavailable" && Brain.voiceState !== "off"
+                        implicitWidth: wakeRow.implicitWidth + 16
+                        implicitHeight: 24
+                        radius: 12
+                        Layout.rightMargin: 4
+                        color: Brain.wakeEnabled ? Theme.accentSoft : (wakeMa.containsMouse ? Theme.hover : "transparent")
+                        border.width: 1
+                        border.color: Brain.wakeEnabled ? Qt.alpha(Theme.accent, 0.4) : Theme.hairline
+                        Behavior on color { ColorAnimation { duration: Theme.fast } }
+                        Row {
+                            id: wakeRow
+                            anchors.centerIn: parent
+                            spacing: 5
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: Brain.wakeEnabled ? "mic" : "mic_off"
+                                font.family: Theme.icons
+                                font.pixelSize: 14
+                                color: Brain.wakeEnabled ? Theme.accent : Theme.textTertiary
+                            }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: "Hey Friday"
+                                font.family: Theme.sans
+                                font.pixelSize: 12
+                                color: Brain.wakeEnabled ? Theme.accent : Theme.textTertiary
+                            }
+                        }
+                        MouseArea {
+                            id: wakeMa
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                Brain.toggleWake();
+                                input.forceActiveFocus();
+                            }
+                        }
                     }
                     Row {
                         id: usageChip
