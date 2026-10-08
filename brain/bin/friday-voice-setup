@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# One-time setup for "Hey Friday". Everything runs locally; ~700 MB of models.
+#   Python 3.12 venv (via uv) with vosk, faster-whisper, piper-tts
+#   Vosk small Indian-English model (wake word + live words), Whisper small.en, a Piper voice
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+V="$HERE/.voice"; VENV="$HERE/.venv"
+[ -f "$HERE/config.env" ] && set -a && . "$HERE/config.env" && set +a
+STT="${FRIDAY_STT_MODEL:-small.en}"
+VOICE="${FRIDAY_PIPER_VOICE:-en_GB-jenny_dioco-medium}"
+say() { printf '\033[1;38;5;173m▸\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+
+command -v pw-record >/dev/null || command -v parecord >/dev/null || die "no recorder: install pipewire (pw-record) or libpulse (parecord)"
+command -v pw-play >/dev/null || command -v paplay >/dev/null || die "no player: install pipewire (pw-play)"
+mkdir -p "$V"
+
+# 1. Python env (3.12: every wheel we need exists for it)
+if [ ! -x "$VENV/bin/python" ]; then
+  if command -v uv >/dev/null; then
+    say "creating Python 3.12 env with uv"
+    uv venv -q --python 3.12 "$VENV"
+  else
+    say "uv not found; using system python ($(python3 --version))"
+    python3 -m venv "$VENV"
+  fi
+fi
+say "installing speech engines (vosk, faster-whisper, piper-tts)"
+if command -v uv >/dev/null; then
+  uv pip install -q --python "$VENV/bin/python" -U vosk faster-whisper piper-tts numpy
+else
+  "$VENV/bin/pip" install -q -U vosk faster-whisper piper-tts numpy
+fi
+
+# 2. Vosk model: wake word + live words while you talk (~40 MB). Indian English by default.
+VOSK="${FRIDAY_VOSK_MODEL:-vosk-model-small-en-in-0.4}"
+if [ "$(cat "$V/vosk/.model" 2>/dev/null)" != "$VOSK" ]; then
+  say "downloading Vosk model $VOSK"
+  curl -fL --progress-bar -o "$V/vosk.zip" "https://alphacephei.com/vosk/models/$VOSK.zip"
+  rm -rf "$V/vosk"
+  "$VENV/bin/python" - "$V" "$VOSK" <<'PY'
+import sys, zipfile, os
+v, name = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(os.path.join(v, "vosk.zip")) as z:
+    z.extractall(v)
+os.rename(os.path.join(v, name), os.path.join(v, "vosk"))
+os.remove(os.path.join(v, "vosk.zip"))
+open(os.path.join(v, "vosk", ".model"), "w").write(name)
+PY
+fi
+
+# 3. Whisper: the accurate final transcript (+ tiny for wake verification)
+#    Hugging Face downloads sometimes stall forever: plain HTTP (no xet), 30 s stall timeout, resume up to 10 times.
+say "downloading Whisper $STT (resumes if interrupted)"
+HF_HUB_DISABLE_XET=1 HF_HUB_DOWNLOAD_TIMEOUT=30 HF_HUB_DISABLE_TELEMETRY=1 "$VENV/bin/python" - "$V/whisper" "$STT" <<'PY'
+import sys, time
+from huggingface_hub import snapshot_download
+try:
+    from faster_whisper.utils import _MODELS
+except Exception:
+    _MODELS = {}
+root, name = sys.argv[1], sys.argv[2]
+for m in [name]:
+    repo = _MODELS.get(m, "Systran/faster-whisper-" + m)
+    for attempt in range(1, 11):
+        try:
+            snapshot_download(repo, cache_dir=root, allow_patterns=[
+                "config.json", "preprocessor_config.json", "model.bin", "tokenizer.json", "vocabulary.*"])
+            print("  ok:", m)
+            break
+        except Exception as e:
+            print("  %s: attempt %d stalled/failed (%s), resuming…" % (m, attempt, type(e).__name__))
+            time.sleep(min(2 * attempt, 10))
+    else:
+        sys.exit("could not download %s; check your connection and re-run friday-voice-setup" % m)
+PY
+
+# 4. Piper voice: how Friday sounds
+if [ ! -f "$V/piper/$VOICE.onnx" ]; then
+  say "downloading voice $VOICE"
+  mkdir -p "$V/piper"
+  "$VENV/bin/python" -m piper.download_voices "$VOICE" --data-dir "$V/piper"
+fi
+
+# tidy: models older versions of Friday used and no longer needs
+rm -rf "$V/whisper/models--Systran--faster-whisper-tiny.en"
+
+say "done. Restart Friday:  pkill -f 'qs -c friday'; qs -c friday -d"
+say "check your mic + speaker any time:  $HERE/bin/friday-voice --test"
+say "then just say \"Hey Friday\" (or press Super+Ctrl+Space)."
