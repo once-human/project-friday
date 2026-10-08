@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""Friday's hands: mouse and keyboard on Hyprland (Wayland).
+
+  friday-input click X Y [--right|--middle] [--double]   X,Y = pixels in the last friday-screen image
+  friday-input click X Y --global                         X,Y = global layout coordinates instead
+  friday-input move X Y [--global]
+  friday-input type "text"                                types into the focused window
+  friday-input key ctrl+l | enter | super+2 | alt+tab    a key or chord
+  friday-input scroll down|up [N]
+  friday-input where                                      cursor position (global)
+  friday-input info                                       what's available + last screenshot mapping
+
+Moving uses hyprctl. Clicking uses ydotool (needs ydotoold) or wlrctl; typing and keys use wtype.
+"""
+import json, os, shutil, subprocess, sys, time
+sys.dont_write_bytecode = True
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":/usr/local/bin:/usr/bin:" + os.environ.get("PATH", "")
+
+SETUP = ("sudo pacman -S ydotool wtype   # then: systemctl --user enable --now ydotool  "
+         "(and add yourself to the 'input' group if /dev/uinput isn't writable)")
+
+
+def run(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def die(msg):
+    print("friday-input: " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def to_global(x, y, is_global):
+    if is_global:
+        return int(round(x)), int(round(y))
+    try:
+        m = json.load(open("/tmp/friday/last-screen.json"))
+    except Exception:
+        die("no screenshot mapping yet: run friday-screen first, or pass --global")
+    (ox, oy), (lw, lh), (pw, ph) = m["origin"], m["logical"], m["pixels"]
+    if not pw or not ph:
+        die("couldn't read the screenshot size; use --global coordinates")
+    return int(round(ox + x * lw / pw)), int(round(oy + y * lh / ph))
+
+
+def move(gx, gy):
+    ok, out = run(["hyprctl", "dispatch", "movecursor", str(gx), str(gy)])
+    if not ok:
+        die("couldn't move the cursor: " + out)
+
+
+def click(button="left", double=False):
+    code = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}[button]
+    if shutil.which("ydotool"):
+        cmd = ["ydotool", "click"] + (["--repeat", "2", "--next-delay", "90"] if double else []) + [code]
+        ok, out = run(cmd)
+        if ok:
+            return
+        last = out
+    else:
+        last = "ydotool not installed"
+    if shutil.which("wlrctl"):
+        for _ in range(2 if double else 1):
+            ok, out = run(["wlrctl", "pointer", "click", button])
+            if not ok:
+                die("click failed: " + out)
+            time.sleep(0.09)
+        return
+    die("can't click (%s). Set it up once: %s" % (last, SETUP))
+
+
+MODS = {"ctrl": "ctrl", "control": "ctrl", "shift": "shift", "alt": "alt", "super": "logo", "win": "logo", "meta": "logo"}
+KEYS = {"enter": "Return", "return": "Return", "esc": "Escape", "escape": "Escape", "tab": "Tab", "space": "space",
+        "backspace": "BackSpace", "delete": "Delete", "del": "Delete", "up": "Up", "down": "Down", "left": "Left",
+        "right": "Right", "home": "Home", "end": "End", "pageup": "Page_Up", "pagedown": "Page_Down", "pgup": "Page_Up",
+        "pgdn": "Page_Down", "insert": "Insert", "menu": "Menu", "print": "Print"}
+
+
+def key(chord):
+    if not shutil.which("wtype"):
+        die("can't press keys: wtype isn't installed. " + SETUP)
+    parts = [p.strip().lower() for p in chord.split("+") if p.strip()]
+    mods = [MODS[p] for p in parts[:-1] if p in MODS]
+    k = parts[-1] if parts else ""
+    k = KEYS.get(k, k.upper() if (len(k) > 1 and k[0] == "f" and k[1:].isdigit()) else k)
+    cmd = ["wtype"]
+    for m in mods:
+        cmd += ["-M", m]
+    cmd += ["-k", k]
+    for m in reversed(mods):
+        cmd += ["-m", m]
+    ok, out = run(cmd)
+    if not ok:
+        die("key failed: " + out)
+
+
+def type_text(text):
+    if shutil.which("wtype"):
+        ok, out = run(["wtype", "--", text])
+        if ok:
+            return
+        die("typing failed: " + out)
+    if shutil.which("ydotool"):
+        ok, out = run(["ydotool", "type", "--", text])
+        if ok:
+            return
+    die("can't type: " + SETUP)
+
+
+def main():
+    a = sys.argv[1:]
+    if not a:
+        print(__doc__)
+        return
+    cmd, rest = a[0], a[1:]
+    flags = {x for x in rest if x.startswith("--")}
+    vals = [x for x in rest if not x.startswith("--")]
+    if cmd in ("click", "move"):
+        if len(vals) < 2:
+            die("usage: friday-input %s X Y" % cmd)
+        gx, gy = to_global(float(vals[0]), float(vals[1]), "--global" in flags)
+        move(gx, gy)
+        if cmd == "click":
+            time.sleep(0.06)
+            click("right" if "--right" in flags else "middle" if "--middle" in flags else "left", "--double" in flags)
+        print("%s at %d,%d" % (cmd, gx, gy))
+    elif cmd == "type":
+        type_text(" ".join(vals))
+        print("typed %d characters" % len(" ".join(vals)))
+    elif cmd == "key":
+        key(vals[0] if vals else "")
+        print("pressed " + (vals[0] if vals else ""))
+    elif cmd == "scroll":
+        direction = vals[0] if vals else "down"
+        n = int(vals[1]) if len(vals) > 1 else 3
+        for _ in range(n):
+            key("pagedown" if direction == "down" else "pageup")
+            time.sleep(0.05)
+        print("scrolled %s x%d" % (direction, n))
+    elif cmd == "where":
+        print(run(["hyprctl", "cursorpos"])[1])
+    elif cmd == "info":
+        print("move: hyprctl  | click: %s | type/keys: %s" % (
+            "ydotool" if shutil.which("ydotool") else ("wlrctl" if shutil.which("wlrctl") else "MISSING"),
+            "wtype" if shutil.which("wtype") else "MISSING"))
+        try:
+            print("last screenshot:", json.load(open("/tmp/friday/last-screen.json")))
+        except Exception:
+            print("last screenshot: none")
+    else:
+        die("unknown command: " + cmd)
+
+
+if __name__ == "__main__":
+    main()
