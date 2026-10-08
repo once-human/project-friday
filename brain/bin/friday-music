@@ -1,22 +1,55 @@
 #!/usr/bin/env bash
-# friday-music <house|afro|fred|techno|chill|"any search">
-# Finds a long mix on YouTube and opens it in your browser, where it autoplays and shows up in your
-# media controls. With yt-dlp installed it jumps straight to a video (picked at random from the top
-# few results so it isn't the same set every time); without it, you land on the search results.
+# friday-music <house|afro|fred|techno|chill|"any search">   actually plays it
+# friday-music stop | now
+#
+# Best: mpv + yt-dlp -> plays in the background (no browser tab), shows up in your media controls
+#       (install mpv-mpris too so the bar's play/pause/next work).
+# Else: opens the first matching YouTube video in your browser, already playing.
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+D="${XDG_RUNTIME_DIR:-/tmp}/friday"; mkdir -p "$D"
 case "${1:-chill}" in
-  house)  Q="house music mix 2026 long set" ;;
-  afro)   Q="afro house mix 2026 long set" ;;
-  fred)   Q="fred again.. boiler room live set" ;;
-  techno) Q="melodic techno mix 2026 long set" ;;
-  chill)  Q="chill house deep focus mix" ;;
-  *)      Q="$*" ;;
+  stop) pkill -f -- "--title=friday-music" && echo "stopped" || echo "nothing playing"; exit 0 ;;
+  now)  cat "$D/music-now" 2>/dev/null || echo "nothing playing"; exit 0 ;;
+  house)  Q="house music mix 2026 long set"; LONG=1 ;;
+  afro)   Q="afro house mix 2026 long set"; LONG=1 ;;
+  fred)   Q="fred again.. boiler room live set"; LONG=1 ;;
+  techno) Q="melodic techno mix 2026 long set"; LONG=1 ;;
+  chill)  Q="chill house deep focus mix"; LONG=1 ;;
+  *)      Q="$*"; LONG=0 ;;
 esac
-ENC="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote_plus(sys.argv[1]))' "$Q")"
-URL="https://www.youtube.com/results?search_query=$ENC"
-if command -v yt-dlp >/dev/null 2>&1; then
-  ID="$(timeout 12 yt-dlp --flat-playlist --print id --match-filter 'duration > 1200' "ytsearch8:$Q" 2>/dev/null | shuf -n1)"
-  [ -n "$ID" ] && URL="https://www.youtube.com/watch?v=$ID"
+
+pick_id() {   # a video id for the query: yt-dlp if present (random long one for mixes), else read YouTube's results page
+  if command -v yt-dlp >/dev/null 2>&1; then
+    if [ "$LONG" = 1 ]; then
+      timeout 15 yt-dlp --flat-playlist --print id --match-filter 'duration > 1200' "ytsearch8:$Q" 2>/dev/null | shuf -n1
+    else
+      timeout 15 yt-dlp --flat-playlist --print id "ytsearch1:$Q" 2>/dev/null | head -1
+    fi
+  else
+    ENC="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote_plus(sys.argv[1]))' "$Q")"
+    curl -s --max-time 10 -A "Mozilla/5.0 (X11; Linux x86_64)" -H "Accept-Language: en" \
+      "https://www.youtube.com/results?search_query=$ENC" | grep -o '"videoId":"[A-Za-z0-9_-]\{11\}"' \
+      | awk -F'"' '!seen[$4]++ {print $4}' | head -$([ "$LONG" = 1 ] && echo 4 || echo 1) | shuf -n1
+  fi
+}
+
+ID="$(pick_id)"
+if [ -z "$ID" ]; then
+  ENC="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote_plus(sys.argv[1]))' "$Q")"
+  setsid -f xdg-open "https://www.youtube.com/results?search_query=$ENC" >/dev/null 2>&1
+  echo "couldn't pick a video; opened the search instead"; exit 0
 fi
-setsid -f xdg-open "$URL" >/dev/null 2>&1
-echo "$URL"
+URL="https://www.youtube.com/watch?v=$ID"
+
+if command -v mpv >/dev/null 2>&1 && command -v yt-dlp >/dev/null 2>&1; then
+  pkill -f -- "--title=friday-music" 2>/dev/null
+  TITLE="$(timeout 10 yt-dlp --print title "$URL" 2>/dev/null)"
+  setsid -f mpv --no-video --really-quiet --title=friday-music --force-media-title="${TITLE:-$Q}" \
+    --ytdl-format='bestaudio/best' "$URL" >/dev/null 2>&1
+  echo "${TITLE:-$Q}" > "$D/music-now"
+  echo "playing in the background: ${TITLE:-$Q}"
+else
+  setsid -f xdg-open "$URL&autoplay=1" >/dev/null 2>&1
+  echo "$URL" > "$D/music-now"
+  echo "playing in your browser: $URL"
+fi
