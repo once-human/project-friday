@@ -1,0 +1,15 @@
+# Personal + runtime state (lives next to the code once installed, never committed)
+brain/me.md
+brain/config.env
+brain/memory/
+brain/device-profile.md
+brain/audit.log
+brain/.claude/
+brain/.cache/
+
+# Python / editors / backups
+__pycache__/
+*.pyc
+*.bak-*
+*.swp
+.DS_Store
