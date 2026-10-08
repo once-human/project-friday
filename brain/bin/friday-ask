@@ -74,7 +74,7 @@ FULL="$(printf '%b\n[request]\n%s' "$CTX" "$PROMPT")"
 # ---- surface style ----
 case "${FRIDAY_SURFACE:-overlay}" in
   sidebar) SURFACE='Surface: the desktop sidebar chat. Normal chat length is fine; Markdown is rendered.' ;;
-  *)       SURFACE='Surface: the Friday overlay (a small floating panel). Be quick and tight: lead with the answer or the result, usually under 8 lines unless asked to go deep. Markdown is rendered.' ;;
+  *)       SURFACE='Surface: the Friday overlay, a small floating panel. Talk like a sharp friend sitting next to Onkar, not a document: lead with the answer or what you did, in plain conversational sentences and short paragraphs. No headings, no tables, no horizontal rules. Use a short list only for real steps or options. Bold sparingly. Code or commands in backticks. Usually under 6 lines unless he asks to go deep.' ;;
 esac
 
 args=(-p --output-format stream-json --verbose --include-partial-messages

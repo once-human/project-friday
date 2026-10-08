@@ -17,6 +17,7 @@ Built for **Arch + Hyprland + [illogical-impulse](https://github.com/end-4/dots-
 | **Acts, not just answers** | Opens apps, tabs and searches in your browser, arranges windows, controls media and volume, sets reminders, runs focus sessions, reads logs, inspects repos. |
 | **Writing tools** | Highlight text anywhere and press <kbd>Super</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> to explain, summarize, proofread, rewrite, make it professional, or translate. |
 | **Made for one person** | A greeting and one status line about your world, plus rows for what you actually do: pick up your most recently touched repos (with uncommitted changes), check on a running PixelOS build, see what's on your connected phone (adb/fastboot), or start a 90-minute deep-work block. |
+| **One-tap music** | A row split five ways: House · Afro · Fred · Techno · Chill. Pick one (← → or click) and a long mix starts in your browser, controllable from the bar. |
 | **Deep work** | A live countdown card with a progress ring, plus a notification when you're done. |
 | **Safe by design** | Every action passes a policy hook: read-only runs silently, changes need your approval, and `sudo` or disk-wiping commands are refused. All of it is logged. |
 | **Claude limits in your bar** | Your 5-hour and weekly plan usage appear as rings next to CPU and RAM. The ring is usage; the dot is how far through the window you are. |

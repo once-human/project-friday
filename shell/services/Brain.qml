@@ -74,6 +74,11 @@ Singleton {
         }
     }
 
+    function playVibe(kind) {
+        Quickshell.execDetached([root.binDir + "friday-music", kind]);
+        root.hide();
+    }
+
     function startFocus(minutes, task) {
         Quickshell.execDetached([root.binDir + "friday-focus", "start", String(minutes), task ?? "Focus"]);
         focusPoke.restart();

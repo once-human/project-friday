@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# friday-music <house|afro|fred|techno|chill|"any search">
+# Finds a long mix on YouTube and opens it in your browser, where it autoplays and shows up in your
+# media controls. With yt-dlp installed it jumps straight to a video (picked at random from the top
+# few results so it isn't the same set every time); without it, you land on the search results.
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+case "${1:-chill}" in
+  house)  Q="house music mix 2026 long set" ;;
+  afro)   Q="afro house mix 2026 long set" ;;
+  fred)   Q="fred again.. boiler room live set" ;;
+  techno) Q="melodic techno mix 2026 long set" ;;
+  chill)  Q="chill house deep focus mix" ;;
+  *)      Q="$*" ;;
+esac
+ENC="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote_plus(sys.argv[1]))' "$Q")"
+URL="https://www.youtube.com/results?search_query=$ENC"
+if command -v yt-dlp >/dev/null 2>&1; then
+  ID="$(timeout 12 yt-dlp --flat-playlist --print id --match-filter 'duration > 1200' "ytsearch8:$Q" 2>/dev/null | shuf -n1)"
+  [ -n "$ID" ] && URL="https://www.youtube.com/watch?v=$ID"
+fi
+setsid -f xdg-open "$URL" >/dev/null 2>&1
+echo "$URL"

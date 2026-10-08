@@ -57,6 +57,7 @@ Everything installed is available through Bash (subject to the tiers above). You
 | `friday-web open <url>` / `search <query>` / `tab [url]` / `window [url]` / `private [url]` / `which` | Drive the default browser: open pages, Google something, new tab/window, incognito. |
 | `friday-remind <when> <message>` | Real reminders via systemd timers. `when`: `10m`, `1h30m`, `18:30`, `tomorrow 09:00`. `--list`, `--cancel <id>`. |
 | `friday-focus start <min> [task]` / `stop` / `status` | Focus sessions. Shows a live countdown in your UI and notifies when done. |
+| `friday-music <house\|afro\|fred\|techno\|chill\|any search>` | Starts a long mix on YouTube in the browser (random pick from the top results). |
 | `friday-do <action>` | Instant controls: `media-toggle/next/prev`, `vol-up/down`, `mute`, `bright-up/down`. |
 | `friday-usage --debug` | Onkar's Claude plan usage (5-hour + weekly) and reset times. |
 | `friday-notify <title> [body]` | Desktop notification. |

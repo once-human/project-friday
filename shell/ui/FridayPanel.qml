@@ -39,16 +39,15 @@ PanelWindow {
     property real appear: 0      // card: scale / lift / fade
     property real dim: 0         // backdrop: its own softer fade
     property real reveal: 0      // content: follows the card by a beat
-    property string greeting: ""
-
-    function makeGreeting() {
-        const h = new Date().getHours();
-        if (h < 5) return "Night shift, Onkar?";
-        if (h < 12) return "Morning, Onkar. Coffee's on.";
-        if (h < 17) return "Afternoon, Onkar.";
-        if (h < 21) return "Evening, Onkar.";
-        return "Late one, Onkar.";
-    }
+    // one-tap music: a row split into five
+    property int vibeSel: 0
+    readonly property var vibes: [
+        { k: "house", t: "House" },
+        { k: "afro", t: "Afro" },
+        { k: "fred", t: "Fred" },
+        { k: "techno", t: "Techno" },
+        { k: "chill", t: "Chill" }
+    ]
     // one quiet line about your world, most useful first
     readonly property string statusLine: {
         const p = [];
@@ -143,6 +142,7 @@ PanelWindow {
         if (win.cx.media && win.cx.media.title)
             out.push({ kind: "media", icon: win.cx.media.status === "Playing" ? "pause" : "play_arrow",
                        title: win.cx.media.title, hint: win.cx.media.artist ? win.cx.media.artist : "Now playing", accent: false });
+        out.push({ kind: "vibes", icon: "graphic_eq", title: "Music", hint: "", accent: false });
         if (win.cx.clip && win.cx.clip.preview)
             out.push({ kind: "clip", icon: win.cx.clip.kind === "image" ? "image" : "content_paste",
                        title: win.cx.clip.kind === "image" ? "What's in the image I copied?" : "Work with what I copied",
@@ -168,7 +168,7 @@ PanelWindow {
         if (!Brain.focusActive)
             out.push({ kind: "focus", icon: "timer", title: "Deep work: 90 minutes, no distractions", hint: "", accent: false });
         for (let m = win.contextual.length; m < all.length && out.length < 8; m++) out.push(all[m]);
-        return out;
+        return out.slice(0, 8);
     }
     onRowsChanged: if (win.sel > win.rows.length - 1) win.sel = Math.max(0, win.rows.length - 1)
 
@@ -176,6 +176,7 @@ PanelWindow {
         if (!r) return;
         if (r.kind === "resume") Brain.resume();
         else if (r.kind === "media") Brain.act("media-toggle");
+        else if (r.kind === "vibes") { Brain.playVibe(win.vibes[win.vibeSel].k); return; }
         else if (r.kind === "clip") Brain.useClipboard(r.clipKind);
         else if (r.kind === "focus") Brain.startFocus(90, win.cx.repos && win.cx.repos.length > 0 ? "Deep work on " + win.cx.repos[0].name : "Deep work");
         else if (r.kind === "sel") {
@@ -201,7 +202,6 @@ PanelWindow {
         function onShownChanged() {
             if (Brain.shown) {
                 win.targetScreen = win.pickScreen();
-                win.greeting = win.makeGreeting();
                 closeAnim.stop();
                 openAnim.restart();
                 win.sel = 0;
@@ -462,6 +462,10 @@ PanelWindow {
                                 input.text = "";
                                 win.sel = 0;
                                 event.accepted = true;
+                            } else if (win.home && input.text.length === 0 && win.rows[win.sel] && win.rows[win.sel].kind === "vibes"
+                                       && (event.key === Qt.Key_Left || event.key === Qt.Key_Right)) {
+                                win.vibeSel = Math.max(0, Math.min(win.vibes.length - 1, win.vibeSel + (event.key === Qt.Key_Right ? 1 : -1)));
+                                event.accepted = true;
                             } else if (win.home && event.key === Qt.Key_Down) {
                                 win.sel = Math.min(win.sel + 1, win.rows.length - 1);
                                 event.accepted = true;
@@ -516,7 +520,7 @@ PanelWindow {
                         wrapMode: Text.Wrap
                         maximumLineCount: 3
                         elide: Text.ElideRight
-                        font.family: Theme.serif
+                        font.family: Theme.sans
                         font.italic: true
                         font.pixelSize: 14
                         lineHeight: 1.3
@@ -620,29 +624,18 @@ PanelWindow {
                     }
                 }
 
-                // ======================================================== hello
-                ColumnLayout {
-                    visible: win.home && Brain.selection.length === 0 && win.query.length === 0 && !Brain.focusActive
+                // ======================================================== your world, in one line
+                Text {
+                    visible: win.home && Brain.selection.length === 0 && win.query.length === 0 && !Brain.focusActive && win.statusLine.length > 0
                     Layout.fillWidth: true
                     Layout.leftMargin: 22
                     Layout.rightMargin: 22
-                    Layout.topMargin: 16
-                    spacing: 3
-                    Text {
-                        text: win.greeting
-                        font.family: Theme.serif
-                        font.pixelSize: 22
-                        color: Theme.text
-                    }
-                    Text {
-                        visible: win.statusLine.length > 0
-                        Layout.fillWidth: true
-                        text: win.statusLine
-                        elide: Text.ElideRight
-                        font.family: Theme.sans
-                        font.pixelSize: 13
-                        color: Theme.textSecondary
-                    }
+                    Layout.topMargin: 14
+                    text: win.statusLine
+                    elide: Text.ElideRight
+                    font.family: Theme.sans
+                    font.pixelSize: 13
+                    color: Theme.textSecondary
                 }
 
                 // ======================================================== home rows
@@ -706,12 +699,50 @@ PanelWindow {
                                         }
                                     }
                                     Text {
+                                        visible: row.modelData.kind !== "vibes"
                                         Layout.fillWidth: true
                                         text: row.modelData.title
                                         elide: Text.ElideRight
                                         font.family: Theme.sans
                                         font.pixelSize: 15
                                         color: Theme.text
+                                    }
+                                    RowLayout {
+                                        visible: row.modelData.kind === "vibes"
+                                        Layout.fillWidth: true
+                                        spacing: 6
+                                        Repeater {
+                                            model: row.modelData.kind === "vibes" ? win.vibes : []
+                                            delegate: Rectangle {
+                                                id: vibe
+                                                required property var modelData
+                                                required property int index
+                                                readonly property bool picked: row.current && win.vibeSel === vibe.index
+                                                Layout.fillWidth: true
+                                                implicitHeight: 30
+                                                radius: 9
+                                                color: vibe.picked ? Theme.accentSoft : (vibeMa.containsMouse ? Theme.hover : Theme.raised)
+                                                border.width: 1
+                                                border.color: vibe.picked ? Qt.alpha(Theme.accent, 0.45) : Theme.hairline
+                                                Behavior on color { ColorAnimation { duration: Theme.fast } }
+                                                Text {
+                                                    anchors.centerIn: parent
+                                                    text: vibe.modelData.t
+                                                    font.family: Theme.sans
+                                                    font.pixelSize: 13
+                                                    font.weight: Font.Medium
+                                                    color: vibe.picked ? Theme.accent : Theme.text
+                                                }
+                                                MouseArea {
+                                                    id: vibeMa
+                                                    anchors.fill: parent
+                                                    hoverEnabled: true
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onEntered: win.vibeSel = vibe.index
+                                                    onClicked: Brain.playVibe(vibe.modelData.k)
+                                                }
+                                            }
+                                        }
                                     }
                                     Glyph {
                                         visible: row.modelData.kind === "media" && row.current

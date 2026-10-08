@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Layouts
 import qs.services
 
-// One turn. You: a quiet bubble on the right. Friday: serif prose, with what it did tucked above.
+// One turn. You: a quiet bubble on the right. Friday: plain conversational text, with what it did tucked above.
 Item {
     id: d
 
@@ -153,9 +153,8 @@ Item {
             id: thinking
             visible: !d.isUser && !d.done && d.body.length === 0 && d.runningCount === 0
             text: "Thinking"
-            font.family: Theme.serif
-            font.italic: true
-            font.pixelSize: 16
+            font.family: Theme.sans
+            font.pixelSize: 15
             color: Theme.textSecondary
             SequentialAnimation on opacity {
                 running: thinking.visible
@@ -169,14 +168,15 @@ Item {
         Text {
             visible: !d.isUser && d.body.length > 0
             Layout.fillWidth: true
-            text: d.body
+            // headings read as shouting in a small panel: render them as bold lines
+            text: d.body.replace(/^#{1,6}\s+(.+)$/gm, "**$1**")
             textFormat: Text.MarkdownText
             wrapMode: Text.Wrap
             color: Theme.text
             linkColor: Theme.accent
-            font.family: Theme.serif
-            font.pixelSize: 16
-            lineHeight: 1.42
+            font.family: Theme.sans
+            font.pixelSize: 15
+            lineHeight: 1.45
             onLinkActivated: link => Qt.openUrlExternally(link)
             HoverHandler { cursorShape: parent.hoveredLink.length > 0 ? Qt.PointingHandCursor : Qt.ArrowCursor }
         }
