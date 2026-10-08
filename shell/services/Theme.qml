@@ -32,7 +32,7 @@ Singleton {
     function pick(dark, lightValue) { return root.light ? lightValue : dark; }
 
     // ---------------------------------------------------------------- surfaces
-    readonly property color glass: pick(Qt.rgba(0.149, 0.145, 0.137, 0.80), Qt.rgba(0.980, 0.976, 0.961, 0.84))
+    readonly property color glass: pick(Qt.rgba(0.149, 0.145, 0.137, 0.84), Qt.rgba(0.980, 0.976, 0.961, 0.88))
     readonly property color raised: pick(Qt.rgba(1, 1, 1, 0.045), Qt.rgba(0, 0, 0, 0.035))
     readonly property color hover: pick(Qt.rgba(1, 1, 1, 0.065), Qt.rgba(0, 0, 0, 0.05))
     readonly property color selected: pick(Qt.rgba(1, 1, 1, 0.085), Qt.rgba(0, 0, 0, 0.065))
@@ -40,7 +40,7 @@ Singleton {
     readonly property color rim: pick(Qt.rgba(1, 1, 1, 0.13), Qt.rgba(1, 1, 1, 0.7))      // top-edge highlight
     readonly property color well: pick(Qt.rgba(0, 0, 0, 0.24), Qt.rgba(0, 0, 0, 0.045))     // code / command wells
     readonly property color userBubble: pick(Qt.rgba(1, 1, 1, 0.075), Qt.rgba(0, 0, 0, 0.055))
-    readonly property color shadow: pick(Qt.rgba(0, 0, 0, 0.38), Qt.rgba(0, 0, 0, 0.16))
+    readonly property color shadow: pick(Qt.rgba(0, 0, 0, 0.30), Qt.rgba(0, 0, 0, 0.14))
 
     // ---------------------------------------------------------------- text (all ≥ 4.5:1 on glass)
     readonly property color text: pick("#F4F3EE", "#1F1E1D")
@@ -71,7 +71,8 @@ Singleton {
 
     // ---------------------------------------------------------------- motion (Apple's sheet curve)
     readonly property var curve: [0.32, 0.72, 0, 1, 1, 1]
-    readonly property var curveIn: [0.4, 0, 1, 1, 1, 1]
+    readonly property var curveIn: [0.4, 0, 0.7, 0.2, 1, 1]          // gentle accelerate-away for closing
+    readonly property var soft: [0.25, 0.1, 0.25, 1, 1, 1]           // fades: no hard start, no hard stop
     readonly property var spring: [0.16, 1, 0.3, 1, 1, 1]   // fast out, long soft settle (no overshoot)
     readonly property int fast: 140
     readonly property int base: 240

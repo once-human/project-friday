@@ -39,6 +39,27 @@ PanelWindow {
     property real appear: 0      // card: scale / lift / fade
     property real dim: 0         // backdrop: its own softer fade
     property real reveal: 0      // content: follows the card by a beat
+    property string greeting: ""
+
+    function makeGreeting() {
+        const h = new Date().getHours();
+        if (h < 5) return "Night shift, Onkar?";
+        if (h < 12) return "Morning, Onkar. Coffee's on.";
+        if (h < 17) return "Afternoon, Onkar.";
+        if (h < 21) return "Evening, Onkar.";
+        return "Late one, Onkar.";
+    }
+    // one quiet line about your world, most useful first
+    readonly property string statusLine: {
+        const p = [];
+        if (win.cx.rom && win.cx.rom.building) p.push("PixelOS is building");
+        if (win.cx.phone) p.push(win.cx.phone.fastboot ? "phone in fastboot" : win.cx.phone.model + " connected");
+        const repos = win.cx.repos ? win.cx.repos : [];
+        if (repos.length > 0 && repos[0].dirty > 0) p.push(repos[0].name + " has " + repos[0].dirty + " uncommitted " + (repos[0].dirty === 1 ? "change" : "changes"));
+        const fh = (Brain.usage && Brain.usage.ok === true) ? Brain.usage.five_hour : null;
+        if (fh) p.push(Math.round(fh.pct) + "% of your Claude session used");
+        return p.slice(0, 3).join("  ·  ");
+    }
     property int sel: 0
     property string query: ""
 
@@ -77,8 +98,6 @@ PanelWindow {
         }
     }
     readonly property var generic: [
-        { t: "Teach me something genuinely useful in 5 minutes", i: "school" },
-        { t: "What was I last working on?", i: "history_edu" },
         { t: "Why does my laptop feel slow?", i: "speed" },
         { t: "What's eating my disk space?", i: "hard_drive" }
     ]
@@ -89,8 +108,7 @@ PanelWindow {
         { i: "spellcheck", t: "Proofread", p: "Proofread this. Give the corrected text first, then a short list of what you changed. Keep my voice." },
         { i: "edit_note", t: "Rewrite it better", p: "Rewrite this to be clearer and sharper. Keep my meaning and voice. Reply with only the rewrite." },
         { i: "work", t: "Make it professional", p: "Rewrite this in a confident, professional tone. Reply with only the rewrite." },
-        { i: "translate", t: "Translate", p: "Translate this into natural English. If it is already English, translate it into Hindi." },
-        { i: "school", t: "Teach me this", p: "Teach me this like a great tutor: intuition first, then the details, one small example, and one quick question to check I got it." }
+        { i: "translate", t: "Translate", p: "Translate this into natural English. If it is already English, translate it into Hindi." }
     ]
 
     // Spotlight-style rows: typed question first, then anything relevant.
@@ -129,9 +147,26 @@ PanelWindow {
             out.push({ kind: "clip", icon: win.cx.clip.kind === "image" ? "image" : "content_paste",
                        title: win.cx.clip.kind === "image" ? "What's in the image I copied?" : "Work with what I copied",
                        hint: win.cx.clip.kind === "image" ? "Clipboard" : win.cx.clip.preview, accent: false, clipKind: win.cx.clip.kind });
-        for (let c = 0; c < win.contextual.length && out.length < 5; c++) out.push(all[c]);
+        if (win.cx.phone)
+            out.push({ kind: "ask", icon: "smartphone", accent: true,
+                       title: win.cx.phone.fastboot ? "Your phone is in fastboot" : win.cx.phone.model + " is connected",
+                       hint: "Phone", prompt: win.cx.phone.fastboot
+                           ? "My phone is in fastboot. Run `fastboot devices` and `fastboot getvar all`, tell me its state (slot, unlocked, current partition info) and what I can do from here. Don't flash anything."
+                           : "My phone is connected over adb. Tell me what's on it right now: model, Android version and build fingerprint, ROM name/version, battery, storage, and anything off in the last few minutes of logcat errors. Don't change anything." });
+        for (let c = 0; c < win.contextual.length && out.length < 4; c++) out.push(all[c]);
+        const repos = win.cx.repos ? win.cx.repos : [];
+        for (let r = 0; r < repos.length && r < 2; r++)
+            out.push({ kind: "ask", icon: "folder_code", accent: false,
+                       title: "Pick up " + repos[r].name,
+                       hint: (repos[r].dirty > 0 ? repos[r].dirty + " changed  ·  " : "") + repos[r].ago,
+                       prompt: "Catch me up on " + repos[r].path + ": what changed recently, what's uncommitted, and what I was in the middle of. Then the single next thing I should do. Don't commit anything." });
+        if (win.cx.rom)
+            out.push({ kind: "ask", icon: "android", accent: win.cx.rom.building,
+                       title: win.cx.rom.building ? "PixelOS build is running: how's it going?" : "Check on my PixelOS build",
+                       hint: "sky",
+                       prompt: "Check my PixelOS build in " + win.cx.rom.dir + ": is a build running, how far along, and if the last one failed, find the actual first error in the logs (out/error.log, soong/ninja logs) and tell me the fix. Don't start or stop builds." });
         if (!Brain.focusActive)
-            out.push({ kind: "focus", icon: "timer", title: "Start a 25-minute focus session", hint: "", accent: false });
+            out.push({ kind: "focus", icon: "timer", title: "Deep work: 90 minutes, no distractions", hint: "", accent: false });
         for (let m = win.contextual.length; m < all.length && out.length < 8; m++) out.push(all[m]);
         return out;
     }
@@ -142,14 +177,14 @@ PanelWindow {
         if (r.kind === "resume") Brain.resume();
         else if (r.kind === "media") Brain.act("media-toggle");
         else if (r.kind === "clip") Brain.useClipboard(r.clipKind);
-        else if (r.kind === "focus") Brain.startFocus(25, win.appName.length > 0 ? "Deep work in " + win.appName : "Deep work");
+        else if (r.kind === "focus") Brain.startFocus(90, win.cx.repos && win.cx.repos.length > 0 ? "Deep work on " + win.cx.repos[0].name : "Deep work");
         else if (r.kind === "sel") {
             const sel = Brain.selection;
             const label = r.title + "\n“" + (sel.length > 90 ? sel.slice(0, 90) + "…" : sel) + "”";
             Brain.selection = "";
             Brain.ask(r.prompt + win.dataNote + sel + "\n\"\"\"", label);
         }
-        else Brain.ask(r.title);
+        else Brain.ask(r.prompt ? r.prompt : r.title, r.prompt ? r.title : undefined);
         input.text = "";
     }
 
@@ -166,6 +201,7 @@ PanelWindow {
         function onShownChanged() {
             if (Brain.shown) {
                 win.targetScreen = win.pickScreen();
+                win.greeting = win.makeGreeting();
                 closeAnim.stop();
                 openAnim.restart();
                 win.sel = 0;
@@ -181,18 +217,18 @@ PanelWindow {
     }
     ParallelAnimation {
         id: openAnim
-        NumberAnimation { target: win; property: "appear"; to: 1; duration: 460; easing.type: Easing.BezierSpline; easing.bezierCurve: Theme.spring }
-        NumberAnimation { target: win; property: "dim"; to: 1; duration: 320; easing.type: Easing.OutCubic }
+        NumberAnimation { target: win; property: "appear"; to: 1; duration: 420; easing.type: Easing.BezierSpline; easing.bezierCurve: Theme.soft }
+        NumberAnimation { target: win; property: "dim"; to: 1; duration: 480; easing.type: Easing.BezierSpline; easing.bezierCurve: Theme.soft }
         SequentialAnimation {
-            PauseAnimation { duration: 70 }
-            NumberAnimation { target: win; property: "reveal"; to: 1; duration: 300; easing.type: Easing.OutCubic }
+            PauseAnimation { duration: 90 }
+            NumberAnimation { target: win; property: "reveal"; to: 1; duration: 380; easing.type: Easing.BezierSpline; easing.bezierCurve: Theme.soft }
         }
     }
     ParallelAnimation {
         id: closeAnim
-        NumberAnimation { target: win; property: "appear"; to: 0; duration: 210; easing.type: Easing.BezierSpline; easing.bezierCurve: Theme.curveIn }
-        NumberAnimation { target: win; property: "dim"; to: 0; duration: 240; easing.type: Easing.InOutCubic }
-        NumberAnimation { target: win; property: "reveal"; to: 0; duration: 120; easing.type: Easing.InCubic }
+        NumberAnimation { target: win; property: "appear"; to: 0; duration: 260; easing.type: Easing.BezierSpline; easing.bezierCurve: Theme.soft }
+        NumberAnimation { target: win; property: "dim"; to: 0; duration: 340; easing.type: Easing.BezierSpline; easing.bezierCurve: Theme.soft }
+        NumberAnimation { target: win; property: "reveal"; to: 0; duration: 160; easing.type: Easing.InCubic }
     }
 
     // ---------------------------------------------------------------- building blocks
@@ -281,7 +317,7 @@ PanelWindow {
     // ---------------------------------------------------------------- outside click closes
     Rectangle {
         anchors.fill: parent
-        color: Qt.rgba(0, 0, 0, (Theme.light ? 0.06 : 0.12) * win.dim)
+        color: Qt.rgba(0, 0, 0, (Theme.light ? 0.25 : 0.45) * win.dim)
     }
     MouseArea {
         id: catcher
@@ -297,10 +333,7 @@ PanelWindow {
         height: card.height
         x: Math.round((win.width - width) / 2)
         y: Math.round(win.height * 0.2)
-        opacity: Math.min(1, win.appear * 1.4)
-        scale: 0.94 + 0.06 * win.appear
-        transformOrigin: Item.Top
-        transform: Translate { y: -14 * (1 - win.appear) }
+        opacity: win.appear
 
         RectangularShadow {
             anchors.fill: card
@@ -345,7 +378,6 @@ PanelWindow {
                 width: card.width
                 spacing: 0
                 opacity: win.reveal
-                transform: Translate { y: 6 * (1 - win.reveal) }
 
                 // ======================================================== input
                 RowLayout {
@@ -585,6 +617,31 @@ PanelWindow {
                             label: "End"
                             onClicked: Brain.stopFocus()
                         }
+                    }
+                }
+
+                // ======================================================== hello
+                ColumnLayout {
+                    visible: win.home && Brain.selection.length === 0 && win.query.length === 0 && !Brain.focusActive
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 22
+                    Layout.rightMargin: 22
+                    Layout.topMargin: 16
+                    spacing: 3
+                    Text {
+                        text: win.greeting
+                        font.family: Theme.serif
+                        font.pixelSize: 22
+                        color: Theme.text
+                    }
+                    Text {
+                        visible: win.statusLine.length > 0
+                        Layout.fillWidth: true
+                        text: win.statusLine
+                        elide: Text.ElideRight
+                        font.family: Theme.sans
+                        font.pixelSize: 13
+                        color: Theme.textSecondary
                     }
                 }
 

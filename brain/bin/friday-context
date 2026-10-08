@@ -53,6 +53,46 @@ try:
 except Exception:
     pass
 
+# your projects: git repos in ~/Projects, most recently touched first
+def ago(sec):
+    sec = int(time.time() - sec)
+    if sec < 3600: return "%dm ago" % max(1, sec // 60)
+    if sec < 86400: return "%dh ago" % (sec // 3600)
+    return "%dd ago" % (sec // 86400)
+
+repos = []
+root = os.path.expanduser("~/Projects")
+for gitdir in glob.glob(root + "/*/.git") + glob.glob(root + "/*/*/.git"):
+    r = os.path.dirname(gitdir)
+    try:
+        touched = max(os.path.getmtime(gitdir + "/index") if os.path.exists(gitdir + "/index") else 0,
+                      os.path.getmtime(gitdir + "/HEAD"))
+    except OSError:
+        continue
+    repos.append((touched, r))
+repos.sort(reverse=True)
+out["repos"] = []
+for touched, r in repos[:3]:
+    dirty = sh(["git", "-C", r, "--no-optional-locks", "status", "--porcelain"], 1.0)
+    out["repos"].append({"name": os.path.basename(r), "path": r, "dirty": len(dirty.splitlines()) if dirty else 0, "ago": ago(touched)})
+
+# the sky phone: only if an adb server is already up (never start one just to look)
+if sh(["pgrep", "-x", "adb"], 0.4):
+    for line in sh(["adb", "devices", "-l"], 1.2).splitlines()[1:]:
+        if line.strip() and " device " in line + " ":
+            m = re.search(r"model:(\S+)", line)
+            out["phone"] = {"serial": line.split()[0], "model": (m.group(1) if m else "phone").replace("_", " ")}
+            break
+if "phone" not in out and sh(["fastboot", "devices"], 0.6).strip():
+    out["phone"] = {"serial": "", "model": "fastboot", "fastboot": True}
+
+# PixelOS / ROM tree: is a build running right now?
+for d in ("~/pixelos17", "~/sky17"):
+    p = os.path.expanduser(d)
+    if os.path.isdir(p):
+        out["rom"] = {"dir": d, "building": bool(sh(["pgrep", "-f", "soong_ui|ninja .*out/"], 0.4))}
+        break
+
 # clipboard, as a short local preview only (never sent anywhere unless you ask Friday about it)
 types = sh(["wl-paste", "--list-types"], 0.6)
 if "image/" in types:
