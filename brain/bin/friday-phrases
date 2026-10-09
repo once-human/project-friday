@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""friday-phrases — keep Friday's on-device answers sounding fresh, with almost no Claude usage.
+
+    friday-phrases --if-stale     refresh only if the bank is older than a week (friday-start runs this at login)
+    friday-phrases --force        refresh now
+    friday-phrases --show         print what's in the bank
+
+Answers like "It's 9:41 pm" or "Volume's at 40" are built on this laptop (no usage, works offline). To stop them
+sounding canned, Claude writes new phrasings for every kind of answer in ONE small Haiku call, at most once a week.
+They're saved to ~/.local/state/friday/phrases.json and friday-local picks from them at random, never repeating
+the last few. Set FRIDAY_PHRASES=off in config.env to turn this off (the built-in phrasings still vary).
+"""
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+FH = os.environ.get("FRIDAY_HOME", os.path.join(HOME, ".local/share/friday"))
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "friday")
+BANK = os.path.join(STATE, "phrases.json")
+# a quiet, empty folder to run Claude from (friday-sessions hides sessions started here)
+QUIET = os.path.join(os.environ.get("XDG_CACHE_HOME", os.path.join(HOME, ".cache")), "friday", "namer")
+WEEK = 7 * 86400
+KEEP = 30                                   # phrasings kept per answer type
+os.environ["PATH"] = ":".join([HOME + "/.local/bin", HOME + "/.claude/local", HOME + "/.npm-global/bin",
+                               "/usr/local/bin", "/usr/bin", os.environ.get("PATH", "")])
+
+
+_mod = None
+
+
+def LOCAL():
+    global _mod
+    if _mod is None:
+        built_ins()
+    return _mod
+
+
+def built_ins():
+    global _mod
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "friday-local")
+    loader = importlib.machinery.SourceFileLoader("friday_local", path)
+    spec = importlib.util.spec_from_loader("friday_local", loader)
+    mod = importlib.util.module_from_spec(spec)
+    saved = sys.argv
+    sys.argv = ["friday-local"]
+    try:
+        loader.exec_module(mod)
+    finally:
+        sys.argv = saved
+    _mod = mod
+    return mod.P, mod.SLOTS, mod.CORE, mod.fits
+
+
+def load():
+    try:
+        with open(BANK) as f:
+            return json.load(f)
+    except Exception:
+        return {"updated": 0, "phrases": {}}
+
+
+def online():
+    return LOCAL().online()                 # same careful check friday-local uses (NetworkManager, proxies, probes)
+
+
+def main():
+    bank = load()
+    if "--show" in sys.argv:
+        for k, v in sorted(bank.get("phrases", {}).items()):
+            print("%s (%d)" % (k, len(v)))
+            for x in v[:4]:
+                print("   ", x)
+        print("updated:", time.strftime("%d %b %Y %H:%M", time.localtime(bank.get("updated", 0))) if bank.get("updated") else "never")
+        return 0
+    LOCAL()                                 # also loads config.env
+    if os.environ.get("FRIDAY_PHRASES", "on") == "off":
+        return 0
+    if "--if-stale" in sys.argv and time.time() - bank.get("updated", 0) < WEEK:
+        return 0
+    claude = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
+    if not claude or not online():
+        return 0                            # try again next login
+
+    P, SLOTS, CORE, fits = built_ins()
+    skip = {"abilities", "joke_more"}
+    spec = {k: {"examples": v[:3], "required": sorted(CORE[k]), "optional": sorted(SLOTS[k] - CORE[k])}
+            for k, v in P.items() if k not in skip and k != "joke"}
+    prompt = (
+        "You write short spoken replies for Friday, a voice assistant on Onkar's Linux laptop (think JARVIS: calm, "
+        "quick, a little dry wit; he talks casually, Indian English, 'man', 'bro' are fine occasionally). "
+        "For EACH answer type below, write 6 NEW ways to say it. Rules: natural spoken English, one or two short "
+        "sentences, no emoji, no markdown, vary the structure, don't be cheesy or over-the-top. Use EXACTLY the "
+        "{placeholders} given: every 'required' one must appear, 'optional' ones may, no others, keep the curly braces. Also add an answer type "
+        "\"joke\" with 10 new, original, clean, genuinely funny one-liners (tech, Linux, coding, everyday life), "
+        "no placeholders.\n\nReply with ONLY a JSON object mapping each answer type to a list of strings.\n\n"
+        + json.dumps(spec, indent=1))
+    os.makedirs(QUIET, exist_ok=True)
+    try:
+        r = subprocess.run([claude, "-p", "--model", os.environ.get("FRIDAY_PHRASES_MODEL", "haiku"), prompt],
+                           cwd=QUIET, capture_output=True, text=True, timeout=180)
+        out = r.stdout
+    except Exception as e:
+        print("friday-phrases: %r" % e, file=sys.stderr)
+        return 1
+    m = re.search(r"\{.*\}", out or "", re.S)
+    try:
+        got = json.loads(m.group(0)) if m else {}
+    except Exception:
+        got = {}
+    if not isinstance(got, dict) or not got:
+        print("friday-phrases: no usable reply", file=sys.stderr)
+        return 1
+    merged = dict(bank.get("phrases", {}))
+    added = 0
+    for k, lines in got.items():
+        if k not in P or k in skip or not isinstance(lines, list):
+            continue
+        good = []
+        for x in lines:
+            if not isinstance(x, str) or "\n" in x or not (2 < len(x) < 220):
+                continue
+            if not fits(k, x) or re.search(r"[*_#`]|[\U0001F300-\U0001FAFF]", x):
+                continue
+            if x not in P[k] and x not in merged.get(k, []):
+                good.append(x)
+        merged[k] = (good + merged.get(k, []))[:KEEP]
+        added += len(good)
+    os.makedirs(STATE, exist_ok=True)
+    with open(BANK + ".tmp", "w") as f:
+        json.dump({"updated": int(time.time()), "phrases": merged}, f, indent=1)
+    os.replace(BANK + ".tmp", BANK)
+    print("friday-phrases: %d new phrasings" % added)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
