@@ -10,7 +10,7 @@ Singleton {
 
     property bool shown: false
     property bool cloaked: false                // briefly hide the overlay (screenshots)
-    readonly property bool running: proc.running
+    readonly property bool running: proc.running || localProc.running
     property string sessionId: ""               // Claude Code session, so follow-ups keep full context
     property var approval: null                 // {id, tool, command, reason, risk} while a card is up
     property string queued: ""
@@ -182,6 +182,9 @@ Singleton {
         root.spokenIdx = -1;
         root.queued = "";
         if (proc.running) proc.running = false;
+        root.localPending = "";
+        if (localProc.running) localProc.running = false;
+        root.localNotes = [];
         root.messages.clear();
         root.sessionId = "";
         root.steps = [];
@@ -272,9 +275,13 @@ Singleton {
         if (t.length === 0) return;
         root.promptHistory = [...root.promptHistory.filter(h => h !== t), t].slice(-40);
         root.show();
-        if (root.authState === "needed") {      // signed out: park the request, the sign-in card is showing
-            root.pendingAfterLogin = t;
-            return;
+        if (localProc.running) {     // still answering the last one on-device: drop that, take this
+            localProc.running = false;
+            root.localPending = "";
+            if (root.assistantIndex >= 0 && root.messages.count >= 2 && root.messages.get(root.assistantIndex).body.length === 0) {
+                root.messages.remove(root.messages.count - 2, 2);
+                root.assistantIndex = -1;
+            }
         }
         if (proc.running) {          // interrupt the current turn, then run the new one
             root.voiceTurn = false;
@@ -282,10 +289,84 @@ Singleton {
             proc.running = false;
             return;
         }
-        root.start(t, label);
+        // Everyday things (time, timers, volume, apps, music…) are done on this laptop with no Claude usage and
+        // no internet; only what friday-local declines goes to Claude. Rows and highlighted-text tools are
+        // always Claude jobs.
+        const local = !(label && label.length > 0) && root.selection.length === 0 && root.localEnabled;
+        if (!local && root.authState === "needed") {      // signed out: park the request, the sign-in card is showing
+            root.pendingAfterLogin = t;
+            return;
+        }
+        root.start(t, label, local);
     }
 
-    function start(t, label) {
+    // ---------------------------------------------------------------- on-device skills (friday-local)
+    property bool localEnabled: true
+    property string localPending: ""
+    property var localNotes: []                 // what was handled on-device since Claude last spoke, for context
+    property int clearSpokenAfter: -1           // on-device answers: show the neat text once it's been said
+    function tryLocal(t) {
+        root.localPending = t;
+        const flags = [];
+        if (root.voiceTurn) flags.push("--voice");
+        if (root.sessionId.length > 0) flags.push("--in-chat");
+        localProc.command = [root.binDir + "friday-local", ...flags, "--", t];
+        localProc.running = true;
+        localGuard.restart();
+    }
+    Process {
+        id: localProc
+        stdout: StdioCollector {
+            id: localOut
+            onStreamFinished: root.onLocal(localOut.text)
+        }
+    }
+    Timer {                                     // never let a stuck skill (weather on bad Wi-Fi) hold you up
+        id: localGuard
+        interval: 8000
+        onTriggered: {
+            if (!localProc.running) return;
+            localProc.running = false;
+            root.onLocal("");
+        }
+    }
+    function onLocal(out) {
+        localGuard.stop();
+        const t = root.localPending;
+        if (t.length === 0) return;
+        root.localPending = "";
+        let r = null;
+        try { r = JSON.parse(String(out ?? "").trim().split("\n").pop()); } catch (e) { r = null; }
+        if (!r || !r.handled) {
+            if (root.authState === "needed") {      // needs Claude, and you're signed out
+                root.messages.remove(root.messages.count - 2, 2);
+                root.assistantIndex = -1;
+                root.pendingAfterLogin = t;
+                return;
+            }
+            root.launch(t);
+            return;
+        }
+        const i = root.assistantIndex;
+        if (i < 0 || i >= root.messages.count) return;
+        const text = String(r.text ?? "");
+        root.messages.setProperty(i, "body", text);
+        root.messages.setProperty(i, "done", true);
+        root.localNotes = [...root.localNotes, "Onkar: " + t + "\nFriday (on-device): " + text].slice(-6);
+        root.lastActivity = Date.now();
+        if (root.voiceTurn && root.shown) {
+            root.speechRanges = [[0, text.length]];
+            root.saveSpoken();
+            root.clearSpokenAfter = i;
+            root.expectReply = !!r.listen;           // "how are you" keeps talking; "volume up" is done
+            root.endAfterSpeaking = !r.listen;
+            root.voiceCmd("say " + JSON.stringify(String(r.say || text)));
+        }
+        root.voiceTurn = false;
+        console.log("[Friday] on-device: " + r.intent);
+    }
+
+    function start(t, label, local) {
         root.lastActivity = Date.now();
         root.messages.append({ role: "user", body: (label && label.length > 0) ? label : t, stepsJson: "[]", done: true, spokenJson: "" });
         root.messages.append({ role: "assistant", body: "", stepsJson: "[]", done: false, spokenJson: "" });
@@ -305,8 +386,19 @@ Singleton {
         }
         root.steps = [];
         root.gotText = false;
+        if (local) root.tryLocal(t);
+        else root.launch(t);
+    }
+    function launch(t) {
+        root.steps = [];
+        root.gotText = false;
+        // anything Friday handled on-device just before goes along as context, so follow-ups make sense
+        const prompt = root.localNotes.length > 0
+            ? "[Just before this, handled on-device without you, for context:]\n" + root.localNotes.join("\n") + "\n\n[Now:]\n" + t
+            : t;
+        root.localNotes = [];
         proc.environment = ({
-            "FRIDAY_PROMPT": t,
+            "FRIDAY_PROMPT": prompt,
             "FRIDAY_SESSION": root.sessionId,
             "FRIDAY_SURFACE": "overlay",
             "FRIDAY_VOICE": root.voiceTurn ? "1" : ""
@@ -478,7 +570,7 @@ Singleton {
             if (root.queued !== "") {
                 const q = root.queued;
                 root.queued = "";
-                root.start(q);
+                root.start(q, undefined, root.localEnabled && root.selection.length === 0);
             } else if (root.archiveWhenDone && !root.shown) {
                 root.archiveChat();                    // you closed the panel while it worked: file it now
             }
@@ -783,6 +875,9 @@ Singleton {
         case "speaking":
             root.voiceState = e.on ? "speaking" : root.restState;
             if (!e.on) {
+                if (root.clearSpokenAfter >= 0 && root.clearSpokenAfter < root.messages.count)
+                    root.messages.setProperty(root.clearSpokenAfter, "spokenJson", "");
+                root.clearSpokenAfter = -1;
                 root.speechBase = root.speechWords.length;
                 if (!root.running) { root.spokenIdx = 9999; root.speakingMsg = -1; }
             }
@@ -850,6 +945,11 @@ Singleton {
         function stopSpeaking(): void { root.voiceCmd("stop"); }
         function withSelection(text: string): void { root.withSelection(text); }
         function approval(payload: string): void { root.requestApproval(payload); }
+        // Say something out loud (reminders and timers use this). Never talks over you while you're speaking.
+        function announce(text: string): void {
+            if (!root.hearing && root.voiceState !== "unavailable" && root.voiceState !== "off")
+                root.voiceCmd("say " + JSON.stringify(text));
+        }
         function cloak(ms: int): void {
             root.cloaked = true;
             cloakTimer.interval = ms;
