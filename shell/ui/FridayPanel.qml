@@ -1,6 +1,5 @@
 import QtQuick
 import QtQuick.Layouts
-import QtQuick.Effects
 import QtQuick.Shapes
 import Quickshell
 import Quickshell.Wayland
@@ -364,13 +363,10 @@ PanelWindow {
         y: Math.round(win.height * 0.2)
         opacity: win.appear
 
-        RectangularShadow {
+        Loader {                                    // soft shadow (Qt 6.9+); absent on older Qt, nothing else changes
             anchors.fill: card
-            radius: card.radius
-            blur: 60
-            spread: -6
-            offset: Qt.vector2d(0, 20)
-            color: Theme.shadow
+            source: "CardShadow.qml"
+            onLoaded: item.radius = Qt.binding(() => card.radius)
         }
 
         Rectangle {
