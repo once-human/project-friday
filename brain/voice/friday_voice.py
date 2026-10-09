@@ -79,6 +79,7 @@ def debug(*a):
 
 def speechify(t):
     """Turn screen text into something that sounds natural out loud."""
+    t = re.sub(r"\[\[(listen|end)\]\]", "", t, flags=re.I)                                         # Friday's hidden tags
     t = re.sub(r"https?://\S+", "the link", t)
     t = re.sub(r"(~|/home/\w+)?(/[\w.\-]+){2,}/?", lambda m: m.group(0).rstrip("/").split("/")[-1], t)   # paths -> last part
     t = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", t)                                       # emoji

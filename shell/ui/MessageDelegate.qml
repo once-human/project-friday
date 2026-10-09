@@ -31,7 +31,7 @@ Item {
     }
     // everything that wasn't spoken (details, code, lists) stays as normal formatted text below
     readonly property string rest: {
-        let b = d.body;
+        let b = Brain.untag(d.body);
         // only cut the spoken paragraphs out once they're actually being shown as speech
         const r = (d.karaoke.length > 0 && d.spoken.ranges) ? d.spoken.ranges : [];
         for (let k = r.length - 1; k >= 0; k--) b = b.slice(0, r[k][0]) + b.slice(r[k][1]);
@@ -207,7 +207,7 @@ Item {
             visible: !d.isUser && (d.karaoke.length > 0 ? d.rest.length > 0 : d.body.length > 0)
             Layout.fillWidth: true
             // headings read as shouting in a small panel: render them as bold lines
-            text: (d.karaoke.length > 0 ? d.rest : d.body).replace(/^#{1,6}\s+(.+)$/gm, "**$1**")
+            text: (d.karaoke.length > 0 ? d.rest : Brain.untag(d.body)).replace(/^#{1,6}\s+(.+)$/gm, "**$1**")
             textFormat: Text.MarkdownText
             wrapMode: Text.Wrap
             color: Theme.text
@@ -256,7 +256,7 @@ Item {
                     hoverEnabled: true
                     cursorShape: Qt.PointingHandCursor
                     onClicked: {
-                        Brain.copy(d.body);
+                        Brain.copy(Brain.untag(d.body));
                         d.copied = true;
                         copiedTimer.restart();
                     }

@@ -39,6 +39,8 @@ Singleton {
     property bool voiceBooted: false            // wait for that setting before starting the voice process
     property bool voiceSession: false           // this panel was opened by voice: tidy it away when the exchange ends
     property bool expectReply: false            // keep the conversation open after Friday speaks
+    property bool endAfterSpeaking: false
+    property string lastTag: ""       // Friday decided the conversation is over: close once it's said its bit
     // live speech: sentences are spoken as they stream in, and the one being heard is highlighted
     property int speakingMsg: -1                // message index being read aloud (-1: none)
     property int spokenIdx: -1                  // sentence currently being heard
@@ -156,6 +158,8 @@ Singleton {
         if (root.hearing || root.voiceState === "speaking") root.voiceCmd("cancel");
         root.voiceSession = false;
         root.expectReply = false;
+        root.endAfterSpeaking = false;
+        closeTimer.stop();
         dismissTimer.stop();
         root.shown = false;
         root.selection = "";
@@ -436,6 +440,10 @@ Singleton {
                 if (m && m.body.length === 0 && exitCode !== 0 && root.queued === "")
                     root.addText("**Error:** Friday exited with code " + exitCode + ".");
                 root.messages.setProperty(i, "done", true);
+                const raw = root.messages.get(i).body;
+                const tag = root.replyTag(raw);
+                if (tag.length > 0 || raw !== root.untag(raw)) root.messages.setProperty(i, "body", root.untag(raw));
+                root.lastTag = tag;
                 // Finished while you were elsewhere: tap you on the shoulder, like a real assistant would.
                 const fin = root.messages.get(i);
                 if (!root.shown && fin && fin.body.length > 0 && root.queued === "") {
@@ -446,9 +454,10 @@ Singleton {
             // A spoken question gets a spoken answer, already playing sentence by sentence; close it out.
             if (root.voiceTurn && root.shown && root.queued === "" && i >= 0 && i < root.messages.count) {
                 root.feedSpeech(true);
-                // A spoken exchange stays open: once Friday finishes talking it listens for your next line,
-                // like a person would. Silence for a few seconds ends it.
-                root.expectReply = true;
+                // Friday decides: keep listening for your reply, or wrap up ("Goodnight, Onkar") and close.
+                // No tag means it didn't say, so it listens; a few seconds of silence still ends it.
+                root.expectReply = root.lastTag !== "end";
+                root.endAfterSpeaking = root.lastTag === "end";
                 if (root.speechParts.length > 0) {
                     root.voiceCmd("say-end");
                 } else {
@@ -615,12 +624,23 @@ Singleton {
     }
     // The conversational bit: what happens when Friday finishes talking.
     function afterSpeaking() {
+        if (root.endAfterSpeaking) {               // "goodnight": say it, then get out of the way
+            root.endAfterSpeaking = false;
+            root.expectReply = false;
+            if (root.shown) closeTimer.restart();
+            return;
+        }
         if (root.expectReply && root.shown) {
             root.expectReply = false;
             root.voiceCmd("listen followup");      // no wake word needed: it just asked you something
         } else if (root.voiceSession) {
             dismissTimer.restart();                // like Siri: step out of the way when the exchange is done
         }
+    }
+    Timer {
+        id: closeTimer
+        interval: 1200
+        onTriggered: if (!root.hearing && !root.running && !root.approval && root.voiceState !== "speaking") root.hide()
     }
     Timer {
         id: dismissTimer
@@ -665,9 +685,16 @@ Singleton {
             JSON.stringify({ words: root.speechWords, ranges: root.speechRanges }));
     }
 
+    // Voice replies end with a hidden [[listen]] / [[end]] tag: Claude's call on whether you'll answer.
+    // (Also hides a half-streamed "[[li" at the very end.)
+    function untag(t) { return String(t ?? "").replace(/\s*\[\[(listen|end)\]\]\s*$/i, "").replace(/\s*\[\[[a-z]{0,6}\]?$/i, ""); }
+    function replyTag(t) {
+        const m = String(t ?? "").match(/\[\[(listen|end)\]\]\s*$/i);
+        return m ? m[1].toLowerCase() : "";
+    }
     // First paragraph or two, as plain sentences, capped so Friday doesn't read an essay aloud.
     function speakable(md) {
-        let t = String(md ?? "").replace(/```[\s\S]*?```/g, " ").replace(/^\*\*Error:\*\*/, "Sorry, something went wrong.");
+        let t = root.untag(String(md ?? "").replace(/\[\[(listen|end)\]\]/gi, "")).replace(/```[\s\S]*?```/g, " ").replace(/^\*\*Error:\*\*/, "Sorry, something went wrong.");
         t = t.split(/\n\s*\n/).slice(0, 2).join(" ");
         t = t.replace(/`([^`]*)`/g, "$1").replace(/[*_#>|]/g, "").replace(/\[(.*?)\]\(.*?\)/g, "$1").replace(/^\s*[-•]\s+/gm, "").replace(/\s+/g, " ").trim();
         if (t.length > 420) {
@@ -686,6 +713,7 @@ Singleton {
         case "muted": root.voiceState = "muted"; break;
         case "unavailable": root.voiceState = "unavailable"; break;
         case "prewake":
+            closeTimer.stop();
             if (!root.shown) root.voiceSession = true;
             dismissTimer.stop();
             root.show();
@@ -694,6 +722,8 @@ Singleton {
             root.voiceLevel = 0;
             break;
         case "wake":
+            closeTimer.stop();
+            root.endAfterSpeaking = false;
             if (!root.shown) root.voiceSession = true;
             dismissTimer.stop();
             root.show();
@@ -735,6 +765,7 @@ Singleton {
             if (/^(thanks?|thank you|cool|perfect|great|nice|awesome|got it),?( friday)?\W*$/i.test(t)) {
                 root.voiceCmd("say " + JSON.stringify("Anytime."));
                 root.expectReply = false;
+                root.endAfterSpeaking = true;
                 break;
             }
             if (/^(new chat|start over|fresh start)\W*$/i.test(t)) { root.fresh(); break; }
