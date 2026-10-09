@@ -1,0 +1,1165 @@
+#!/usr/bin/env python3
+"""friday-local — Friday's on-device skills. No Claude, no plan usage, and most of them work offline.
+
+    friday-local [--voice] [--in-chat] -- "what time is it"
+
+Prints one JSON line:
+    {"handled": true, "intent": "time", "text": "It's 9:41 pm.", "say": "It's 9 41 p.m.", "listen": false}
+    {"handled": false}                      -> not a basic task: Friday hands it to Claude
+
+Everyday things (time, date, timers, reminders, volume, brightness, media, music, apps, websites, search,
+weather, battery, Wi-Fi, Bluetooth, system stats, screenshots, lock, workspaces, maths, unit conversion,
+world clock, coin/dice, Claude usage, small talk, jokes) are done right here, instantly. Anything it isn't
+sure about goes to Claude: a wrong guess is worse than a short wait.
+
+If you're offline and it isn't a basic task, Friday says so (and what it can still do) instead of hanging.
+
+Answers are phrased from a bank of variations so they don't sound canned. friday-phrases refreshes that bank
+with Claude at most once a week (one small call), so it keeps sounding fresh without spending usage per answer.
+"""
+import ast
+import datetime as dt
+import json
+import math
+import operator
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+
+HOME = os.path.expanduser("~")
+FH = os.environ.get("FRIDAY_HOME", os.path.join(HOME, ".local/share/friday"))
+BIN = os.path.join(FH, "bin")
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "friday")
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "friday")
+BANK = os.path.join(STATE, "phrases.json")
+os.environ["PATH"] = ":".join([BIN, HOME + "/.local/bin", "/usr/local/bin", "/usr/bin", os.environ.get("PATH", "")])
+
+
+
+def load_config():
+    """Pick up FRIDAY_* settings from config.env (Friday's other helpers source it as a shell file)."""
+    try:
+        with open(os.path.join(FH, "config.env")) as f:
+            for line in f:
+                m = re.match(r"\s*(?:export\s+)?(FRIDAY_[A-Z_]+)=(.*)", line)
+                if m and m.group(1) not in os.environ:
+                    os.environ[m.group(1)] = m.group(2).split(" #")[0].strip().strip("'\"")
+    except OSError:
+        pass
+
+
+load_config()
+ARGS = sys.argv[1:]
+VOICE = "--voice" in ARGS
+IN_CHAT = "--in-chat" in ARGS
+RAW = ARGS[ARGS.index("--") + 1] if "--" in ARGS and ARGS.index("--") + 1 < len(ARGS) else (ARGS[-1] if ARGS else "")
+
+
+# ---------------------------------------------------------------- helpers
+def run(cmd, timeout=6):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "").strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def spawn(cmd):
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
+def have(x):
+    return shutil.which(x) is not None
+
+
+_online = None
+
+
+def online():
+    """Are we online? Saying "offline" wrongly would stop Friday reaching Claude, so this only says no when
+    it's sure: NetworkManager reports no connectivity, or nothing at all can be reached."""
+    global _online
+    if _online is not None:
+        return _online
+    forced = os.environ.get("FRIDAY_ONLINE", "")
+    if forced in ("1", "0"):
+        _online = forced == "1"
+        return _online
+    if any(os.environ.get(v) for v in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")):
+        _online = True                            # behind a proxy we can't probe directly: assume yes
+        return _online
+    if have("nmcli"):
+        code, out = run(["nmcli", "networking", "connectivity"], timeout=3)
+        if code == 0 and out in ("full", "limited", "portal"):
+            _online = True
+            return _online
+        if code == 0 and out == "none":
+            _online = False
+            return _online
+    _online = False
+    for host, port in (("api.anthropic.com", 443), ("1.1.1.1", 443), ("8.8.8.8", 53)):
+        try:
+            socket.create_connection((host, port), timeout=1.2).close()
+            _online = True
+            break
+        except OSError:
+            continue
+    return _online
+
+
+def now():
+    return dt.datetime.now().astimezone()
+
+
+def clock(t, spoken=False):
+    h, m = t.hour % 12 or 12, t.minute
+    ap = ("a.m." if t.hour < 12 else "p.m.") if spoken else ("am" if t.hour < 12 else "pm")
+    if m == 0:
+        return "%d %s" % (h, ap)
+    if spoken and m < 10:
+        return "%d oh %d %s" % (h, m, ap)
+    return ("%d %d %s" if spoken else "%d:%02d %s") % (h, m, ap)
+
+
+def plural(n, word):
+    n = int(n) if float(n).is_integer() else n
+    return "%s %s%s" % (n, word, "" if n == 1 else "s")
+
+
+def human_duration(sec):
+    sec = int(round(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(plural(h, "hour"))
+    if m:
+        parts.append(plural(m, "minute"))
+    if s and not h:
+        parts.append(plural(s, "second"))
+    return " and ".join(parts) if parts else "a moment"
+
+
+def part_of_day(t=None):
+    h = (t or now()).hour
+    return "morning" if 5 <= h < 12 else "afternoon" if h < 17 else "evening" if h < 22 else "night"
+
+
+# ---------------------------------------------------------------- phrasing: built-in variations + the refreshed bank
+P = {
+    "time": ["It's {time}.", "{time} right now.", "It's {time}, {part}.", "Right now it's {time}."],
+    "time_late": ["It's {time}. Bit late, no?", "{time}. Shouldn't you be asleep?", "It's {time}. Night owl mode, I see."],
+    "date": ["It's {weekday}, {date}.", "Today's {weekday}, {date}.", "{weekday}, {date}."],
+    "time_city": ["It's {time} in {city}.", "In {city} it's {time} right now.", "{city}: {time}, {cityday}."],
+    "greet": ["Hey Onkar. What's up?", "Hey! What do you need?", "Hi. What can I do for you?", "Yo. What's the plan?"],
+    "greet_tod": ["Good {part}, Onkar. What's on your mind?", "Good {part}! What are we doing?"],
+    "howareyou": ["Doing great, thanks. You?", "All good here, running smooth. How about you?",
+                  "Pretty good, honestly. What's up with you?", "Never better. What's going on?"],
+    "thanks": ["Anytime.", "You got it.", "Happy to help.", "No problem.", "Sure thing."],
+    "bye": ["Later, Onkar.", "See you.", "Catch you later.", "Bye for now."],
+    "night": ["Goodnight, Onkar. Sleep well.", "Night! Get some rest.", "Goodnight. See you tomorrow."],
+    "identity": ["I'm Friday, your assistant on this laptop. Claude's brain, your machine's hands.",
+                 "Friday. I run your desktop, and Claude does the heavy thinking."],
+    "abilities": ["The everyday stuff happens right here, even offline: time, timers, reminders, volume, brightness, "
+                  "music, apps, battery, Wi-Fi, maths, conversions. For anything bigger, like code, your screen, or "
+                  "research, I bring in Claude."],
+    "vol_set": ["Volume's at {n} percent.", "Done, volume at {n}.", "Set to {n} percent."],
+    "vol_up": ["Turned it up, {n} percent now.", "Louder. {n} percent.", "Up to {n}."],
+    "vol_down": ["Turned it down, {n} percent now.", "Quieter. {n} percent.", "Down to {n}."],
+    "vol_get": ["Volume's at {n} percent.", "It's at {n} percent."],
+    "mute": ["Muted.", "Sound's off."],
+    "unmute": ["Sound's back on.", "Unmuted."],
+    "bri_set": ["Brightness at {n} percent.", "Done, {n} percent brightness."],
+    "bri_up": ["Brighter. {n} percent.", "Turned it up to {n}."],
+    "bri_down": ["Dimmed it to {n} percent.", "Down to {n}."],
+    "pause": ["Paused.", "Done, paused."],
+    "resume": ["Playing.", "Back on."],
+    "next": ["Skipped.", "Next one."],
+    "prev": ["Going back.", "Previous track."],
+    "nothing_playing": ["Nothing's playing right now.", "There's nothing playing at the moment."],
+    "now_playing": ["That's {track}.", "You're listening to {track}.", "This is {track}."],
+    "play": ["Playing {what}.", "On it, {what} coming up.", "Here's some {what}."],
+    "stop_music": ["Stopped the music.", "Music off."],
+    "open": ["Opening {app}.", "{app}, coming up.", "Launching {app}."],
+    "open_site": ["Opening {site}.", "Here's {site}."],
+    "no_app": ["I couldn't find an app called {app} on this laptop.", "There's no {app} installed that I can see."],
+    "search": ["Searching for {q}.", "Here's what Google has on {q}."],
+    "timer": ["Timer set for {dur}.", "Okay, {dur}, starting now.", "{dur} timer, running."],
+    "remind": ["Okay, I'll remind you to {msg} {when}.", "Got it. {when_cap}, I'll remind you to {msg}.",
+               "Reminder set: {msg}, {when}."],
+    "reminders_none": ["You've got no reminders or timers running.", "Nothing scheduled right now."],
+    "reminders_list": ["You've got {n}: {list}.", "Coming up: {list}."],
+    "reminders_cancelled": ["Cancelled {n}.", "Done, cleared {n}."],
+    "focus_start": ["Focus mode on for {min} minutes. I'll keep things quiet.", "{min} minutes of focus, starting now. You got this."],
+    "focus_stop": ["Focus session ended.", "Done, focus is off."],
+    "focus_status": ["{left} left in your focus session.", "You've got {left} to go."],
+    "focus_none": ["You're not in a focus session right now."],
+    "battery": ["Battery's at {n} percent{state}.", "You're at {n} percent{state}."],
+    "battery_low": ["Battery's at {n} percent{state}. Might want to plug in.", "Only {n} percent left{state}. Charger time."],
+    "no_battery": ["I can't find a battery on this machine."],
+    "online_yes": ["Yep, you're online{ssid}.", "You're connected{ssid}."],
+    "online_no": ["Nope, you're offline right now.", "No internet at the moment."],
+    "wifi_on": ["Wi-Fi's on.", "Turned Wi-Fi on."],
+    "wifi_off": ["Wi-Fi's off.", "Turned Wi-Fi off."],
+    "bt_on": ["Bluetooth's on.", "Turned Bluetooth on."],
+    "bt_off": ["Bluetooth's off.", "Turned Bluetooth off."],
+    "cpu": ["CPU's at {cpu} percent, RAM at {ram} percent.", "You're using {cpu} percent CPU and {ram} percent of your RAM."],
+    "ram": ["{used} of {total} gigs of RAM in use, {ram} percent.", "RAM's at {ram} percent, {used} of {total} gigs."],
+    "disk": ["You've got {free} gigs free out of {total}.", "{free} gigs free on your drive, out of {total}."],
+    "uptime": ["Up for {up}.", "Your laptop's been on for {up}."],
+    "screenshot": ["Screenshot saved to Pictures, and it's on your clipboard.", "Got it, saved and copied."],
+    "lock": ["Locking up.", "Locked."],
+    "workspace": ["Workspace {n}.", "Here's workspace {n}."],
+    "calc": ["That's {r}.", "{r}.", "It comes to {r}."],
+    "convert": ["{a} is {b}.", "That's {b}."],
+    "coin": ["{side}.", "It's {side}.", "Flipped it: {side}."],
+    "dice": ["You rolled a {n}.", "{n}.", "It's a {n}."],
+    "number": ["{n}.", "How about {n}?", "I pick {n}."],
+    "weather": ["It's {temp} degrees and {desc} in {place}, feels like {feels}. Today: {lo} to {hi}{rain}.",
+                "{place}: {temp} degrees, {desc}. High of {hi}, low of {lo}{rain}."],
+    "rain_yes": ["Looks like it, about a {pct} percent chance of rain today in {place}.", "Probably, {pct} percent chance today. Carry an umbrella."],
+    "rain_no": ["Doesn't look like it, only {pct} percent chance today in {place}.", "Nah, {pct} percent chance of rain. You're good."],
+    "usage": ["You've used {five} percent of this Claude session{reset}, and {week} percent of the week.",
+              "Claude: {five} percent of your session used{reset}. Weekly's at {week} percent."],
+    "usage_unknown": ["I can't read your Claude usage right now. Open Friday once you're online and it'll refresh."],
+    "need_online": ["I need internet for that, and you're offline right now.", "That one needs the internet, and we're offline."],
+    "offline": ["I'm offline right now, so only the basics work: time, timers and reminders, volume, brightness, music controls, "
+                "apps, battery, maths and conversions. Ask me again once you're back online.",
+                "No internet at the moment, so I can't think that one through. I can still do the basics: timers, reminders, "
+                "volume, apps, music controls, battery, maths."],
+    "joke": [
+        "Why do programmers prefer dark mode? Because light attracts bugs.",
+        "I told my laptop a joke about UDP. I don't know if it got it.",
+        "There are 10 kinds of people: those who understand binary, and those who don't.",
+        "Why did the Arch user cross the road? To tell everyone on the other side they use Arch.",
+        "A SQL query walks into a bar, sees two tables, and asks: can I join you?",
+        "Why was the JavaScript developer sad? Because he didn't Node how to Express himself.",
+        "I'd tell you a joke about git, but you'd probably want to rebase it.",
+        "How many programmers does it take to change a light bulb? None. That's a hardware problem.",
+        "My code doesn't have bugs. It just develops random features.",
+        "Why don't skeletons fight each other? They don't have the guts.",
+        "I asked the Wi-Fi for a relationship. It said there was no connection.",
+        "Why did the developer go broke? Because he used up all his cache.",
+    ],
+    "joke_more": ["Want another one?", "I've got more where that came from.", ""],
+}
+
+# placeholders each intent may use, and the ones every phrasing must keep (bank lines that break this are dropped)
+SLOTS = {k: set(re.findall(r"{(\w+)}", " ".join(v))) for k, v in P.items()}
+CORE = {k: set.intersection(*[set(re.findall(r"{(\w+)}", x)) for x in v]) for k, v in P.items()}
+
+
+def fits(intent, line):
+    used = set(re.findall(r"{(\w+)}", line))
+    return used <= SLOTS.get(intent, set()) and CORE.get(intent, set()) <= used
+
+
+def load_bank():
+    try:
+        with open(BANK) as f:
+            b = json.load(f).get("phrases", {})
+        return {k: [x for x in v if isinstance(x, str) and fits(k, x)]
+                for k, v in b.items() if k in P}
+    except Exception:
+        return {}
+
+
+BANKED = None
+LAST = os.path.join(STATE, "phrases-last.json")
+
+
+def say(intent, **kw):
+    """A phrasing for this intent that you didn't just hear."""
+    global BANKED
+    if BANKED is None:
+        BANKED = load_bank()
+    options = P[intent] + BANKED.get(intent, [])
+    try:
+        with open(LAST) as f:
+            last = json.load(f)
+    except Exception:
+        last = {}
+    recent = last.get(intent, [])
+    fresh = [o for o in options if o not in recent] or options
+    choice = random.choice(fresh)
+    last[intent] = ([choice] + recent)[: max(1, min(3, len(options) - 1))]
+    try:
+        os.makedirs(STATE, exist_ok=True)
+        with open(LAST + ".tmp", "w") as f:
+            json.dump(last, f)
+        os.replace(LAST + ".tmp", LAST)
+    except OSError:
+        pass
+    out = choice.format(**{k: v for k, v in kw.items()})
+    return out[:1].upper() + out[1:] if out else out
+
+
+def reply(intent, text, spoken=None, listen=False):
+    spoken = re.sub(r"\.\.+", ".", spoken or text)
+    text = re.sub(r"(?<!\.)\.\.(?!\.)", ".", text)
+    print(json.dumps({"handled": True, "intent": intent, "text": text, "say": spoken, "listen": listen}))
+    sys.exit(0)
+
+
+def decline():
+    print(json.dumps({"handled": False, "online": online()}))
+    sys.exit(0)
+
+
+# ---------------------------------------------------------------- understanding what you said
+WORDNUM = {w: i for i, w in enumerate("zero one two three four five six seven eight nine ten eleven twelve thirteen "
+                                       "fourteen fifteen sixteen seventeen eighteen nineteen twenty".split())}
+WORDNUM.update({"thirty": 30, "forty": 40, "forty-five": 45, "fifty": 50, "sixty": 60, "ninety": 90, "hundred": 100,
+                "a": 1, "an": 1, "a couple of": 2, "couple of": 2, "a few": 3, "few": 3})
+
+
+def num(w):
+    w = (w or "").strip().lower()
+    if re.fullmatch(r"\d+(\.\d+)?", w):
+        return float(w)
+    return float(WORDNUM[w]) if w in WORDNUM else None
+
+
+def clean(raw):
+    t = raw.strip().lower().replace("’", "'").replace("`", "'")
+    t = re.sub(r"^\W*((hey|hi|okay|ok|yo)\W+)?friday\b\W*", "", t)
+    t = re.sub(r"[?!.…]+$", "", t).strip(" ,")
+    for _ in range(2):
+        t = re.sub(r"^(please|pls|can you|could you|would you|will you|can u|kindly|hey|okay|ok|so|um|uh|just)\b[\s,]*", "", t)
+    t = re.sub(r"\s*\b(please|pls|for me|real quick|quickly)$", "", t).strip(" ,")
+    return re.sub(r"\s+", " ", t)
+
+
+DUR_RE = r"((?:\d+(?:\.\d+)?|an?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty|thirty|forty|forty-five|fifty|sixty|ninety|a couple of|a few|half an?)\s*(?:and a half\s*)?(?:hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?:\s+and a half)?(?:\s*(?:and\s*)?(?:\d+|[a-z-]+)\s*(?:minutes?|mins?|m|seconds?|secs?|s))?)"
+
+
+def parse_duration(s):
+    """'5 minutes', 'an hour and a half', '1 hour 30 minutes', 'half an hour', '90 seconds' -> seconds."""
+    s = (s or "").strip().lower()
+    if re.fullmatch(r"half an? hour", s):
+        return 1800
+    if re.fullmatch(r"(a )?quarter (of )?an hour", s):
+        return 900
+    total, found = 0.0, False
+    for n, unit, half in re.findall(r"(\d+(?:\.\d+)?|an?|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+                                    r"fifteen|twenty|thirty|forty|forty-five|fifty|sixty|ninety|a couple of|a few)\s*"
+                                    r"(hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)\b(\s*and a half)?", s):
+        v = num(n)
+        if v is None:
+            continue
+        if half:
+            v += 0.5
+        mult = 3600 if unit.startswith("h") else 60 if unit.startswith("m") else 1
+        total += v * mult
+        found = True
+    if re.search(r"(hours?|minutes?)\s+and a half", s) and not found:
+        return None
+    return int(total) if found and total > 0 else None
+
+
+def parse_clock(s, base=None):
+    """'6', '6 pm', '6:30', '6.30 pm', '18:30', 'noon', 'midnight' -> next datetime it happens."""
+    base = base or now()
+    s = s.strip().lower().replace(".", ":").replace("a:m:", "am").replace("p:m:", "pm")
+    s = re.sub(r"\s*o'?clock", "", s)
+    if s in ("noon", "midday"):
+        h, m, ap = 12, 0, "pm"
+    elif s == "midnight":
+        h, m, ap = 0, 0, "am"
+    else:
+        mt = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm|in the morning|in the evening|at night|tonight)?", s)
+        if not mt:
+            return None
+        h, m = int(mt.group(1)), int(mt.group(2) or 0)
+        ap = mt.group(3) or ""
+        if "morning" in ap:
+            ap = "am"
+        elif ap and ap != "am":
+            ap = "pm"
+        if h > 23 or m > 59:
+            return None
+    if ap == "am" and h == 12:
+        h = 0
+    elif ap == "pm" and h < 12:
+        h += 12
+    cands = []
+    days = (0, 1, 2)
+    hours = [h] if (ap or h > 12 or h == 0) else [h, (h + 12) % 24]
+    for d in days:
+        for hh in hours:
+            c = (base + dt.timedelta(days=d)).replace(hour=hh, minute=m, second=0, microsecond=0)
+            if c > base + dt.timedelta(seconds=20):
+                cands.append(c)
+    return min(cands) if cands else None
+
+
+def when_words(t):
+    today = now().date()
+    if t.date() == today:
+        return "at " + clock(t)
+    if t.date() == today + dt.timedelta(days=1):
+        return "tomorrow at " + clock(t)
+    return "on %s at %s" % (t.strftime("%A"), clock(t))
+
+
+def you_form(msg):
+    m = " " + msg + " "
+    for a, b in ((" my ", " your "), (" me ", " you "), (" i ", " you "), (" i'm ", " you're "), (" myself ", " yourself "),
+                 (" mine ", " yours "), (" am ", " are ")):
+        m = m.replace(a, b)
+    return m.strip()
+
+
+# ---------------------------------------------------------------- the skills
+def k_time(t):
+    if re.fullmatch(r"(what('s| is) the |what )?time( is it)?( now| right now)?|what time is it( now| right now)?|"
+                    r"tell me the time|current time|time now|time please|got the time|do you know (what )?the time( is)?", t):
+        n = now()
+        late = 0 <= n.hour < 4
+        intent = "time_late" if late and random.random() < 0.6 else "time"
+        txt = say(intent, time=clock(n), part=part_of_day(n))
+        return reply("time", txt, txt.replace(clock(n), clock(n, True)))
+    m = re.fullmatch(r"(?:what(?:'s| is) the )?time(?: is it)? in ([a-z .'-]+)|what time is it in ([a-z .'-]+)", t)
+    if m:
+        city = (m.group(1) or m.group(2)).strip()
+        tz = CITIES.get(city)
+        if not tz:
+            return None
+        try:
+            from zoneinfo import ZoneInfo
+            ct = dt.datetime.now(ZoneInfo(tz))
+        except Exception:
+            return None
+        diff = (ct.date() - now().date()).days
+        cityday = "tomorrow there" if diff > 0 else "yesterday there" if diff < 0 else ct.strftime("%A")
+        name = city.title() if len(city) > 3 else city.upper()
+        txt = say("time_city", time=clock(ct), city=name, cityday=cityday)
+        return reply("time_city", txt, txt.replace(clock(ct), clock(ct, True)))
+
+
+CITIES = {
+    "london": "Europe/London", "uk": "Europe/London", "paris": "Europe/Paris", "berlin": "Europe/Berlin",
+    "amsterdam": "Europe/Amsterdam", "madrid": "Europe/Madrid", "rome": "Europe/Rome", "dublin": "Europe/Dublin",
+    "new york": "America/New_York", "nyc": "America/New_York", "new york city": "America/New_York",
+    "san francisco": "America/Los_Angeles", "sf": "America/Los_Angeles", "los angeles": "America/Los_Angeles",
+    "la": "America/Los_Angeles", "seattle": "America/Los_Angeles", "california": "America/Los_Angeles",
+    "chicago": "America/Chicago", "texas": "America/Chicago", "austin": "America/Chicago", "toronto": "America/Toronto",
+    "vancouver": "America/Vancouver", "dubai": "Asia/Dubai", "singapore": "Asia/Singapore", "tokyo": "Asia/Tokyo",
+    "japan": "Asia/Tokyo", "seoul": "Asia/Seoul", "beijing": "Asia/Shanghai", "shanghai": "Asia/Shanghai",
+    "hong kong": "Asia/Hong_Kong", "sydney": "Australia/Sydney", "melbourne": "Australia/Melbourne",
+    "india": "Asia/Kolkata", "bangalore": "Asia/Kolkata", "bengaluru": "Asia/Kolkata", "pune": "Asia/Kolkata",
+    "mumbai": "Asia/Kolkata", "delhi": "Asia/Kolkata", "kathmandu": "Asia/Kathmandu", "dhaka": "Asia/Dhaka",
+    "moscow": "Europe/Moscow", "istanbul": "Europe/Istanbul", "cairo": "Africa/Cairo", "nairobi": "Africa/Nairobi",
+    "lagos": "Africa/Lagos", "johannesburg": "Africa/Johannesburg", "sao paulo": "America/Sao_Paulo",
+    "mexico city": "America/Mexico_City", "bali": "Asia/Makassar", "bangkok": "Asia/Bangkok", "jakarta": "Asia/Jakarta",
+    "manila": "Asia/Manila", "kuala lumpur": "Asia/Kuala_Lumpur", "riyadh": "Asia/Riyadh", "tel aviv": "Asia/Jerusalem",
+    "zurich": "Europe/Zurich", "stockholm": "Europe/Stockholm", "lisbon": "Europe/Lisbon", "hawaii": "Pacific/Honolulu",
+    "utc": "UTC", "gmt": "UTC",
+}
+
+
+def k_date(t):
+    if re.fullmatch(r"(what('s| is) )?(the |today's )?(date|day)( today| is it( today)?)?|what day is (it|today)|"
+                    r"what('s| is) today('s date)?|today's date|which day is (it|today)|what date is it( today)?", t):
+        n = now()
+        txt = say("date", weekday=n.strftime("%A"), date="%s %d" % (n.strftime("%B"), n.day))
+        return reply("date", txt)
+
+
+def k_smalltalk(t):
+    if IN_CHAT:     # mid-conversation, a short line is usually an answer to Claude, not a fresh greeting
+        if re.fullmatch(r"(thanks?|thank you|thank you so much|thanks a lot|thx|ty|cheers)( friday| man| bro)?", t):
+            return reply("thanks", say("thanks"))
+        if re.fullmatch(r"(good ?night|gn|night night)( friday)?", t):
+            return reply("night", say("night"))
+        return None
+    if t in ("", "hi", "hello", "hey", "yo", "hey there", "hello there", "hiya", "sup", "wassup", "what's up", "whats up"):
+        return reply("greet", say("greet"), listen=True)
+    m = re.fullmatch(r"good (morning|afternoon|evening)", t)
+    if m:
+        return reply("greet", say("greet_tod", part=m.group(1)), listen=True)
+    if re.fullmatch(r"how (are|r) (you|u)( doing| today)?|how('s| is) it going|how you doing|how are things|"
+                    r"how have you been|how's your day( going)?|you good|you okay|you alright", t):
+        return reply("howareyou", say("howareyou"), listen=True)
+    if re.fullmatch(r"(thanks?|thank you|thank you so much|thanks a lot|thx|ty|cheers)( friday| man| bro)?", t):
+        return reply("thanks", say("thanks"))
+    if re.fullmatch(r"(good ?night|gn|night night)( friday)?", t):
+        return reply("night", say("night"))
+    if re.fullmatch(r"(bye|goodbye|bye bye|see you|see ya|later|catch you later|that's all|that's it)( friday)?", t):
+        return reply("bye", say("bye"))
+    if re.fullmatch(r"who are you|what('s| is) your name|what are you|introduce yourself", t):
+        return reply("identity", say("identity"))
+    if re.fullmatch(r"what can you do|what do you do|help|what are you capable of", t):
+        return reply("abilities", say("abilities"))
+    if re.fullmatch(r"(tell me |say )?(a |another |one more )?(funny )?joke|make me laugh", t):
+        j = say("joke")
+        tail = say("joke_more")
+        return reply("joke", (j + " " + tail).strip(), listen=bool(tail))
+
+
+def wpctl_volume():
+    code, out = run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"])
+    m = re.search(r"([\d.]+)", out or "")
+    return (int(round(float(m.group(1)) * 100)), "MUTED" in out) if code == 0 and m else (None, False)
+
+
+def k_volume(t):
+    if not have("wpctl"):
+        return None
+    n = None
+    m = re.fullmatch(r"(set |change |put |make )?(the )?(volume|sound)( level)? (to |at )?(\d{1,3}|[a-z-]+)( percent|%)?|"
+                     r"(volume|sound) (\d{1,3})( percent|%)?", t)
+    if m:
+        n = num(m.group(6) or m.group(9))
+    if m and n is not None:
+        n = int(max(0, min(100, n)))
+        run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"])
+        run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", "%d%%" % n])
+        return reply("volume", say("vol_set", n=n))
+    if re.fullmatch(r"(turn (it|the volume|the sound|the music) up|volume up|increase (the )?volume|louder|make it louder|"
+                    r"(a bit |little )?louder|raise (the )?volume|turn up (the )?(volume|music|sound))( a (bit|little|lot))?", t):
+        step = 20 if t.endswith("a lot") else 10
+        run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"])
+        run(["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", "%d%%+" % step])
+        return reply("volume", say("vol_up", n=wpctl_volume()[0]))
+    if re.fullmatch(r"(turn (it|the volume|the sound|the music) down|volume down|decrease (the )?volume|quieter|softer|"
+                    r"make it quieter|lower (the )?volume|turn down (the )?(volume|music|sound))( a (bit|little|lot))?", t):
+        step = 20 if t.endswith("a lot") else 10
+        run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "%d%%-" % step])
+        return reply("volume", say("vol_down", n=wpctl_volume()[0]))
+    if re.fullmatch(r"(mute|mute (the )?(sound|volume|audio|it|everything)|silence|shut up)", t):
+        run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1"])
+        return reply("mute", say("mute"))
+    if re.fullmatch(r"unmute( (the )?(sound|volume|audio|it))?|sound on", t):
+        run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"])
+        return reply("unmute", say("unmute"))
+    if re.fullmatch(r"(what('s| is) the |what )?volume( level| at)?|how loud is it", t):
+        n, muted = wpctl_volume()
+        if n is None:
+            return None
+        return reply("volume", say("mute") if muted else say("vol_get", n=n))
+
+
+def bright():
+    code, out = run(["brightnessctl", "-m"])
+    m = re.search(r",(\d+)%", out or "")
+    return int(m.group(1)) if m else None
+
+
+def k_brightness(t):
+    if not have("brightnessctl"):
+        return None
+    n = None
+    m = re.fullmatch(r"(set |change |put )?(the )?(screen )?brightness (to |at )?(\d{1,3}|[a-z-]+)( percent|%)?", t)
+    if m:
+        n = num(m.group(5))
+    if m and n is not None:
+        n = int(max(1, min(100, n)))
+        run(["brightnessctl", "set", "%d%%" % n])
+        return reply("brightness", say("bri_set", n=n))
+    if re.fullmatch(r"(brightness up|increase (the )?brightness|(make it |make the screen )?brighter|turn (up )?(the )?brightness( up)?|"
+                    r"raise (the )?brightness)( a (bit|little|lot))?", t):
+        run(["brightnessctl", "set", "%d%%+" % (20 if t.endswith("a lot") else 10)])
+        return reply("brightness", say("bri_up", n=bright()))
+    if re.fullmatch(r"(brightness down|decrease (the )?brightness|dim( the screen| it)?|(make it |make the screen )?dimmer|"
+                    r"turn (down )?(the )?brightness( down)?|lower (the )?brightness)( a (bit|little|lot))?", t):
+        run(["brightnessctl", "set", "%d%%-" % (20 if t.endswith("a lot") else 10)])
+        return reply("brightness", say("bri_down", n=bright()))
+
+
+def players():
+    if not have("playerctl"):
+        return []
+    code, out = run(["playerctl", "-l"])
+    return [p for p in out.splitlines() if p.strip()] if code == 0 else []
+
+
+def k_media(t):
+    if re.fullmatch(r"(pause|pause (the )?(music|song|video|it|playback)|stop (the )?(music|song|playback|playing))", t):
+        if t.startswith("stop") and have("mpv"):
+            run([os.path.join(BIN, "friday-music"), "stop"])
+        if not players():
+            return reply("media", say("nothing_playing"))
+        run(["playerctl", "pause"])
+        return reply("media", say("stop_music") if t.startswith("stop") else say("pause"))
+    if re.fullmatch(r"(resume|unpause|continue( playing| the music)?|play|resume (the )?(music|song|video|playback))", t):
+        if not players():
+            return None if t == "play" else reply("media", say("nothing_playing"))
+        run(["playerctl", "play"])
+        return reply("media", say("resume"))
+    if re.fullmatch(r"(next|skip)( (song|track|one|this))?|skip (this|it|the)( song| track| one)?|play (the )?next( song| track)?|next please", t):
+        if not players():
+            return reply("media", say("nothing_playing"))
+        run(["playerctl", "next"])
+        return reply("media", say("next"))
+    if re.fullmatch(r"(previous|go back|last)( (song|track|one))?|play (the )?previous( song| track)?", t):
+        if not players():
+            return reply("media", say("nothing_playing"))
+        run(["playerctl", "previous"])
+        return reply("media", say("prev"))
+    if re.fullmatch(r"what('s| is) (this )?(song|playing|this)( called)?|what song is (this|playing)|who('s| is) (this|singing|playing)|"
+                    r"what am i listening to|name (of )?this song", t):
+        code, out = run(["playerctl", "metadata", "--format", "{{artist}} — {{title}}"])
+        out = out.strip(" —")
+        if code != 0 or not out:
+            return reply("media", say("nothing_playing"))
+        return reply("media", say("now_playing", track=out.replace(" — ", ", ") if VOICE else out))
+    m = re.fullmatch(r"play (some |a |me (some )?|the )?(.+?)( (music|songs|playlist|mix|on youtube))?", t)
+    if m:
+        what = m.group(3).strip()
+        if what in ("music", "something", "some music", "a song", "songs", "anything"):
+            if players():
+                run(["playerctl", "play"])
+                return reply("media", say("resume"))
+            what = "chill"
+        if re.search(r"\b(screen|video|game|file|folder|this|that|it|from|here|there|movie|episode|podcast)\b", what):
+            return None
+        if " and " in what and not re.search(r"(drum and bass|rock and roll|r and b|rhythm and blues)", what):
+            return None
+        if not online():
+            return reply("need_online", say("need_online"))
+        spawn([os.path.join(BIN, "friday-music"), what])
+        return reply("music", say("play", what=what))
+
+
+SITES = {
+    "youtube": "https://youtube.com", "gmail": "https://mail.google.com", "mail": "https://mail.google.com",
+    "github": "https://github.com", "google": "https://google.com", "maps": "https://maps.google.com",
+    "google maps": "https://maps.google.com", "calendar": "https://calendar.google.com", "drive": "https://drive.google.com",
+    "google drive": "https://drive.google.com", "twitter": "https://x.com", "x": "https://x.com", "reddit": "https://reddit.com",
+    "instagram": "https://instagram.com", "linkedin": "https://linkedin.com", "netflix": "https://netflix.com",
+    "whatsapp web": "https://web.whatsapp.com", "chatgpt": "https://chatgpt.com", "claude": "https://claude.ai",
+    "claude ai": "https://claude.ai", "amazon": "https://amazon.in", "flipkart": "https://flipkart.com",
+    "spotify web": "https://open.spotify.com", "hacker news": "https://news.ycombinator.com", "wikipedia": "https://wikipedia.org",
+    "stack overflow": "https://stackoverflow.com", "vercel": "https://vercel.com", "figma": "https://figma.com",
+}
+APP_ALIAS = {"whatsapp": "whatsie", "browser": "chrome", "terminal": "kitty", "files": "files", "file manager": "files",
+             "music": "spotify", "code": "code", "vs code": "code", "vscode": "code", "settings": "settings"}
+
+
+def k_open(t):
+    m = re.fullmatch(r"(open|launch|start|fire up|bring up|pull up)( up)? (the )?(.+?)( app| website| site| page)?", t)
+    if not m:
+        return None
+    what = m.group(4).strip()
+    if m.group(1) not in ("open", "launch") and (len(what.split()) > 1 or re.fullmatch(
+            r"build|server|tests?|project|recording|download|update|install|backup|sync|game|deploy|dev|app|it|over", what)):
+        return None          # "start the build": a task, not an app
+    if " and " in what or len(what.split()) > 3 or re.match(r"(my |the )?(last|latest|recent|project|file|folder|repo|chat|session)", what):
+        return None          # "open chrome and search…", "open my last project": Claude's job
+    if what.startswith(("workspace", "focus", "pomodoro", "a timer", "timer")):
+        return None
+    site = SITES.get(what) or SITES.get(what.replace(".com", ""))
+    if re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+(/\S*)?", what) and not site:
+        site = "https://" + what
+    app = APP_ALIAS.get(what, what)
+    if not site or what in ("google", "claude"):
+        code, out = run([os.path.join(BIN, "friday-open"), app])
+        if code == 0:
+            return reply("open", say("open", app=what.title() if len(what) > 3 else what.upper()))
+        if app != what:
+            code, out = run([os.path.join(BIN, "friday-open"), what])
+            if code == 0:
+                return reply("open", say("open", app=what.title()))
+    if site:
+        if not online():
+            return reply("need_online", say("need_online"))
+        run([os.path.join(BIN, "friday-web"), "open", site])
+        return reply("open", say("open_site", site=what.title() if len(what) > 3 else what.upper()))
+    return None                  # no such app here: Claude can work out what you meant
+
+
+def k_search(t):
+    m = re.fullmatch(r"(google|search (the web |google )?(for )?|look up on google |search for )(.+)", t)
+    if not m:
+        return None
+    q = m.group(4).strip()
+    if not q:
+        return None
+    if not online():
+        return reply("need_online", say("need_online"))
+    run([os.path.join(BIN, "friday-web"), "search", q])
+    return reply("search", say("search", q=q))
+
+
+REMINDERS = os.path.join(STATE, "reminders.json")
+
+
+def remind(spec, msg):
+    code, out = run([os.path.join(BIN, "friday-remind")] + spec + [msg])
+    return code == 0
+
+
+def k_timer(t):
+    m = (re.fullmatch(r"(set |start )?(a |an )?timer (for |of )?(.+)", t)
+         or re.fullmatch(r"(set |start )?(a |an )?(.+?) timer", t)
+         or re.fullmatch(r"(countdown|count down) (for |from )?(.+)", t))
+    if not m:
+        return None
+    sec = parse_duration(m.groups()[-1])
+    if not sec or sec > 86400:
+        return None
+    spec = "%dh%dm%ds" % (sec // 3600, (sec % 3600) // 60, sec % 60)
+    spec = re.sub(r"(?<!\d)0[hms]", "", spec) or "1s"
+    if not remind([spec], "Timer done (%s)" % human_duration(sec)):
+        return None
+    return reply("timer", say("timer", dur=human_duration(sec)))
+
+
+def k_remind(t):
+    m = re.fullmatch(r"remind me (to |about |that )?(.+)", t)
+    if not m:
+        return None
+    body = m.group(2)
+    target, rest, sec = None, body, None
+    # "in 10 minutes" / "after an hour"
+    d = re.search(r"\b(in|after) " + DUR_RE + r"\b", body)
+    if d:
+        sec = parse_duration(d.group(2))
+        if sec:
+            target = now() + dt.timedelta(seconds=sec)
+            rest = (body[: d.start()] + body[d.end():]).strip()
+    if target is None:
+        c = re.search(r"\b(tomorrow|tonight|today)?\s*(?:at|by|around)\s+(\d{1,2}(?:[:.]\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.|o'?clock)?|noon|midnight)"
+                      r"(\s*(tomorrow|tonight|in the morning|in the evening|at night))?\b", body)
+        if c:
+            day = (c.group(1) or c.group(4) or "").strip()
+            clk = c.group(2)
+            if day in ("in the morning",):
+                clk += " am"
+            elif day in ("tonight", "in the evening", "at night") and not re.search(r"am|pm", clk):
+                clk += " pm"
+            target = parse_clock(clk)
+            if target and day == "tomorrow" and target.date() == now().date():
+                target += dt.timedelta(days=1)
+            rest = (body[: c.start()] + body[c.end():]).strip()
+    if target is None:
+        return None          # no clear time: let Claude ask
+    msg = re.sub(r"^(to|about|that)\s+", "", re.sub(r"\s+", " ", rest)).strip(" ,")
+    if not msg:
+        msg = "the thing you asked"
+    secs = sec if sec else int((target - now()).total_seconds())
+    if secs < 5:
+        return None
+    spec = ["%ds" % secs] if secs < 6 * 3600 else [target.strftime("%Y-%m-%d %H:%M")]
+    if not remind(spec, msg[:1].upper() + msg[1:]):
+        return None
+    w = "in " + human_duration(sec) if sec and sec < 3600 else when_words(target)
+    txt = say("remind", msg=you_form(msg), when=w, when_cap=w[:1].upper() + w[1:])
+    return reply("remind", txt, txt.replace(clock(target), clock(target, True)))
+
+
+def load_reminders():
+    try:
+        with open(REMINDERS) as f:
+            items = json.load(f)
+    except Exception:
+        return []
+    t = time.time()
+    code, out = run(["systemctl", "--user", "list-timers", "friday-remind-*", "--all", "--no-legend", "--no-pager", "--plain"])
+    active = set(re.findall(r"friday-remind-(\d+)\.timer", out or "")) if code == 0 else None
+    return [r for r in items if r.get("at", 0) > t and (active is None or str(r.get("id")) in active)]
+
+
+def k_reminders(t):
+    if re.fullmatch(r"(what are |show |list |tell me )?(my |all |any )?(reminders|timers|alarms)( do i have)?( set| running)?|"
+                    r"do i have any (reminders|timers)|what('s| is) (coming up|scheduled)", t):
+        items = sorted(load_reminders(), key=lambda r: r["at"])
+        if not items:
+            return reply("reminders", say("reminders_none"))
+        parts = []
+        for r in items[:5]:
+            at = dt.datetime.fromtimestamp(r["at"]).astimezone()
+            left = r["at"] - time.time()
+            parts.append("%s %s" % (r.get("msg", "reminder").rstrip("."), ("in " + human_duration(left)) if left < 3600 else when_words(at)))
+        return reply("reminders", say("reminders_list", n=plural(len(items), "thing"), list="; ".join(parts)))
+    m = re.fullmatch(r"(cancel|clear|delete|stop|remove) (the |my |all( my)? |all the )?(reminders?|timers?|alarms?)", t)
+    if m:
+        items = load_reminders()
+        code, out = run(["systemctl", "--user", "list-timers", "friday-remind-*", "--no-legend", "--no-pager", "--plain"])
+        units = re.findall(r"(friday-remind-\d+\.timer)", out or "")
+        if "timer" in m.group(4) and items:
+            ids = {"friday-remind-%s.timer" % r["id"] for r in items if r.get("msg", "").startswith("Timer done")}
+            units = [u for u in units if u in ids] or units
+        for u in units:
+            run(["systemctl", "--user", "stop", u])
+        what = plural(len(units), "timer" if "timer" in m.group(4) else "reminder")
+        return reply("reminders", say("reminders_cancelled", n=what) if units else say("reminders_none"))
+
+
+def k_focus(t):
+    m = re.fullmatch(r"(start |begin |turn on |enable )?(a |the )?(focus|pomodoro|deep work)( session| mode| timer| block)?"
+                     r"( for (\d+|[a-z-]+) ?(minutes?|mins?|hours?))?( on (.+))?|(help me |let me |i need to |i want to )focus( for (\d+|[a-z-]+) ?(minutes?|mins?|hours?))?( on (.+))?", t)
+    if m and not re.match(r"(stop|end|cancel)", t) and (m.group(1) or m.group(4) or m.group(5) or m.group(10) or m.group(11)
+                                                         or m.group(3) in ("pomodoro", "deep work") or t in ("focus", "focus mode")):
+        n = num(m.group(6) or m.group(12) or "") or (25 if "pomodoro" in t else 50)
+        if (m.group(7) or m.group(13) or "").startswith("hour"):
+            n *= 60
+        task = (m.group(9) or m.group(15) or "Focus").strip()
+        run([os.path.join(BIN, "friday-focus"), "start", str(int(n)), task[:1].upper() + task[1:]])
+        return reply("focus", say("focus_start", min=int(n)))
+    if re.fullmatch(r"(stop|end|cancel|finish|turn off|disable) (the )?(focus|pomodoro|deep work)( session| mode| timer)?|i'm done focusing", t):
+        run([os.path.join(BIN, "friday-focus"), "stop"])
+        return reply("focus", say("focus_stop"))
+    if re.fullmatch(r"how (much|long) (time )?(is )?left( in (my |the )?(focus|session|pomodoro))?|focus status", t):
+        try:
+            with open(os.path.join(RUNTIME, "focus.json")) as f:
+                fj = json.load(f)
+            left = fj.get("ends", 0) - time.time()
+        except Exception:
+            left = 0
+        if left <= 0:
+            return reply("focus", say("focus_none"))
+        return reply("focus", say("focus_status", left=human_duration(left)))
+
+
+def k_battery(t):
+    if not re.fullmatch(r"(what('s| is) (my |the )?)?battery( level| percentage| status| life)?( left| at)?|how much battery( do i have| is| have i got)?( left| remaining)?|"
+                        r"(am i|is it) (charging|plugged in)|battery left|how('s| is) (my |the )?battery", t):
+        return None
+    import glob
+    bats = glob.glob("/sys/class/power_supply/BAT*")
+    if not bats:
+        return reply("battery", say("no_battery"))
+    try:
+        cap = int(open(os.path.join(bats[0], "capacity")).read().strip())
+        status = open(os.path.join(bats[0], "status")).read().strip().lower()
+    except OSError:
+        return None
+    state = ", charging" if status == "charging" else ", fully charged" if status == "full" else ""
+    if re.search(r"charging|plugged", t):
+        state = ", and you're charging" if status in ("charging", "full") else ", and you're not plugged in"
+    return reply("battery", say("battery_low" if cap <= 20 and status not in ("charging", "full") else "battery", n=cap, state=state))
+
+
+def ssid():
+    if not have("nmcli"):
+        return ""
+    code, out = run(["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"])
+    for line in (out or "").splitlines():
+        if line.startswith("yes:"):
+            return line[4:]
+    return ""
+
+
+def k_network(t):
+    if re.fullmatch(r"(am i|are we|is (the )?(internet|wifi|wi-fi)) (online|connected|working|up)( to (the )?internet)?|"
+                    r"(do i|do we) have (internet|wifi|wi-fi)|is the internet working|internet status|wi-?fi status", t):
+        if online():
+            s = ssid()
+            return reply("network", say("online_yes", ssid=(" on " + s) if s else ""))
+        return reply("network", say("online_no"))
+    m = re.fullmatch(r"(turn |switch )?(on|off) (the )?(wifi|wi-fi|bluetooth)|(turn |switch )?(the )?(wifi|wi-fi|bluetooth) (on|off)|"
+                     r"(enable|disable) (the )?(wifi|wi-fi|bluetooth)", t)
+    if m:
+        dev = m.group(4) or m.group(7) or m.group(11)
+        on = (m.group(2) or m.group(8) or m.group(9)) in ("on", "enable")
+        if dev.startswith("w"):
+            if not have("nmcli"):
+                return None
+            run(["nmcli", "radio", "wifi", "on" if on else "off"])
+            return reply("network", say("wifi_on" if on else "wifi_off"))
+        if not have("bluetoothctl"):
+            return None
+        if on and have("rfkill"):
+            run(["rfkill", "unblock", "bluetooth"])
+        run(["bluetoothctl", "power", "on" if on else "off"])
+        return reply("network", say("bt_on" if on else "bt_off"))
+
+
+def cpu_pct():
+    def snap():
+        with open("/proc/stat") as f:
+            v = [int(x) for x in f.readline().split()[1:]]
+        return sum(v), v[3] + v[4]
+    a = snap()
+    time.sleep(0.25)
+    b = snap()
+    tot, idle = b[0] - a[0], b[1] - a[1]
+    return int(round(100 * (tot - idle) / tot)) if tot else 0
+
+
+def meminfo():
+    m = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":")
+            m[k] = int(v.split()[0])
+    total, avail = m["MemTotal"] / 1048576, m.get("MemAvailable", 0) / 1048576
+    return round(total - avail, 1), round(total, 1), int(round(100 * (total - avail) / total))
+
+
+def k_system(t):
+    if re.fullmatch(r"(what('s| is) (my |the )?)?(cpu|processor)( usage| load)?|how (busy|hard) is (my |the )?(cpu|laptop|computer|system) (working)?|"
+                    r"system (status|stats|usage)|how('s| is) (my |the )?(system|laptop|computer)( doing)?", t):
+        used, total, pct = meminfo()
+        return reply("system", say("cpu", cpu=cpu_pct(), ram=pct))
+    if re.fullmatch(r"(how much |what('s| is) (my |the )?)?(ram|memory)( usage| am i using| is used| left| free)?|how much (ram|memory)( do i have| is (used|free|left))?", t):
+        used, total, pct = meminfo()
+        return reply("system", say("ram", used=used, total=int(round(total)), ram=pct))
+    if re.fullmatch(r"(how much )?(disk|storage|space)( space)?( left| free| do i have( left)?)?|how much (disk |storage )?space (is )?(left|free)|"
+                    r"(what('s| is) (my |the )?)?(disk|storage)( usage| space)?", t):
+        s = os.statvfs(HOME)
+        free, total = s.f_bavail * s.f_frsize / 1e9, s.f_blocks * s.f_frsize / 1e9
+        return reply("system", say("disk", free=int(round(free)), total=int(round(total))))
+    if re.fullmatch(r"(what('s| is) (my |the )?)?uptime|how long (has|have) (my |the )?(laptop|computer|pc|system|it|i) been (on|up|running)", t):
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+        return reply("system", say("uptime", up=human_duration(up - up % 60 if up > 3600 else up)))
+
+
+def k_desktop(t):
+    if re.fullmatch(r"(take |grab |capture )?(a )?screen ?shot( of (my |the )?screen)?|screen ?shot( this)?|capture (my |the )?screen", t):
+        if not have("grim"):
+            return None
+        d = os.path.join(HOME, "Pictures", "Screenshots")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, now().strftime("Screenshot_%Y-%m-%d_%H-%M-%S.png"))
+        run(["qs", "-c", "friday", "ipc", "call", "friday", "cloak", "1400"], timeout=3)
+        time.sleep(0.45)
+        code, _ = run(["grim", path])
+        if code != 0:
+            return None
+        if have("wl-copy"):
+            try:
+                with open(path, "rb") as f:
+                    subprocess.run(["wl-copy", "--type", "image/png"], stdin=f, timeout=3)
+            except Exception:
+                pass
+        return reply("screenshot", say("screenshot"))
+    if re.fullmatch(r"lock( the| my)? (screen|computer|laptop|pc)|lock (it|up)|lock", t):
+        code, _ = run(["loginctl", "lock-session"])
+        if code != 0 and have("hyprlock"):
+            spawn(["hyprlock"])
+        return reply("lock", say("lock"))
+    m = re.fullmatch(r"(go to|switch to|move to|open|show( me)?|take me to)? ?(the )?workspace (\d{1,2}|[a-z]+)", t)
+    if m and have("hyprctl"):
+        n = num(m.group(4))
+        if not n or n < 1 or n > 20:
+            return None
+        run(["hyprctl", "dispatch", "workspace", str(int(n))])
+        return reply("workspace", say("workspace", n=int(n)))
+
+
+# -- maths
+OPS = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+       ast.Pow: operator.pow, ast.Mod: operator.mod, ast.USub: operator.neg, ast.UAdd: operator.pos, ast.FloorDiv: operator.floordiv}
+FUNCS = {"sqrt": math.sqrt, "log": math.log10, "ln": math.log, "sin": lambda x: math.sin(math.radians(x)),
+         "cos": lambda x: math.cos(math.radians(x)), "tan": lambda x: math.tan(math.radians(x)), "abs": abs}
+
+
+def safe_eval(expr):
+    def ev(n):
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return n.value
+        if isinstance(n, ast.BinOp) and type(n.op) in OPS:
+            a, b = ev(n.left), ev(n.right)
+            if isinstance(n.op, ast.Pow) and abs(b) > 100:
+                raise ValueError("too big")
+            return OPS[type(n.op)](a, b)
+        if isinstance(n, ast.UnaryOp) and type(n.op) in OPS:
+            return OPS[type(n.op)](ev(n.operand))
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in FUNCS and len(n.args) == 1:
+            return FUNCS[n.func.id](ev(n.args[0]))
+        if isinstance(n, ast.Name) and n.id in ("pi", "e"):
+            return math.pi if n.id == "pi" else math.e
+        raise ValueError("unsupported")
+    return ev(ast.parse(expr, mode="eval"))
+
+
+def fmt_num(v):
+    if isinstance(v, float) and v.is_integer() and abs(v) < 1e15:
+        v = int(v)
+    if isinstance(v, int):
+        return "{:,}".format(v)
+    return ("{:,.4f}".format(v)).rstrip("0").rstrip(".")
+
+
+def k_calc(t):
+    m = re.fullmatch(r"(what('s| is)|calculate|compute|how much is|what do you get (for|if you)|solve)?\s*(.+?)( equal| equals| is)?", t)
+    if not m:
+        return None
+    e = m.group(4)
+    if not re.search(r"\d", e):
+        return None
+    pm = re.fullmatch(r"([\d.,]+)\s*(%|percent) of ([\d.,]+)", e)
+    if pm:
+        e = "(%s/100)*%s" % (pm.group(1).replace(",", ""), pm.group(3).replace(",", ""))
+    for a, b in ((r"\bsquare root of\s*([\d.]+)", r"sqrt(\1)"), (r"\bcube root of\s*([\d.]+)", r"(\1)**(1/3)"),
+                 (r"([\d.]+)\s*squared", r"(\1)**2"), (r"([\d.]+)\s*cubed", r"(\1)**3"),
+                 (r"\bto the power of\b|\braised to\b|\^", "**"), (r"\bmultiplied by\b|\btimes\b|×|\bx\b", "*"),
+                 (r"\bdivided by\b|\bover\b|÷", "/"), (r"\bplus\b|\band\b", "+"), (r"\bminus\b|\bless\b", "-"),
+                 (r"\bmod(ulo)?\b", "%"), (r"(?<=\d),(?=\d{3}\b)", ""), (r"\bpercent\b", "/100")):
+        e = re.sub(a, b, e)
+    if not re.fullmatch(r"[\d\s.+\-*/%()]*|.*(sqrt|log|ln|sin|cos|tan|abs|pi)\b.*", e) or not re.search(r"[+\-*/%]|sqrt|log|ln|sin|cos|tan|\*\*", e):
+        return None
+    if re.search(r"[a-z]", re.sub(r"sqrt|log|ln|sin|cos|tan|abs|pi", "", e)):
+        return None
+    try:
+        r = safe_eval(e.strip())
+    except Exception:
+        return None
+    if isinstance(r, complex) or (isinstance(r, float) and (math.isnan(r) or math.isinf(r))):
+        return None
+    txt = say("calc", r=fmt_num(r))
+    return reply("calc", txt, txt.replace(",", ""))
+
+
+UNITS = {  # unit -> (dimension, factor to base)
+    "mm": ("len", 0.001), "millimeter": ("len", 0.001), "cm": ("len", 0.01), "centimeter": ("len", 0.01),
+    "m": ("len", 1), "meter": ("len", 1), "metre": ("len", 1), "km": ("len", 1000), "kilometer": ("len", 1000),
+    "kilometre": ("len", 1000), "inch": ("len", 0.0254), "in": ("len", 0.0254), "foot": ("len", 0.3048),
+    "feet": ("len", 0.3048), "ft": ("len", 0.3048), "yard": ("len", 0.9144), "mile": ("len", 1609.344), "mi": ("len", 1609.344),
+    "mg": ("mass", 0.001), "g": ("mass", 1), "gram": ("mass", 1), "kg": ("mass", 1000), "kilo": ("mass", 1000),
+    "kilogram": ("mass", 1000), "lb": ("mass", 453.592), "lbs": ("mass", 453.592), "pound": ("mass", 453.592),
+    "oz": ("mass", 28.3495), "ounce": ("mass", 28.3495), "ton": ("mass", 1e6), "tonne": ("mass", 1e6),
+    "ml": ("vol", 0.001), "milliliter": ("vol", 0.001), "l": ("vol", 1), "liter": ("vol", 1), "litre": ("vol", 1),
+    "gallon": ("vol", 3.78541), "cup": ("vol", 0.236588), "tablespoon": ("vol", 0.0147868), "teaspoon": ("vol", 0.00492892),
+    "second": ("time", 1), "sec": ("time", 1), "minute": ("time", 60), "min": ("time", 60), "hour": ("time", 3600),
+    "hr": ("time", 3600), "day": ("time", 86400), "week": ("time", 604800), "month": ("time", 2629800), "year": ("time", 31557600),
+    "byte": ("data", 1), "kb": ("data", 1e3), "mb": ("data", 1e6), "gb": ("data", 1e9), "tb": ("data", 1e12),
+    "kilobyte": ("data", 1e3), "megabyte": ("data", 1e6), "gigabyte": ("data", 1e9), "terabyte": ("data", 1e12),
+    "kmh": ("speed", 1 / 3.6), "km/h": ("speed", 1 / 3.6), "kph": ("speed", 1 / 3.6), "mph": ("speed", 0.44704),
+    "c": ("temp", None), "celsius": ("temp", None), "centigrade": ("temp", None), "f": ("temp", None),
+    "fahrenheit": ("temp", None), "k": ("temp", None), "kelvin": ("temp", None),
+}
+
+
+def unit(u):
+    u = u.strip().lower().replace("degrees ", "").replace("degree ", "").replace("kilometers per hour", "kmh").replace("miles per hour", "mph")
+    if u in UNITS:
+        return u
+    if u.endswith("es") and u[:-2] in UNITS:
+        return u[:-2]
+    if u.endswith("s") and u[:-1] in UNITS:
+        return u[:-1]
+    return None
+
+
+def k_convert(t):
+    m = (re.fullmatch(r"(convert |what('s| is) |how much is |how many \w+ (is|are) )?([\d.,]+) ?([a-z/ ]+?) (to|in|into|as) ([a-z/ ]+)", t)
+         or re.fullmatch(r"how many ([a-z/ ]+?) (are )?(in|is|make) (a |an |one )?([\d.,]*) ?([a-z/ ]+)", t))
+    if not m:
+        return None
+    if t.startswith("how many") and m.re.pattern.startswith("how many"):
+        v = num(m.group(5) or "1") if (m.group(5) or "1") else 1
+        a, b = unit(m.group(6)), unit(m.group(1))
+        raw_a, raw_b = m.group(6), m.group(1)
+    else:
+        v = num((m.group(4) or "").replace(",", ""))
+        a, b = unit(m.group(5)), unit(m.group(7))
+        raw_a, raw_b = m.group(5), m.group(7)
+    if v is None or not a or not b or UNITS[a][0] != UNITS[b][0]:
+        return None
+    dim = UNITS[a][0]
+    if dim == "temp":
+        to_c = {"c": lambda x: x, "celsius": lambda x: x, "centigrade": lambda x: x, "f": lambda x: (x - 32) * 5 / 9,
+                "fahrenheit": lambda x: (x - 32) * 5 / 9, "k": lambda x: x - 273.15, "kelvin": lambda x: x - 273.15}
+        from_c = {"c": lambda x: x, "celsius": lambda x: x, "centigrade": lambda x: x, "f": lambda x: x * 9 / 5 + 32,
+                  "fahrenheit": lambda x: x * 9 / 5 + 32, "k": lambda x: x + 273.15, "kelvin": lambda x: x + 273.15}
+        r = from_c[b](to_c[a](v))
+        names = {"c": "degrees Celsius", "celsius": "degrees Celsius", "centigrade": "degrees Celsius",
+                 "f": "degrees Fahrenheit", "fahrenheit": "degrees Fahrenheit", "k": "kelvin", "kelvin": "kelvin"}
+        return reply("convert", say("convert", a="%s %s" % (fmt_num(v), names[a]), b="%s %s" % (fmt_num(round(r, 1)), names[b])))
+    r = v * UNITS[a][1] / UNITS[b][1]
+    r = round(r, 2) if abs(r) >= 1 else float("%.3g" % r)
+    return reply("convert", say("convert", a="%s %s" % (fmt_num(v), raw_a.strip()), b="%s %s" % (fmt_num(r), raw_b.strip())))
+
+
+def k_random(t):
+    if re.fullmatch(r"(flip|toss) a coin|heads or tails|coin (flip|toss)", t):
+        return reply("coin", say("coin", side=random.choice(["heads", "tails"])))
+    if re.fullmatch(r"roll (a |the )?(dice|die)|dice roll|roll", t):
+        return reply("dice", say("dice", n=random.randint(1, 6)))
+    m = re.fullmatch(r"(pick|choose|give me|say) a (random )?number( between| from) (\d+) (and|to) (\d+)", t)
+    if m:
+        a, b = sorted((int(m.group(4)), int(m.group(6))))
+        return reply("number", say("number", n=random.randint(a, b)))
+
+
+def k_weather(t):
+    m = re.fullmatch(r"(what('s| is) the |how('s| is) the |show me the |tell me the )?(weather|forecast|temperature)( like)?( outside| today| now| right now| tomorrow)?( in ([a-z .'-]+))?( today| tomorrow)?|"
+                     r"(is it|will it|is it going to|gonna) (rain|be raining|be hot|be cold)( today| tomorrow)?( in ([a-z .'-]+))?|"
+                     r"(do i need|should i (take|carry)) an umbrella( today)?|how (hot|cold) is it( outside)?( in ([a-z .'-]+))?", t)
+    if not m:
+        return None
+    if "tomorrow" in t:
+        return None                       # forecasts beyond today: Claude handles nuance
+    if not online():
+        return reply("need_online", say("need_online"))
+    place = (m.group(8) or m.group(14) or m.group(21) or "").strip()
+    url = "https://wttr.in/%s?format=j1" % urllib.parse.quote(place)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "curl/8", "Accept-Language": "en"})
+        j = json.loads(urllib.request.urlopen(req, timeout=5).read().decode())
+        cur, day = j["current_condition"][0], j["weather"][0]
+        area = j.get("nearest_area", [{}])[0]
+        name = place.title() if place else (area.get("areaName", [{}])[0].get("value") or "your area")
+        rain = max(int(h.get("chanceofrain", 0)) for h in day.get("hourly", [])) if day.get("hourly") else 0
+    except Exception:
+        return None                       # couldn't fetch: Claude (with web search) can try
+    if re.search(r"rain|umbrella", t):
+        return reply("weather", say("rain_yes" if rain >= 45 else "rain_no", pct=rain, place=name))
+    desc = cur["weatherDesc"][0]["value"].lower().strip()
+    rain_note = ", and a %d percent chance of rain" % rain if rain >= 40 else ""
+    return reply("weather", say("weather", temp=cur["temp_C"], feels=cur["FeelsLikeC"], desc=desc, place=name,
+                                hi=day["maxtempC"], lo=day["mintempC"], rain=rain_note))
+
+
+def k_usage(t):
+    if not re.fullmatch(r"(how much )?(claude )?(usage|limit|quota)( (do i have )?(left|remaining))?|how much (claude|usage) (do i have )?(left|remaining)?|"
+                        r"(what('s| is) my |check my )(claude )?(usage|limit|quota)|how much claude( is)?( left| remaining)?( do i have)?|"
+                        r"how much of (my )?claude( have i used| is left)?", t):
+        return None
+    try:
+        with open(os.path.join(RUNTIME, "usage.json")) as f:
+            u = json.load(f)
+        five, week = u["five_hour"], u.get("seven_day", {})
+    except Exception:
+        return reply("usage", say("usage_unknown"))
+    reset = ""
+    if five.get("resets_at"):
+        left = five["resets_at"] - time.time()
+        if left > 0:
+            reset = ", resets in " + human_duration(left - left % 60 if left > 60 else left)
+    return reply("usage", say("usage", five=int(round(five["pct"])), week=int(round(week.get("pct", 0))), reset=reset))
+
+
+SKILLS = [k_smalltalk, k_time, k_date, k_timer, k_remind, k_reminders, k_focus, k_volume, k_brightness, k_media,
+          k_desktop, k_search, k_open, k_battery, k_network, k_system, k_usage, k_weather, k_random, k_convert, k_calc]
+
+
+def main():
+    if os.environ.get("FRIDAY_LOCAL", "on") == "off":
+        print(json.dumps({"handled": False}))
+        return
+    t = clean(RAW)
+    if len(t) > 140 or "\n" in RAW.strip():
+        decline()                              # long or multi-line: not a basic task
+    for skill in SKILLS:
+        try:
+            skill(t)                           # a skill that handles it prints and exits
+        except SystemExit:
+            raise
+        except Exception as e:
+            print("friday-local: %s failed: %r" % (skill.__name__, e), file=sys.stderr)
+    if not online():
+        reply("offline", say("offline"))
+    decline()
+
+
+if __name__ == "__main__":
+    main()
