@@ -55,6 +55,27 @@ Commands: `listen [followup]`, `cancel`, `stop`, `mute`, `unmute`, `say <json>`,
 Models live in `brain/.voice/`, the Python env in `brain/.venv/` (both git-ignored, created by `friday-voice-setup`).
 Debug log: `brain/.voice/voice.log` (set `FRIDAY_VOICE_DEBUG=1` for every wake-word guess).
 
+## On-device skills (`friday-local`) and autostart (`friday-start`)
+
+```
+you ask (typed or spoken) ─▶ friday-local (~0.1 s, no network for most)
+   handled ─▶ answer shown/spoken right away, the action done with wpctl / brightnessctl / playerctl / friday-open /
+              friday-web / friday-remind / friday-focus / hyprctl / nmcli / grim …  (no Claude usage)
+   declined ─▶ online? ─▶ Claude (anything friday-local handled just before goes along as context)
+            └─ offline ─▶ "I'm offline, here's what I can still do"
+```
+
+It is deliberately conservative: anchored patterns, and "not sure" means Claude. A wrong guess costs more than a
+little usage. Phrasings come from built-in variations plus `~/.local/state/friday/phrases.json`, which
+`friday-phrases` refreshes at most once a week with one Haiku call (`FRIDAY_PHRASES=off` to disable).
+
+`friday-start` is run once by Hyprland at login. It starts `qs -c friday`, checks every 5 s and restarts it if it
+died (it gives up with a notification after 5 crashes in a row), and kicks off the weekly phrase refresh.
+`friday-start --restart` after updates, `--stop` to stop until next login.
+
+Nothing calls Claude in the background except that weekly phrase refresh. Session titles are made locally, and
+`friday-usage` only reads the usage meter.
+
 ## 3. The ii hooks (`friday-integrate`)
 
 Small, marked insertions into illogical-impulse:

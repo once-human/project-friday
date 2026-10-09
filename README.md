@@ -17,6 +17,7 @@ Built for **Arch + Hyprland + [illogical-impulse](https://github.com/end-4/dots-
 | **Acts, not just answers** | Opens apps, tabs and searches in your browser, arranges windows, controls media and volume, sets reminders, runs focus sessions, reads logs, inspects repos. |
 | **Talk to it** | <kbd>Super</kbd>+<kbd>Ctrl</kbd>+<kbd>Space</kbd> (or "Hey Friday" when you switch the wake word on). Your words appear live, Whisper turns them into an accurate request, and Friday answers out loud. Say "Friday" or "Hey Friday". By voice it's conversational (short and casual for small talk, calm and focused for real work); typed, it's regular Claude. After each answer Friday decides, like a person would, whether you'll reply: if it asked you something it keeps listening; if you said "goodnight" or you're clearly done, it says its goodbye and closes. Approval cards take a spoken "yes" / "no". 100% local. |
 | **Writing tools** | Highlight text anywhere and press <kbd>Super</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> to explain, summarize, proofread, rewrite, make it professional, or translate. |
+| **Everyday stuff without Claude** | Time, date, world clock, timers and reminders (it says them out loud when they go off), volume, brightness, play/pause/next, "play some Fred again", open apps and sites, Google something, weather, battery, Wi-Fi/Bluetooth, CPU/RAM/disk, screenshots, lock, workspaces, maths, unit conversion, coin/dice, your Claude usage, small talk and jokes. All handled on your laptop in ~0.1 s: **no Claude usage, and it works offline**. Only what it can't do goes to Claude; offline, it tells you so instead of hanging. Answers are phrased from a bank of variations that Claude refreshes once a week (one tiny call), so it doesn't sound canned. |
 | **Made for one person** | A greeting and one status line about your world, plus rows for what you actually do: jump back into your latest Claude Code sessions (auto-titled like *Continue Friday Overlay Polish*, with project and time) right where you left them, see what's on your connected phone (adb/fastboot), or start a 90-minute deep-work block. |
 | **One-tap music** | A row split five ways: House · Afro · Fred · Techno · Chill. Pick one (← → or click) and a long mix starts playing: in the background with `mpv` + `yt-dlp` if you have them (`sudo pacman -S mpv yt-dlp mpv-mpris`), otherwise the first YouTube result opens already playing. "Play some Fred again" works too. |
 | **Uses your mouse and keyboard** | For apps with no command line, Friday looks at the screen, clicks and types (`friday-input`, needs `wtype` for typing and `ydotool` or `wlrctl` for clicks). Moving and scrolling are free; every click or keystroke shows an approval card unless you set `FRIDAY_INPUT_TRUST=1`. |
@@ -34,8 +35,10 @@ Optional: `playerctl`, `wireplumber` (`wpctl`), `brightnessctl`, `networkmanager
 git clone https://github.com/once-human/project-friday ~/Projects/project-friday
 cd ~/Projects/project-friday
 ./install.sh
-hyprctl reload && qs -c friday -d
+hyprctl reload && ~/.local/share/friday/bin/friday-start --restart
 ```
+
+From then on Friday starts with every login and comes back by itself if it ever crashes.
 
 Then press <kbd>Super</kbd>+<kbd>Space</kbd>. If Claude Code isn't signed in, Friday shows a one-click **Sign in** card.
 
@@ -54,7 +57,7 @@ To remove everything cleanly: `./uninstall.sh`.
 
 ```bash
 ~/.local/share/friday/bin/friday-voice-setup     # ~700 MB of local models, one time
-pkill -f "qs -c friday"; qs -c friday -d
+~/.local/share/friday/bin/friday-start --restart
 ~/.local/share/friday/bin/friday-voice --test    # say something; it should repeat it back
 ```
 
