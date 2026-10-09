@@ -19,6 +19,10 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/once-human/project-friday"
+# pinned third-party downloads (bump deliberately, together with the checksum/commit)
+QS_TAG="v0.3.2"; QS_COMMIT="4f508be500dea6e5732cc3d50382a0048b17e7b1"
+FONT_URL="https://raw.githubusercontent.com/google/material-design-icons/49d4db35df873165d6bd6ba09b063c7dafbac2f4/variablefont/MaterialSymbolsRounded%5BFILL%2CGRAD%2Copsz%2Cwght%5D.ttf"
+FONT_SHA256="32e4011709e055596eb8d2dd0f7cb547b47c1d40ac9ecb8fad54f7f7eac202e7"
 YES=0; VOICE=ask; DEPS=1; DRY=0
 for a in "$@"; do
   case "$a" in
@@ -227,10 +231,11 @@ build_quickshell() {
   (Ubuntu 25.04+, Debian 13+, Fedora, Arch, openSUSE Tumbleweed)."
   fi
   local b; b="$(mktemp -d)"
-  run git clone --quiet https://github.com/quickshell-mirror/quickshell "$b/quickshell"
-  local tag=""
-  [ "$DRY" = 0 ] && tag="$(git -C "$b/quickshell" tag -l 'v*' | sort -V | tail -1)"
-  [ -n "$tag" ] && run git -C "$b/quickshell" checkout --quiet "$tag"
+  # a pinned, known release (not "whatever is newest"), checked against its exact commit after cloning
+  run git clone --quiet --depth 1 --branch "$QS_TAG" https://github.com/quickshell-mirror/quickshell "$b/quickshell"
+  if [ "$DRY" = 0 ] && [ "$(git -C "$b/quickshell" rev-parse HEAD)" != "$QS_COMMIT" ]; then
+    rm -rf "$b"; die "Quickshell $QS_TAG didn't match its expected commit; stopping rather than building unknown code."
+  fi
   run cmake -GNinja -S "$b/quickshell" -B "$b/build" -DCMAKE_BUILD_TYPE=Release -DCRASH_HANDLER=OFF -DUSE_JEMALLOC=OFF \
       -DSERVICE_PIPEWIRE=OFF -DSERVICE_PAM=OFF -DSERVICE_POLKIT=OFF -DSCREENCOPY=OFF -DSERVICE_STATUS_NOTIFIER=OFF -DSERVICE_MPRIS=OFF
   run cmake --build "$b/build"
@@ -251,7 +256,13 @@ if ! have qs && ! have quickshell; then
         pm_install base-devel git
         tmp="$(mktemp -d)"; run git clone --quiet https://aur.archlinux.org/quickshell.git "$tmp/quickshell"
         if [ "$DRY" = 1 ]; then note "$ (cd $tmp/quickshell && makepkg -si --noconfirm)"
-        else ( cd "$tmp/quickshell" && makepkg -si --noconfirm ); fi
+        else
+          # AUR packages are user-submitted: show the build script before running it
+          say "AUR build script for quickshell (review it):"
+          sed 's/^/    /' "$tmp/quickshell/PKGBUILD"
+          ask "Build and install it?" y || die "stopped before building Quickshell"
+          ( cd "$tmp/quickshell" && makepkg -si --noconfirm )
+        fi
         rm -rf "$tmp"
       fi ;;
     fedora) pm_install 'dnf-command(copr)'; run $SUDO dnf copr enable -y errornointernet/quickshell && pm_install quickshell ;;
@@ -269,9 +280,15 @@ if ! fc-list 2>/dev/null | grep -qi "Material Symbols Rounded"; then
   say "installing the Material Symbols icon font (Apache 2.0, ~15 MB)"
   FDIR="$HOME/.local/share/fonts/friday"
   run mkdir -p "$FDIR"
-  run curl -fsSL --retry 3 -o "$FDIR/MaterialSymbolsRounded.ttf" \
-    "https://raw.githubusercontent.com/google/material-design-icons/master/variablefont/MaterialSymbolsRounded%5BFILL%2CGRAD%2Copsz%2Cwght%5D.ttf" \
-    && run fc-cache -f "$FDIR" >/dev/null 2>&1 || warn "couldn't fetch the icon font; icons may show as words until it's installed"
+  if [ "$DRY" = 1 ]; then note "$ curl -fsSL $FONT_URL  (then check sha256)"
+  elif curl -fsSL --retry 3 -o "$FDIR/.MaterialSymbolsRounded.ttf" "$FONT_URL" \
+       && echo "$FONT_SHA256  $FDIR/.MaterialSymbolsRounded.ttf" | sha256sum -c --quiet - 2>/dev/null; then
+    mv -f "$FDIR/.MaterialSymbolsRounded.ttf" "$FDIR/MaterialSymbolsRounded.ttf"
+    fc-cache -f "$FDIR" >/dev/null 2>&1
+  else
+    rm -f "$FDIR/.MaterialSymbolsRounded.ttf"
+    warn "couldn't fetch (or verify) the icon font; icons may show as words until it's installed"
+  fi
 fi
 
 # ---------------------------------------------------------------- 6. Claude Code (Friday's brain)
@@ -430,6 +447,8 @@ fi
 
 # ---------------------------------------------------------------- 9. voice (optional)
 if [ "$VOICE" = ask ]; then
+  note "Voice: listening and wake word run 100% on this machine. Friday's natural speaking voice sends the text it speaks"
+  note "(never your audio) to Microsoft's speech service; set FRIDAY_TTS=piper in brain/config.env for a fully local voice."
   ask "Set up voice (\"Hey Friday\", talk back)? Downloads ~700 MB of local speech models" y && VOICE=yes || VOICE=no
 fi
 if [ "$VOICE" = yes ]; then
