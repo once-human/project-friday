@@ -20,7 +20,9 @@ PanelWindow {
     property var targetScreen: Quickshell.screens[0]
     screen: win.targetScreen
 
-    visible: !Brain.cloaked
+    // Unmapped when closed: a hidden full-screen overlay would still cost the compositor (blur, no direct
+    // scanout for fullscreen video/games) on every frame. Mapping it again on open is instant.
+    visible: !Brain.cloaked && (Brain.shown || closeAnim.running || win.appear > 0.001 || win.dim > 0.001)
     mask: Region { item: Brain.shown ? catcher : null }
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore

@@ -4,7 +4,7 @@
 #   friday-start --restart    restart Friday now, e.g. after an update (the supervisor brings it back)
 #   friday-start --stop       stop Friday until next login
 #   friday-start --once       just make sure it's running (no supervisor)
-# The watch is a pgrep every 5 s: no measurable battery cost. Nothing here talks to Claude.
+# The supervisor just waits on Friday's process (no polling). Nothing here talks to Claude.
 export PATH="$HOME/.local/bin:$HOME/.local/share/friday/bin:/usr/local/bin:/usr/bin:$PATH"
 RUN="${XDG_RUNTIME_DIR:-/tmp/friday-$(id -u)}/friday"
 (umask 077; mkdir -p "$RUN")
@@ -41,20 +41,25 @@ exec 9>"$RUN/supervisor.lock"
 flock -n 9 || exit 0                          # already supervised
 
 # once a week at most: fresh phrasings for on-device answers (one small Claude call; FRIDAY_PHRASES=off disables)
-( sleep 120; "$HOME/.local/share/friday/bin/friday-phrases" --if-stale >/dev/null 2>&1 ) &
+( sleep 120; "$HOME/.local/share/friday/bin/friday-phrases" --if-stale >/dev/null 2>&1 ) 9>&- &
 
 fails=0; last=0
 while true; do
-  if ! alive; then
-    now=$(date +%s)
-    if [ $(( now - last )) -lt 90 ]; then fails=$(( fails + 1 )); else fails=0; fi
-    last=$now
-    if [ "$fails" -ge 5 ]; then
-      notify-send -a Friday "Friday keeps crashing" "Stopped restarting it. Run 'project-friday logs' (or 'qs -c friday') in a terminal to see why." 2>/dev/null
-      exit 1
-    fi
-    start_qs
-    sleep 2
+  if alive; then
+    sleep 30                                  # started by someone else: check now and then (costs nothing)
+    continue
   fi
-  sleep 5
+  now=$(date +%s)
+  if [ $(( now - last )) -lt 90 ]; then fails=$(( fails + 1 )); else fails=0; fi
+  last=$now
+  if [ "$fails" -ge 5 ]; then
+    notify-send -a Friday "Friday keeps crashing" "Stopped restarting it. Run 'project-friday logs' (or 'qs -c friday') in a terminal to see why." 2>/dev/null
+    exit 1
+  fi
+  # run it as our own child and simply wait for it: no polling at all while it's running
+  case "${XDG_CURRENT_DESKTOP:-}" in *GNOME*|*gnome*) [ -n "${WAYLAND_DISPLAY:-}" ] && export QT_QPA_PLATFORM=xcb ;; esac
+  command -v qs >/dev/null || { notify-send -a Friday "Friday can't start" "Quickshell (qs) isn't installed. Re-run Friday's install.sh." 2>/dev/null; exit 1; }
+  qs -c friday 9>&- >/dev/null 2>&1 &           # (the lock stays with the supervisor, not Friday)
+  wait $!
+  sleep 1
 done

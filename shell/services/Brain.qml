@@ -688,8 +688,8 @@ Singleton {
 
     // ---------------------------------------------------------------- plan usage, focus, clock
     Process { id: usageProc; command: [root.binDir + "friday-usage"]; onExited: usageFile.reload() }
-    Timer {
-        interval: 180000
+    Timer {                                     // every 3 min while you're looking, every 15 min otherwise
+        interval: root.shown ? 180000 : 900000
         running: true
         repeat: true
         triggeredOnStart: true
