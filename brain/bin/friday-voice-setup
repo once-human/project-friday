@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time setup for "Hey Friday". Everything runs locally; ~700 MB of models.
-#   Python 3.12 venv (via uv) with vosk, faster-whisper, piper-tts
+#   Python 3.12 venv (via uv) with vosk, faster-whisper, piper-tts, edge-tts + miniaudio (the natural voice)
 #   Vosk small Indian-English model (wake word + live words), Whisper small.en, a Piper voice
 set -euo pipefail
 HERE="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
@@ -26,11 +26,12 @@ if [ ! -x "$VENV/bin/python" ]; then
     python3 -m venv "$VENV"
   fi
 fi
-say "installing speech engines (vosk, faster-whisper, piper-tts)"
+say "installing speech engines (vosk, faster-whisper, piper-tts, edge-tts)"
+PKGS=(vosk faster-whisper piper-tts numpy edge-tts miniaudio)
 if command -v uv >/dev/null; then
-  uv pip install -q --python "$VENV/bin/python" -U vosk faster-whisper piper-tts numpy
+  uv pip install -q --python "$VENV/bin/python" -U "${PKGS[@]}"
 else
-  "$VENV/bin/pip" install -q -U vosk faster-whisper piper-tts numpy
+  "$VENV/bin/pip" install -q -U "${PKGS[@]}"
 fi
 
 # 2. Vosk model: wake word + live words while you talk (~40 MB). Indian English by default.

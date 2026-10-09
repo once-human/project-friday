@@ -15,6 +15,12 @@ fi
 case "${1:-}" in
   --test|--wake-test) exec "$PY" -u "$HERE/voice/friday_voice.py" "$@" ;;
 esac
+# Older installs: fetch the natural-voice packages quietly in the background (the daemon picks them up by itself).
+if ! "$PY" -c "import edge_tts, miniaudio" 2>/dev/null; then
+  ( export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+    if command -v uv >/dev/null; then uv pip install -q --python "$PY" edge-tts miniaudio
+    else "$HERE/.venv/bin/pip" install -q edge-tts miniaudio; fi ) >>"$HERE/.voice/voice.log" 2>&1 &
+fi
 # daemon: keep a small log of what it hears / rejects (tail -f ~/.local/share/friday/.voice/voice.log)
 LOG="$HERE/.voice/voice.log"
 [ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 1000000 ] && mv -f "$LOG" "$LOG.1"

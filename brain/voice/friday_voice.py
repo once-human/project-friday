@@ -40,7 +40,16 @@ SPEAK_ON = os.environ.get("FRIDAY_SPEAK", "on") != "off"
 PIPER_VOICE = os.environ.get("FRIDAY_PIPER_VOICE", "en_GB-jenny_dioco-medium")
 SILENCE_END = float(os.environ.get("FRIDAY_SILENCE_END", "1.1"))  # seconds of quiet that end a request
 PAUSE_SENTENCE = float(os.environ.get("FRIDAY_PAUSE_SENTENCE", "0.34"))  # breath after a full stop
-COMMA_HOLD = int(os.environ.get("FRIDAY_COMMA_HOLD", "2"))             # how much longer Friday pauses at commas (0 = Piper's own)
+COMMA_HOLD = int(os.environ.get("FRIDAY_COMMA_HOLD", "1"))             # Piper only: how much longer it pauses at commas
+# Friday's voice. "auto": a natural neural voice (Microsoft's, the same family Edge's Read Aloud uses) whenever
+# you're online, and the local Piper voice offline or if that ever fails. "piper": always local, nothing leaves
+# the laptop. The neural voice sends the text being spoken (never your audio) to Microsoft.
+TTS = os.environ.get("FRIDAY_TTS", "auto")                                 # auto | neural | piper
+NEURAL_VOICE = os.environ.get("FRIDAY_NEURAL_VOICE", "en-US-AvaNeural")    # edge-tts --list-voices for more
+NEURAL_RATE = os.environ.get("FRIDAY_NEURAL_RATE", "+4%")
+NEURAL_PITCH = os.environ.get("FRIDAY_NEURAL_PITCH", "+0Hz")
+NEURAL_HZ = 24000
+PAUSE_NEURAL = float(os.environ.get("FRIDAY_PAUSE_NEURAL", "0.12"))      # the neural voice breathes on its own
 NO_SPEECH_TIMEOUT = 6.0
 MAX_UTTERANCE = 25.0
 MAX_GAIN = float(os.environ.get("FRIDAY_MAX_GAIN", "10"))       # software gain ceiling for quiet mics
@@ -213,6 +222,9 @@ class Engines:
         self.whisper = None
         self.piper = None
         self.piper_rate = 22050
+        self.neural_down_until = 0.0
+        self.neural_checked = 0.0
+        self.neural_ok = None
         self.np = None
         self._lock = threading.Lock()
         self._load_lock = threading.Lock()
@@ -303,6 +315,98 @@ class Engines:
         if text.lower().strip(" .!?,") in HALLUCINATIONS and len(pcm) < RATE * 2 * 2:
             return ""
         return text
+
+    # ---- the natural voice
+    def neural_ready(self):
+        if TTS == "piper" or self.np is None or time.time() < self.neural_down_until:
+            return False
+        if self.neural_ok is None or (not self.neural_ok and time.time() - self.neural_checked > 30):
+            self.neural_checked = time.time()
+            try:
+                import importlib
+                importlib.invalidate_caches()          # friday-voice may have just installed it in the background
+                import edge_tts  # noqa: F401
+                import miniaudio  # noqa: F401
+                self.neural_ok = True
+            except Exception:
+                if self.neural_ok is None:
+                    log("natural voice not installed yet (edge-tts, miniaudio); using Piper")
+                self.neural_ok = False
+        return self.neural_ok
+
+    def synth_neural(self, text):
+        """Speak text with the neural voice. Returns (s16 mono PCM at 24 kHz, [(seconds, word), …])."""
+        import edge_tts
+        import miniaudio
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or None
+        comm = edge_tts.Communicate(text, NEURAL_VOICE, rate=NEURAL_RATE, pitch=NEURAL_PITCH, boundary="WordBoundary",
+                                    proxy=proxy, connect_timeout=4, receive_timeout=15)
+        mp3, bounds = bytearray(), []
+        for ch in comm.stream_sync():
+            if ch.get("type") == "audio":
+                mp3 += ch["data"]
+            elif ch.get("type") == "WordBoundary":
+                bounds.append((ch["offset"] / 1e7, ch["text"]))
+        if not mp3:
+            raise RuntimeError("no audio came back")
+        dec = miniaudio.decode(bytes(mp3), output_format=miniaudio.SampleFormat.SIGNED16, nchannels=1, sample_rate=NEURAL_HZ)
+        return dec.samples.tobytes(), bounds
+
+    @staticmethod
+    def align(words, bounds):
+        """Match the words we show to the word timings the voice reported ("9:41" may be spoken as "9", "41")."""
+        norm = lambda x: re.sub(r"[^a-z0-9]", "", x.lower())
+        bs = [(t, norm(w)) for t, w in bounds if norm(w)]
+        out, j = [], 0
+        for w in words:
+            nw, t = norm(w), None
+            for k in range(j, min(len(bs), j + 4)):
+                nb = bs[k][1]
+                if nb == nw or nw.startswith(nb) or nb.startswith(nw) or (nw and nb in nw):
+                    t, j = bs[k][0], k + 1
+                    while j < len(bs) and bs[j][1] and bs[j][1] in nw and not nw.startswith(bs[j][1]):
+                        j += 1                         # the rest of a word spoken in pieces
+                    break
+            if t is None:
+                t = (out[-1] + 0.22) if out else (bs[0][0] if bs else 0.05)
+            out.append(max(t, out[-1] if out else 0.0))
+        return out
+
+    def resample(self, pcm, src, dst):
+        if src == dst or not pcm:
+            return pcm
+        np = self.np
+        a = np.frombuffer(pcm, dtype=np.int16).astype(np.float32)
+        n = int(len(a) * dst / src)
+        b = np.interp(np.linspace(0, len(a) - 1, n), np.arange(len(a)), a)
+        return b.astype(np.int16).tobytes()
+
+    def render(self, sent, rate):
+        """One sentence -> (PCM at `rate`, start time of each word, engine). Neural first, Piper if it can't."""
+        words = sent.split()
+        if self.neural_ready():
+            try:
+                pcm, bounds = self.synth_neural(sent)
+                return self.resample(pcm, NEURAL_HZ, rate), self.align(words, bounds), "neural"
+            except Exception as e:
+                self.neural_down_until = time.time() + 90
+                log("natural voice unavailable (%s); Piper for the next 90 s" % (repr(e)[:160]))
+        self.load_piper()
+        if self.piper is None:
+            return b"", [0.0] * len(words), "none"
+        fa = self.synth_sentence(sent)
+        if fa is not None:
+            pcm = (fa * 32767).astype(self.np.int16).tobytes()
+            times = self.word_times(fa, words)
+        else:
+            pcm = b"".join(self.synth(sent))
+            dur = len(pcm) / 2 / self.piper_rate
+            wts = [len(x) + 2 + (3 if x[-1:] in ",;:" else 0) for x in words]
+            tot, acc, times = max(1, sum(wts)), 0, []
+            for wt in wts:
+                times.append(0.04 + dur * 0.92 * acc / tot)
+                acc += wt
+        return self.resample(pcm, self.piper_rate, rate), times, "piper"
 
     def synth_sentence(self, text):
         """One sentence as ONE utterance, so the intonation flows across commas like a person's does
@@ -484,9 +588,13 @@ class Voice:
             emit("ready", wake=True)
         elif c.startswith("say+ "):           # append a sentence to what Friday is saying
             try:
-                self.say_add(json.loads(c[5:]))
+                obj = json.loads(c[5:])
             except Exception:
-                self.say_add(c[5:])
+                obj = c[5:]
+            if isinstance(obj, dict):                # {"text": …, "id": n}: the id comes back on the "words" event
+                self.say_add(obj.get("text", ""), obj.get("id"))
+            else:
+                self.say_add(obj)
         elif c == "say-end":                   # that's everything for this answer
             self.say_end()
         elif c.startswith("say "):            # say this, now, instead of anything else
@@ -717,9 +825,10 @@ class Voice:
         """Start (or keep) an utterance that sentences can be appended to."""
         if not SPEAK_ON:
             return False
-        self.e.load_piper()
-        if self.e.piper is None:
-            return False
+        if not self.e.neural_ready():
+            self.e.load_piper()
+            if self.e.piper is None:
+                return False
         if self.speaker and self.speaker.is_alive():
             return True
         self.speak_stop.clear()
@@ -728,10 +837,10 @@ class Voice:
         self.speaker.start()
         return True
 
-    def say_add(self, text):
+    def say_add(self, text, tag=None):
         text = (text or "").strip()
         if text and self.say_open():
-            self.say_q.put(text)
+            self.say_q.put((text, tag))
 
     def say_end(self):
         if self.speaker and self.speaker.is_alive():
@@ -743,7 +852,7 @@ class Voice:
         self.say_end()
 
     def _speak_stream(self):
-        rate = self.e.piper_rate
+        rate = NEURAL_HZ if self.e.neural_ready() else self.e.piper_rate
         cmd = raw_player(rate)
         if not cmd:
             log("can't speak: no raw audio player (install libpulse for pacat, or alsa-utils for aplay)")
@@ -758,6 +867,8 @@ class Voice:
         emit("speaking", on=True)
         idx, written, t0, waited = 0, 0, None, 0.0
         timers = []
+        import concurrent.futures
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)   # the next sentence is ready before this one ends
         try:
             while not self.speak_stop.is_set():
                 try:
@@ -770,28 +881,17 @@ class Voice:
                 waited = 0.0
                 if item is self._END:
                     break
-                # One whole answer at a time, sentence by sentence: each sentence is a single utterance
-                # (natural intonation, real breaths at commas), with a pause after each full stop and every
-                # word lit up at the moment you hear it.
+                item, tag = item if isinstance(item, tuple) else (item, None)
+                # One whole answer at a time, sentence by sentence (each one a single natural utterance), the next
+                # sentences prepared while this one plays, and every word lit up the moment you hear it.
                 text = speechify(item)
                 sentences = [x.strip() for x in re.split(r"(?<=[.!?…])\s+", text) if x.strip()]
-                emit("words", words=[w for x in sentences for w in x.split()], base=idx)
-                for si, sent in enumerate(sentences):
+                emit("words", words=[w for x in sentences for w in x.split()], base=idx, id=tag)
+                jobs = [pool.submit(self.e.render, x, rate) for x in sentences]
+                for si, job in enumerate(jobs):
                     if self.speak_stop.is_set():
                         break
-                    sw = sent.split()
-                    fa = self.e.synth_sentence(sent)
-                    if fa is not None:
-                        audio = (fa * 32767).astype(self.e.np.int16).tobytes()
-                        times = self.e.word_times(fa, sw)
-                    else:
-                        audio = b"".join(self.e.synth(sent))
-                        dur = len(audio) / 2 / rate
-                        wts = [len(x) + 2 + (3 if x[-1:] in ",;:" else 0) for x in sw]
-                        tot, acc, times = max(1, sum(wts)), 0, []
-                        for wt in wts:
-                            times.append(0.04 + dur * 0.92 * acc / tot)
-                            acc += wt
+                    audio, times, engine = job.result()
                     now = time.time()
                     if t0 is not None and now > t0 + written / rate:
                         t0 = now - written / rate   # playback ran dry while we waited: re-align the clock
@@ -804,7 +904,10 @@ class Voice:
                         tm.start()
                         timers.append(tm)
                         idx += 1
-                    pause = PAUSE_SENTENCE if si < len(sentences) - 1 else 0.18
+                    if engine == "neural":
+                        pause = PAUSE_NEURAL
+                    else:
+                        pause = PAUSE_SENTENCE if si < len(sentences) - 1 else 0.18
                     audio += b"\x00\x00" * int(rate * pause)
                     step = rate // 5 * 2            # write in 200 ms slices so "stop" is instant
                     for k in range(0, len(audio), step):
@@ -825,6 +928,7 @@ class Voice:
         finally:
             for tm in timers:
                 tm.cancel()
+            pool.shutdown(wait=False, cancel_futures=True)
             if p.poll() is None:
                 p.terminate()
             if self.state == self.SPEAK:
@@ -886,6 +990,15 @@ def selftest():
     print("whisper:", "ok (%s)" % STT_MODEL if e.whisper else "MISSING")
     e.load_piper()
     print("piper voice:", "ok (%s)" % PIPER_VOICE if e.piper else "MISSING")
+    if e.np is not None and e.neural_ready():
+        try:
+            t = time.time()
+            pcm, _ = e.synth_neural("Testing.")
+            print("natural voice: ok (%s, %.1fs to first audio)" % (NEURAL_VOICE, time.time() - t))
+        except Exception as ex:
+            print("natural voice: unreachable (%s); Piper will be used" % repr(ex)[:120])
+    else:
+        print("natural voice:", "off (FRIDAY_TTS=piper)" if TTS == "piper" else "not installed (re-run friday-voice-setup)")
     m = Mic()
     if not m.start():
         print("microphone: no recorder (pw-record/parecord) found")
