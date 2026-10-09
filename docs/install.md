@@ -36,7 +36,7 @@ Hyprland without ii is a close second: everything except those three ii hooks.
 | Link | `~/.config/quickshell/friday → <repo>/shell`, `~/.local/share/friday → <repo>/brain`. Your personal files (`me.md`, `memory/`, `config.env`, `device-profile.md`) live in `brain/` and are git-ignored. |
 | Desktop | Shortcut, autostart and app-menu entries (search "Friday" in your launcher). See the table below. |
 | Voice | Optional: `friday-voice-setup` (Python env via `uv`, Vosk, Whisper `small.en`, Piper, the neural voice packages). |
-| Offline brain | Optional: `friday-offline-setup` installs Ollama (Arch package, else Ollama's official installer) and pulls a Qwen3 model sized to your RAM/GPU, so Friday keeps answering offline or out of Claude usage. |
+| Offline brain | Offered, your pick (`--offline=TIER` to choose up front, `--no-offline` to skip; `--yes` never downloads it unasked): `friday-offline-setup` installs Ollama (Arch package with the CUDA/ROCm build when it sees the GPU, else Ollama's official installer) and pulls the Qwen3 size you chose, so Friday keeps answering offline or out of Claude usage. |
 | Command | Links `project-friday` (and `friday`, when that name is free) into `~/.local/bin`, and offers to put `~/.local/bin` on your PATH if it isn't. |
 | Start | `project-friday restart`. From then on it starts at login and restarts itself if it crashes. |
 
@@ -72,6 +72,8 @@ project-friday update       # pull the latest, re-link, restart
 project-friday restart      # restart after editing things (or if it's stuck)
 project-friday stop         # stop until next login
 project-friday status       # what's running and set up
+project-friday mode private # everything on this laptop (also: local, default)
+project-friday settings     # every setting, value and default; change with: project-friday set NAME VALUE
 project-friday uninstall    # remove every hook Friday added (your brain/ files stay)
 project-friday uninstall --voice    # ...and delete the ~700 MB of speech models
 ```

@@ -32,7 +32,8 @@ One command on any Linux desktop: it detects your distro and desktop, installs w
 | **Everyday stuff without Claude** | Time, date, world clock, timers and reminders (it says them out loud when they go off), volume, brightness, play/pause/next, "play some Fred again", open apps and sites, Google something, weather, battery, Wi-Fi/Bluetooth, CPU/RAM/disk, screenshots, lock, workspaces, maths, unit conversion, coin/dice, your Claude usage, small talk and jokes. All handled on your laptop in ~0.1 s: **no Claude usage, and it works offline**. Only what it can't do goes to Claude; offline, it tells you so instead of hanging. Answers are phrased from a bank of variations that Claude refreshes once a week (one tiny call), so it doesn't sound canned. |
 | **Made for one person** | A greeting and one status line about your world, plus rows for what you actually do: jump back into your latest Claude Code sessions (auto-titled like *Continue Friday Overlay Polish*, with project and time) right where you left them, see what's on your connected phone (adb/fastboot), or start a 90-minute deep-work block. |
 | **Music that gets you** | "Play something nice" plays something *you'd* pick: it knows your taste (`FRIDAY_MUSIC`, plus what you play, like and skip) and the vibe you asked for. "High energy Fred again" finds his Boiler Room set; "afro house for the gym" a peak-time mix; a song plays and then keeps going with similar tracks. Every YouTube result is vetted first (music only, never a news clip), and "I love this", "not this", "more like this" teach it. The music row is *For you* plus your favourites. Plays in the background with `mpv` + `yt-dlp` (installed for you), or in your browser. |
-| **Offline brain** | No internet, or out of Claude usage? Friday keeps going on a free open model running on your own laptop (Qwen3 via Ollama): no keys, no limits, nothing leaves the machine. Same panel, same voice, same safety guard; Claude picks the chat back up when it's available. |
+| **Offline brain** | No internet, or out of Claude usage? Friday keeps going on a free open model running on your own laptop (Qwen3 via Ollama, size of your choice): no keys, no limits, nothing leaves the machine. Same panel, same voice, same safety guard; Claude picks the chat back up when it's available. |
+| **Your call, all of it** | `project-friday mode private` and everything (thinking, listening, speaking) stays on your laptop; `mode local` drops Claude entirely; `mode default` puts it back. Every other knob is one `project-friday set` away, with a default to return to. |
 | **Uses your mouse and keyboard** | For apps with no command line, Friday looks at the screen, clicks and types (`friday-input`: `wtype` + `ydotool` on Wayland, `xdotool` on X11; the installer sets them up). Moving and scrolling are free; every click or keystroke shows an approval card unless you set `FRIDAY_INPUT_TRUST=1`. |
 | **Deep work** | A live countdown card with a progress ring, plus a notification when you're done. |
 | **Safe by design** | Every action passes a policy hook: read-only runs silently, changes need your approval (the card shows the whole command, and you have to scroll through it before Allow works), and `sudo`, disk-wiping commands, credentials, browser data and Friday's own files are off-limits. All of it is logged. See [SECURITY.md](SECURITY.md). |
@@ -53,42 +54,43 @@ The installer asks once before using `sudo`, then does everything itself:
 2. installs what's missing: **Quickshell** (from the AUR, a COPR, or built from source), **Claude Code** (Anthropic's official installer), clipboard, screenshot, media and audio tools, and the icon font
 3. links Friday in (`~/.config/quickshell/friday → shell/`, `~/.local/share/friday → brain/`), so `project-friday update` keeps it current
 4. adds a keyboard shortcut, autostart (Friday restarts itself if it ever crashes) and app-menu entries for your desktop
-5. offers voice (~700 MB of local speech models) and the offline brain (a 1.4 to 9 GB local model), then starts Friday
+5. offers voice (~700 MB of local speech models) and the offline brain (you pick the size, 1.4 to 9 GB), then starts Friday
 
-Flags: `--yes` (no questions), `--no-voice`, `--no-offline`, `--no-deps` (don't touch system packages), `--dry-run` (show what it would do).
+Flags: `--yes` (no questions; never downloads the offline brain unasked), `--offline=balanced` (pick its size up front), `--no-voice`, `--no-offline`, `--no-deps` (don't touch system packages), `--dry-run` (show what it would do).
 
-After that, everything is one command, `project-friday` (or just `friday` if nothing else on your system uses that name):
+After that, everything is one command, `project-friday` (or just `friday` if nothing else on your system uses that name). `project-friday help` lists it all:
 
 | | |
 |---|---|
-| `project-friday status` | running? signed in? voice, offline brain, Claude usage |
-| `project-friday restart` | if it ever gets stuck |
-| `project-friday start` · `stop` | |
+| `project-friday status` | running? signed in? which mode, voice, offline brain, Claude usage |
+| `project-friday restart` · `start` · `stop` | restart it if it's ever stuck · start · stop until next login |
+| `project-friday mode local` | switch modes: `default`, `local` or `private` ([below](#modes-and-settings)) |
+| `project-friday settings` · `set NAME VALUE` · `reset NAME\|all` | every setting with its value and default · change one · back to defaults |
+| `project-friday offline setup` · `models` · `use` · `remove` · `test` | the offline brain: install, see sizes, switch model, delete one, try it |
 | `project-friday update` | pull the latest version, re-link, restart |
 | `project-friday ask "…"` | open Friday and ask something from a terminal or script |
-| `project-friday config` · `me` | edit your settings · what Friday knows about you |
-| `project-friday music "…"` | play something (`stop`, `next`, `like`, `taste`) |
+| `project-friday music "…"` | play something (`stop`, `next`, `like`, `more`, `taste`) |
 | `project-friday voice setup` · `voice test` | install / check voice |
-| `project-friday offline setup` · `offline test` | install / check the offline brain |
+| `project-friday config` · `me` | edit `config.env` by hand · what Friday knows about you |
 | `project-friday logs` | recent voice and shell logs, and the guard's last decisions |
 | `project-friday uninstall` | remove everything Friday added (your `brain/` files stay) |
-You need a Claude **Pro, Max, Team, Enterprise or Console** account for Claude Code; the first time, Friday shows a **Sign in** card.
 
 ### Make it yours
 
 Friday works out of the box, but it's much better once it knows you. Two git-ignored files in `brain/` (so your personal stuff never ends up in a commit):
 
 - **`me.md`**: who you are, what you work on, how you like answers. Friday reads it on every request. Start from [`me.example.md`](brain/me.example.md).
-- **`config.env`**: settings. Start from [`config.example.env`](brain/config.example.env). The personal ones:
+- **`config.env`**: settings. Change them with `project-friday set NAME VALUE` (or edit the file; start from [`config.example.env`](brain/config.example.env)). The personal ones:
 
 | Setting | What it does |
 |---|---|
-| `FRIDAY_NAME="Sam"` | What Friday calls you (defaults to the first name on your account) |
-| `FRIDAY_STYLE="casual, short, a bit of slang"` | How you talk, so on-device replies match your vibe |
-| `FRIDAY_VOCAB="Hyprland, fastboot, MyApp"` | Names and jargon the speech recogniser should expect |
-| `FRIDAY_ROM_DIRS="~/aosp ~/lineage"` | Android ROM build trees, so Friday can tell you when a build is running |
-| `FRIDAY_MUSIC="Fred again.., afro house, lofi"` | Artists and genres you like, favourites first (your music row and "play something nice") |
-| `FRIDAY_LOCAL_MODEL=qwen3:8b` | The offline brain's model (`project-friday offline setup` picks one for your RAM) ([more](#offline-brain)) |
+| Command | What it does |
+|---|---|
+| `project-friday set name Sam` | What Friday calls you (defaults to the first name on your account) |
+| `project-friday set style "casual, short, a bit of slang"` | How you talk, so on-device replies match your vibe |
+| `project-friday set vocab "Hyprland, fastboot, MyApp"` | Names and jargon the speech recogniser should expect |
+| `project-friday set rom-dirs "~/aosp ~/lineage"` | Android ROM build trees, so Friday can tell you when a build is running |
+| `project-friday set music "Fred again.., afro house, lofi"` | Artists and genres you like, favourites first (your music row and "play something nice") |
 
 Friday also keeps its own notes about how you work in `brain/memory/notes.md`; you can read and edit them any time.
 
@@ -128,21 +130,51 @@ Tune it in `brain/config.env` (model size, voice, silence before it stops listen
 
 ## Offline brain
 
-Friday's everyday skills never needed Claude or the internet. The **offline brain** covers the rest: a free, open model running **on your laptop** that takes over whenever you're offline, your Claude limit runs out, or Claude is down. No account, no API keys, no usage limits, free forever, and nothing leaves your machine.
+Friday's everyday skills never needed Claude or the internet. The **offline brain** covers the rest: a free, open model running **on your laptop** that takes over whenever you're offline, your Claude limit runs out, or Claude is down. No account, no API keys, no usage limits, free forever, and nothing leaves your machine. The installer offers it and lets you pick the size (it never downloads gigabytes without asking); add or change it any time:
 
 ```bash
-project-friday offline setup     # installs Ollama + a Qwen3 model sized to your RAM (the installer offers this too)
-project-friday offline test      # make sure it answers
+project-friday offline models          # the sizes, and which one suits this laptop
+project-friday offline setup           # pick one from a menu (installs Ollama the first time)
+project-friday offline setup balanced  # or name it straight away
+project-friday offline test            # ask it something
+project-friday offline use smart       # switch model (downloads it if needed)
+project-friday offline remove small    # free the space again
 ```
 
-| Your laptop | Model it picks | Download |
-|---|---|---|
-| 30 GB+ RAM or a 12 GB+ GPU | `qwen3:14b` | ~9 GB |
-| 15 GB+ RAM or a 6 GB+ GPU | `qwen3:8b` | ~5 GB |
-| 7 GB+ RAM | `qwen3:4b` | ~2.5 GB |
-| less | `qwen3:1.7b` | ~1.4 GB |
+| Size | Model | Download | Runs well on | Good for |
+|---|---|---|---|---|
+| `small` | `qwen3:1.7b` | 1.4 GB | any laptop | quick answers, basic tasks |
+| `balanced` | `qwen3:4b` | 2.5 GB | 8 GB RAM | a good everyday helper |
+| `smart` | `qwen3:8b` | 5.2 GB | 16 GB RAM or a 6 GB GPU | noticeably smarter |
+| `smartest` | `qwen3:14b` | 9.3 GB | 32 GB RAM or a 12 GB GPU | best quality |
 
-It answers in the same panel and voice, can still run commands, read files and use Friday's helpers (through the same guard, so the same things are allowed, asked about or refused), and says once per chat that it's standing in. When Claude's back, Claude picks up the chat. Be realistic about it: a small local model is good for questions, quick tasks and chat, slower on a CPU-only laptop, and no match for Claude on big jobs; it'll say so. Pick a different model with `FRIDAY_LOCAL_MODEL` (any [Ollama model](https://ollama.com/library) that supports tools), or point `FRIDAY_LOCAL_URL` at another local server (llama.cpp, LM Studio). `FRIDAY_FALLBACK=off` turns it off.
+Any other [Ollama model](https://ollama.com/library) that supports tools works too (`project-friday offline use gemma3:4b`), or point `project-friday set local-url http://127.0.0.1:8080/v1/chat/completions` at another server on your machine (llama.cpp, LM Studio). It answers in the same panel and voice, can still run commands, read files and use Friday's helpers (through the same guard, so the same things are allowed, asked about or refused), and says once per chat that it's standing in; when Claude's back, Claude picks up the chat. Be realistic about it: a small local model is good for questions, quick tasks and chat, slower on a CPU-only laptop, and no match for Claude on big jobs. It'll say so.
+
+## Modes and settings
+
+One switch for how Friday thinks and what leaves your laptop:
+
+| `project-friday mode …` | Thinking | Voice | Background calls | Needs a Claude account |
+|---|---|---|---|---|
+| **`default`** | Claude; the offline brain when you're offline or out of usage | natural neural voice online, Piper offline | weekly phrase refresh, usage rings | yes |
+| **`local`** | the offline brain, always (no Claude usage at all) | as you set it | as you set it | no |
+| **`private`** | the offline brain, always | Piper, on-device | none | no |
+
+In `private` mode nothing leaves your laptop on its own: listening, speech, thinking and everyday skills are all on-device. Things you explicitly ask for that live on the internet (playing music from YouTube, the weather, a web search) still go online, because that's the request.
+
+Everything else is a named setting. `project-friday settings` shows each one with its current value, its default and what it does; `project-friday set NAME VALUE` changes it, `project-friday set NAME default` (or `reset NAME`) puts it back, and `project-friday reset all` returns everything to defaults (keeping your name, style and music; `reset everything` clears those too). A few:
+
+| Setting | Values (default first) | |
+|---|---|---|
+| `brain` | `auto` · `claude` · `local` | who thinks (what the modes switch) |
+| `tts` | `auto` · `neural` · `piper` | which voice speaks |
+| `stt-model` | `small.en` · `tiny.en` · `base.en` · `medium.en` · `large-v3-turbo` | speech recognition accuracy vs speed |
+| `claude-model` / `voice-claude-model` | your Claude Code default / `sonnet` | which Claude for typed / spoken requests |
+| `local-model` | best one you've pulled | the offline brain's model |
+| `speak` | `on` · `off` | read answers aloud |
+| `local-skills` | `on` · `off` | answer everyday things on the laptop first |
+| `phrases` · `usage-check` | `on` · `off` | the weekly phrase refresh · the usage rings |
+| `input-trust` | `0` · `1` | let Friday click and type without asking |
 
 ## Keys
 
