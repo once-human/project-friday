@@ -1,238 +1,740 @@
-#!/usr/bin/env bash
-# friday-music <anything>      plays it: a request ("fred again boiler room", "high energy"), or a vague ask
-#                              ("something nice", "play me something") which is answered from YOUR taste
-# friday-music stop | now
-# friday-music --say "<ask>"   decide what to play, remember the plan, print a sentence to say out loud (instant, offline)
-# friday-music --go            play the plan --say just made
-# friday-music like "<artist>" | dislike "<artist>" | taste     teach it / see what it knows
-#
-# Best: mpv + yt-dlp -> plays in the background (no browser tab), shows up in your media controls
-#       (install mpv-mpris too so the bar's play/pause/next work).
-# Else: opens the first matching YouTube video in your browser, already playing.
-#
-# Taste lives in ~/.local/share/friday/music-taste.json: artists and genres you like, weighted by what you
-# actually play, with what you played recently set aside so it doesn't repeat itself.
-export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
-D="${XDG_RUNTIME_DIR:-/tmp}/friday"; mkdir -p "$D"
-FRIDAY_HOME="${FRIDAY_HOME:-$HOME/.local/share/friday}"
-TASTE="$FRIDAY_HOME/music-taste.json"
-PLAN="$D/music-plan.json"
-export TASTE PLAN
+#!/usr/bin/env python3
+"""friday-music — plays music you'll actually want, and learns what you like.
 
-planner() { python3 -I - "$@" <<'PY'
-import json, os, random, re, sys, time
+    friday-music "<anything you'd say>"   "something nice", "high energy fred again", "afro house", "delilah fred again"
+    friday-music --exact "<search>"       a precise search (Friday's brain uses this once it knows the exact song/set)
+    friday-music next | stop | now        skip (counts as "not this"), stop, what's playing
+    friday-music like | dislike | more    teach it your taste / "more like this" (similar music, continuing on)
+    friday-music taste | row              what it thinks you like (JSON) / the five quick-pick buttons for the panel
+    add --dry-run to just print what it would play, --json for machine-readable output
 
-TASTE, PLAN = os.environ["TASTE"], os.environ["PLAN"]
-SEED = {
-    "artists": {"Fred again..": 3},
-    "genres": {"house": 2, "afro house": 2, "melodic techno": 2, "chill house": 1},
-    "recent": [],
-}
+How it picks:
+  * Your taste = FRIDAY_MUSIC in config.env (artists and genres, comma separated) + what you've played, liked,
+    skipped and stopped early. Kept in ~/.local/state/friday/music.json, never leaves this laptop.
+  * Vague requests ("something nice", "anything", "a banger") are drawn from your taste, matched to the energy you
+    asked for and the time of day. Named artists/genres/songs are searched directly.
+  * Every YouTube result is vetted before it plays: it must look like music (not news, talk, a debate, a tutorial…),
+    match what you asked for, and be the right length (a long set for "mix"/"set"/vibes, a song otherwise). A song
+    keeps going with similar tracks afterwards (YouTube's own radio for it), so the music doesn't stop after 3 minutes.
+  * Plays in the background with mpv + yt-dlp (shows in your media controls with mpv-mpris); else in your browser.
+"""
+import json
+import math
+import os
+import random
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
-def load():
+sys.dont_write_bytecode = True
+HOME = os.path.expanduser("~")
+FH = os.environ.get("FRIDAY_HOME", os.path.join(HOME, ".local/share/friday"))
+os.environ["PATH"] = ":".join([HOME + "/.local/bin", "/usr/local/bin", "/usr/bin", os.environ.get("PATH", "")])
+RT = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/friday-%d" % os.getuid(), "friday")
+STATE_DIR = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "friday")
+STATE = os.path.join(STATE_DIR, "music.json")
+NOW = os.path.join(RT, "music-now")              # human-readable title (the panel and friday-local read it)
+NOWJ = os.path.join(RT, "music-now.json")
+SOCK = os.path.join(RT, "mpv-music.sock")
+TITLE_TAG = "--title=friday-music"
+PIDF = os.path.join(RT, "mpv-music.pid")
+ARGS = [a for a in sys.argv[1:]]
+DRY = "--dry-run" in ARGS
+JSON_OUT = "--json" in ARGS
+ARGS = [a for a in ARGS if a not in ("--dry-run", "--json")]
+
+
+def load_config():
     try:
-        t = json.load(open(TASTE))
+        with open(os.path.join(FH, "config.env")) as f:
+            for line in f:
+                m = re.match(r"\s*(?:export\s+)?(FRIDAY_[A-Z_]+)=(.*)", line)
+                if m and m.group(1) not in os.environ:
+                    os.environ[m.group(1)] = m.group(2).split(" #")[0].strip().strip("'\"")
+    except OSError:
+        pass
+
+
+load_config()
+
+# ---------------------------------------------------------------- vocabulary
+GENRES = r"""house|deep house|tech house|afro house|afro|afrobeats?|amapiano|techno|melodic techno|minimal|trance|psytrance|
+edm|dubstep|drum and bass|dnb|jungle|garage|uk garage|breakbeat|electro|electronic|dance music|disco|nu disco|funk|soul|
+r&b|rnb|hip hop|hip-hop|rap|trap|drill|grime|phonk|lofi|lo-fi|lo fi|jazz|blues|rock|indie|alt|metal|punk|pop|k-pop|kpop|
+synthwave|ambient|chillout|chill house|chillhop|downtempo|classical|piano|acoustic|folk|country|reggae|reggaeton|latin|salsa|bossa nova|
+lounge|bollywood|punjabi|sufi|ghazal|qawwali|carnatic|hindustani|indian classical|devotional|instrumental|soundtrack|ost|
+80s|90s|2000s|retro|oldies|hardstyle|progressive house|progressive|organic house|melodic house|bass|bass house|uk bass"""
+GENRE_RE = re.compile(r"\b(" + GENRES.replace("\n", "") + r")\b")
+ENERGY = {
+    "high": r"high energy|high-energy|hype|hyped|bangers?|pump(ed)?( me)? up|gym|work ?out|running|run|party|dance|danceable|"
+            r"upbeat|energetic|hard|heavy|loud|rave|festival|turn up|lit|fire|intense|peak time|peak-time|club|hyper|crazy|wild|"
+            r"something to move|get me going|wake me up",
+    "chill": r"chill|chilled|calm|relax(ing|ed)?|mellow|soft|slow|sleep|sleepy|lofi|lo-fi|study(ing)?|focus|concentrat\w*|"
+             r"work(ing)?|cod(e|ing)|background|rainy|late night|sunset|sunrise|cozy|cosy|peaceful|soothing|ambient|wind down",
+    "sad": r"sad|emotional|heartbreak|heartbroken|melanchol\w*|moody|in my feels|cry",
+    "happy": r"happy|feel ?good|good vibes|sunny|uplifting|cheerful|summer(y)?",
+}
+ENERGY_RE = {k: re.compile(r"\b(" + v + r")\b") for k, v in ENERGY.items()}
+# words that carry no subject: what's left after removing them is the artist/genre/song you asked for
+FILLER = re.compile(
+    r"\b(hey friday|friday|can you|could you|would you|will you|please|pls|play|put on|put|throw on|queue( up)?|start|"
+    r"blast|crank|bump|spin|for me|something|anything|music|songs?|tracks?|tunes|beats|stuff|"
+    r"nice|good|great|cool|decent|lovely|dope|sick|vibe|vibes|vibey|my vibe|my kind of|my type of|kinda|kind of|"
+    r"that i('d| would)? like|i('d| would)? like|i like|i love|you think i('d| would)? like|my taste|my music|"
+    r"my style|surprise me|anything good|right now|today|tonight|this morning|"
+    r"on youtube|on yt|from youtube|in the background|really|very|super|pretty|some more|"
+    r"to listen to|to vibe to|listen to|to vibe|while i work|while i study|while i code)\b")
+EDGE = {"for", "with", "of", "and", "or", "by", "to", "on", "in", "at", "while", "i", "am", "im", "i'm", "a", "an", "the",
+        "some", "me", "us", "now", "bit", "little", "more", "real", "that", "this", "is", "it", "my", "your", "something"}
+LONG_WORDS = re.compile(r"\b(mix|mixes|set|sets|dj set|live set|boiler room|cercle|live|session|sessions|playlist|full album|album|"
+                        r"radio|nonstop|non-stop|marathon|hour|hours|long)\b")
+NOT_MUSIC = re.compile(
+    r"\b(news|debate|debates|interview|podcast|episode|reaction|reacts?|reacting|trailer|teaser|tutorial|how to|lesson|"
+    r"course|review|unboxing|explained|explains|breakdown|analysis|documentary|lecture|ted ?x?|speech|press conference|"
+    r"asked|clinton|trump|biden|modi|election|politic\w*|parliament|senate|vs\.?|gameplay|walkthrough|let'?s play|"
+    r"prank|vlog|challenge|shorts?|#shorts|meme|funny moments|compilation|asmr|karaoke|instrumental cover tutorial|"
+    r"sermon|full movie|movie scene|scene|clip|highlights|stand ?up|comedy|roast|cooking|recipe|motivational speech|"
+    r"crypto|stock|market|cricket|football|nba|ufc|wwe)\b")
+NEWS_CHANNEL = re.compile(r"\b(news|cnn|bbc|fox|cbs|nbc|abc|msnbc|sky news|al jazeera|ndtv|aaj tak|zee|times now|"
+                          r"wion|reuters|associated press|guardian|vice|tedx?|podcast|cnbc|bloomberg|c-span)\b", re.I)
+MUSIC_TITLE = re.compile(r"(official (audio|video|music video|visuali[sz]er)|lyrics?|lyric video|visuali[sz]er|remix|"
+                         r"\bmix\b|\bset\b|live at|boiler room|cercle|dj set|full album|\baudio\b|\bft\.|\bfeat\.|"
+                         r"extended|\bep\b|\(live\)|session|radio edit|original mix|slowed|sped up|nonstop)", re.I)
+MUSIC_CHANNEL = re.compile(r"( - topic$|vevo|records|recordings|music|boiler room|cercle|mixmag|defected|anjunadeep|"
+                           r"keinemusik|lofi girl|majestic casual|selected|monstercat|spinnin|ultra|tomorrowland|"
+                           r"t-series|sony music|saregama|zee music|tips official|yrf|speed records)", re.I)
+ENERGY_TITLE = {
+    "high": re.compile(r"boiler room|live|festival|rave|hard|peak|energy|club|warehouse|edc|tomorrowland|ultra|banger|"
+                       r"workout|gym|party|hype|anthem", re.I),
+    "chill": re.compile(r"chill|deep|sunset|sunrise|lo-?fi|calm|relax|study|focus|ambient|acoustic|slow|sleep|"
+                        r"lounge|mellow|cafe|coffee", re.I),
+    "sad": re.compile(r"sad|emotional|heartbreak|slowed|lonely|cry", re.I),
+    "happy": re.compile(r"happy|feel ?good|summer|sunny|good vibes|uplifting", re.I),
+}
+OPPOSITE = {"chill": "high", "high": "chill", "sad": "happy", "happy": "sad"}
+PRESETS = {  # the old one-word buttons still work
+    "house": "house", "afro": "afro house", "fred": "fred again..", "techno": "melodic techno", "chill": "chill house",
+}
+DEFAULT_TASTE = "chill house, lofi, pop hits, indie, deep house"     # until you set FRIDAY_MUSIC or it learns
+
+
+def norm(s):
+    s = (s or "").lower().replace("..", " ").replace("&", " and ")
+    return re.sub(r"\s+", " ", re.sub(r"[^\w\s'-]", " ", s)).strip()
+
+
+# ---------------------------------------------------------------- state (your taste, learned on this laptop)
+def load_state():
+    try:
+        with open(STATE) as f:
+            s = json.load(f)
     except Exception:
-        t = {}
-    for k, v in SEED.items():
-        t.setdefault(k, json.loads(json.dumps(v)))
-    return t
+        s = {}
+    s.setdefault("scores", {})       # seed/artist -> learned score (likes up, skips down)
+    s.setdefault("plays", [])        # recent plays, newest last
+    s.setdefault("banned", [])       # video ids you said no to
+    return s
 
-def save(t):
-    os.makedirs(os.path.dirname(TASTE), exist_ok=True)
-    json.dump(t, open(TASTE, "w"), indent=1, ensure_ascii=False)
 
-# words that describe a mood or a format, not a thing to search for
-MOODS = {
-    "energy": r"high[- ]?energy|energetic|hype|hyped|pump(ed)?( up)?|workout|gym|party|banger|bangers|hard|intense|lit|rave|peak",
-    "focus":  r"focus|focused|work|working|coding|study|studying|concentrat\w*|deep work|flow",
-    "chill":  r"chill|chilled|relax\w*|calm|mellow|sleep\w*|wind down|late night|slow|soft|easy",
-    "happy":  r"happy|uplifting|good vibes?|feel good|sunny|summer|morning",
-}
-FILLER = (r"\b(play|put on|some|me|something|anything|a|an|the|my|music|songs?|tracks?|playlist|mix|stuff|"
-          r"nice|good|great|cool|decent|sick|fire|best|favou?rite|favs?|usual|please|for|to|on|youtube|"
-          r"surprise|vibe|vibes?|what i like|i like|you think|i'?d like|would like|then|and|of|with|by|something)\b")
-VAGUE = re.compile(r"^\W*$")
-# how each mood wants to be served for an artist, and for a genre
-ARTIST_FMT = {
-    "energy": ["boiler room set", "live set", "festival set"],
-    "focus":  ["deep focus mix", "studio mix", "ambient mix"],
-    "chill":  ["chill mix", "live set sunrise", "acoustic live"],
-    "happy":  ["live set", "mix", "boiler room set"],
-    None:     ["boiler room set", "live set"],
-}
-GENRE_FMT = {
-    "energy": "high energy {g} set 2026 long set", "focus": "{g} deep focus mix long set",
-    "chill": "{g} chill mix long set", "happy": "uplifting {g} mix long set", None: "{g} mix 2026 long set",
-}
-ALIASES = {"fred": "Fred again..", "fredagain": "Fred again..", "fred again": "Fred again..", "fred again..": "Fred again..",
-           "house": "@house", "afro": "@afro house", "afro house": "@afro house", "techno": "@melodic techno",
-           "melodic techno": "@melodic techno", "chill": "@chill house", "deep house": "@deep house"}
+def save_state(s):
+    s["plays"] = s["plays"][-200:]
+    s["banned"] = s["banned"][-300:]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=1)
+    os.replace(tmp, STATE)
 
-EXTRA = {"fred again..": {"energy": ["USB002 live"], None: ["USB002 live"]}}   # artist-specific formats worth offering
 
-def fmt_for(name, mood):
-    return random.choice(ARTIST_FMT[mood] + EXTRA.get(name.lower(), {}).get(mood, []))
+def bump(state, key, by):
+    if not key:
+        return
+    key = norm(key)
+    state["scores"][key] = round(max(-6.0, min(8.0, state["scores"].get(key, 0.0) + by)), 2)
 
-def mood_of(t):
-    for m, rx in MOODS.items():
-        if re.search(r"\b(" + rx + r")\b", t):
-            return m
+
+def seeds():
+    raw = os.environ.get("FRIDAY_MUSIC") or DEFAULT_TASTE
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def is_genre(subject):
+    s = norm(subject)
+    return bool(s) and bool(GENRE_RE.search(s)) and len(s.split()) <= 4
+
+
+def artist_of(title, channel):
+    """Best guess at the artist of a YouTube result ("Artist - Song", or a '- Topic' channel)."""
+    ch = (channel or "").strip()
+    if ch.lower().endswith(" - topic"):
+        return ch[:-8]
+    m = re.match(r"\s*([^-–|]{2,40}?)\s+[-–]\s+", title or "")
+    if m and not NOT_MUSIC.search(m.group(1).lower()):
+        return m.group(1).strip()
+    return ""
+
+
+def taste(state):
+    """Weighted list of (seed, weight, kind) from your config + what you've played and liked."""
+    out = {}
+    for i, s in enumerate(seeds()):
+        out[norm(s)] = [s, 2.0 - i * 0.1, "genre" if is_genre(s) else "artist"]
+    # artists you've let play (not skipped) become part of your taste too
+    counts = {}
+    for p in state["plays"][-120:]:
+        if p.get("skipped") or not p.get("artist"):
+            continue
+        counts[norm(p["artist"])] = counts.get(norm(p["artist"]), 0) + 1
+    for a, n in counts.items():
+        if a and a not in out and n >= 2:
+            out[a] = [a, 0.6 + 0.2 * min(n, 6), "artist"]
+    for k, sc in state["scores"].items():                # things you've said you like
+        if k and k not in out and sc >= 1.5:
+            out[k] = [k, 0.8, "genre" if is_genre(k) else "artist"]
+    for k, v in out.items():
+        v[1] = max(0.15, v[1] + 0.35 * state["scores"].get(k, 0.0))
+    return [tuple(v) for v in out.values()]
+
+
+# ---------------------------------------------------------------- understanding the request
+def parse(text):
+    t = norm(text)
+    t = re.sub(r"\bfred\b(?! again)", "fred again", t)            # people say "fred" for Fred again..
+    energy = None
+    for k in ("high", "chill", "sad", "happy"):
+        if ENERGY_RE[k].search(t):
+            energy = k
+            break
+    want_long = bool(LONG_WORDS.search(t))
+    fm = re.search(r"\b(boiler room|cercle|dj set|live set|festival set|full album|album|live)\b", t)
+    subj = t
+    for k in ENERGY_RE:                                   # vibe words go, unless they're a genre you named ("lofi")
+        subj = ENERGY_RE[k].sub(lambda m: m.group(0) if GENRE_RE.fullmatch(m.group(0)) else " ", subj)
+    subj = LONG_WORDS.sub(" ", subj)
+    subj = FILLER.sub(" ", subj)
+    w = subj.split()
+    while w and w[0] in EDGE:
+        w.pop(0)
+    while w and w[-1] in EDGE:
+        w.pop()
+    subj = " ".join(w).strip(" -'")
+    if subj in ("random", "whatever", "anything", "surprise", "any", "idk", "you choose", "you pick", "your choice"):
+        subj = ""
+    return {"text": t, "subject": subj, "energy": energy, "long": want_long, "format": fm.group(1) if fm else None}
+
+
+def hour_mood():
+    h = time.localtime().tm_hour
+    if 0 <= h < 6 or h >= 23:
+        return "chill"
+    if 6 <= h < 11:
+        return "chill" if random.random() < 0.6 else None
+    if 17 <= h < 23:
+        return "high" if random.random() < 0.35 else None
     return None
 
-def strip_moods(t):
-    for rx in MOODS.values():
-        t = re.sub(r"\b(" + rx + r")\b", " ", t)
-    return t
 
-def time_mood():                                                 # only the late hours change what "something nice" means
-    h = time.localtime().tm_hour
-    return "chill" if (h >= 23 or h < 5) else None
+def dedupe(q):
+    out = []
+    for w in q.split():
+        if w.lower() not in [x.lower() for x in out]:
+            out.append(w)
+    return " ".join(out)
 
-def weighted(d, recent):
-    items = [(k, v) for k, v in d.items() if v > 0]
-    if not items:
-        return None
-    fresh = [(k, v) for k, v in items if k not in recent] or items
-    return random.choices([k for k, _ in fresh], weights=[v for _, v in fresh])[0]
 
-def plan(ask):
-    t = load()
-    raw = (ask or "").strip()
-    low = raw.lower()
-    mood = mood_of(low)
-    rest = re.sub(r"\s+", " ", re.sub(FILLER, " ", strip_moods(low))).strip(" .,!?-")
-    light = re.sub(r"\s+", " ", re.sub(r"^(please |can you |could you )?(play|put on)( me)?( some| a| the)? ", "", strip_moods(low))).strip(" .,!?-")
-    light = re.sub(r"( music| songs?| please| on youtube)$", "", light).strip()
-    recent = t["recent"][-4:]
-    p = {"ask": raw, "mood": mood, "long": True, "kind": "taste"}
-    artists = {a.lower(): a for a in t["artists"]}
-
-    if rest in ALIASES or rest in artists:                       # a named artist or genre, maybe with a mood
-        name = ALIASES.get(rest) or artists[rest]
-        if name.startswith("@"):
-            g = name[1:]
-            p.update(kind="genre", genre=g, query=GENRE_FMT[mood].format(g=g), say=("some " + g))
-        else:
-            fmt = fmt_for(name, mood)
-            p.update(kind="artist", artist=name, query=f"{name} {fmt}", match=name.lower().split("..")[0].strip(),
-                     say=f"{name}, {fmt}")
-    elif rest and not VAGUE.match(rest):                         # something specific: search exactly that
-        q = light if not mood else f"{light} {random.choice(ARTIST_FMT[mood])}"
-        p.update(kind="search", query=q, long=bool(mood) or len(light.split()) <= 2, say=q)
-        if mood is None and len(light.split()) >= 2:
-            p["long"] = False                                    # "artist song" -> that track
-    else:                                                        # vague: this is where taste decides
-        mood = mood or time_mood()
-        p["mood"] = mood
-        if random.random() < 0.7 and t["artists"]:
-            a = weighted(t["artists"], recent)
-            fmt = fmt_for(a, mood)
-            p.update(kind="artist", artist=a, query=f"{a} {fmt}", match=a.lower().split("..")[0].strip(),
-                     say=f"{a}, {fmt}")
-        else:
-            g = weighted(t["genres"], recent) or "house"
-            p.update(kind="genre", genre=g, query=GENRE_FMT[mood].format(g=g), say=f"some {g}")
-    if p["kind"] == "genre" and mood:
-        p["say"] = f"some {mood if mood != 'energy' else 'high energy'} {p['genre']}"
+def plan(req, state):
+    p = _plan(req, state)
+    if req.get("format") and req["subject"]:
+        p["queries"].insert(0, "%s %s" % (req["subject"], req["format"]))    # you named it: boiler room, cercle…
+        if req["format"] in ("album", "full album"):
+            p["queries"] = ["%s full album" % req["subject"], "%s album" % req["subject"]]
+        p["mode"] = "long"
+    seen, qs = set(), []
+    for q in p["queries"]:
+        q = dedupe(q)
+        if q.lower() not in seen:
+            seen.add(q.lower())
+            qs.append(q)
+    p["queries"] = qs[:3]
     return p
 
-cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-if cmd == "plan":
-    p = plan(" ".join(sys.argv[2:]))
-    json.dump(p, open(PLAN, "w"))
-    print(p["say"])
-elif cmd == "field":                                             # print one field of the saved plan
-    p = json.load(open(PLAN))
-    print(p.get(sys.argv[2], ""))
-elif cmd == "pick":                                              # stdin: id<TAB>title<TAB>channel<TAB>duration; print best id
-    p = json.load(open(PLAN))
-    rows = [l.rstrip("\n").split("\t") for l in sys.stdin if l.strip()]
-    rows = [r + [""] * (4 - len(r)) for r in rows]
-    junk = re.compile(r"\b(reaction|tutorial|lyrics? video|cover|remake|karaoke|slowed|reverb|8d|nightcore|shorts?|podcast|interview|reacts?)\b", re.I)
-    rows = [r for r in rows if not junk.search(r[1])] or rows
-    m = p.get("match")
-    if m:                                                        # an artist was asked for: it has to actually be them
-        rows = [r for r in rows if m in (r[1] + " " + r[2]).lower()] or rows
-    if p.get("long"):
-        def dur(r):
-            try: return float(r[3])
-            except Exception: return 0.0
-        long = [r for r in rows if 1200 <= dur(r) <= 14400]   # a set, not a 108-hour compilation
-        rows = long or rows
-    rows = rows[:3]                                              # best few, then a little variety
-    print(random.choice(rows)[0] if rows else "")
-elif cmd == "learn":                                             # remember what is being played
-    p = json.load(open(PLAN))
-    t = load()
-    if p.get("artist"):
-        t["artists"][p["artist"]] = t["artists"].get(p["artist"], 0) + 1
-    elif p.get("genre"):
-        t["genres"][p["genre"]] = t["genres"].get(p["genre"], 0) + 1
-    key = p.get("artist") or p.get("genre")
-    if key:
-        t["recent"] = (t["recent"] + [key])[-8:]
-    save(t)
-elif cmd in ("like", "dislike"):
-    t = load()
-    name = " ".join(sys.argv[2:]).strip()
-    n = ALIASES.get(name.lower(), name)
-    bucket = "genres" if n.startswith("@") else "artists"
-    n = n.lstrip("@")
-    if cmd == "like":
-        t[bucket][n] = t[bucket].get(n, 0) + 3
-        print(f"Noted, you like {n}.")
+
+def _plan(req, state):
+    """-> dict(queries=[...], mode='long'|'song', subject=..., seed=..., why=...)"""
+    subj, energy = req["subject"], req["energy"]
+    suffix = {"high": ["boiler room", "live set", "festival set"], "chill": ["chill mix", "deep mix", "sunset mix"],
+              "sad": ["emotional mix", "sad songs"], "happy": ["feel good mix", "summer mix"]}
+    gsuffix = {"high": ["peak time mix", "club mix", "live set"], "chill": ["chill mix", "deep mix", "sunset mix"],
+               "sad": ["melancholic mix"], "happy": ["feel good mix", "summer mix"], None: ["mix", "dj set", "live set"]}
+    if not subj:
+        # vague: draw from your taste, matched to the energy (asked for, or the time of day)
+        mood = energy or hour_mood()
+        pool = taste(state)
+        recent = [norm(p.get("seed", "")) for p in state["plays"][-3:]]
+        weights = []
+        for s, w, kind in pool:
+            k = norm(s)
+            if k in recent:
+                w *= 0.35                                   # variety: don't play the same thing three times running
+            if mood == "chill" and re.search(r"chill|deep|lofi|ambient|downtempo|lounge|jazz|acoustic", k):
+                w *= 1.6
+            if mood == "high" and re.search(r"techno|tech house|bass|edm|dnb|drum and bass|hard|trance", k):
+                w *= 1.4
+            weights.append(w)
+        seed, _, kind = random.choices(pool, weights=weights, k=1)[0]
+        if kind == "genre":
+            qs = ["%s %s" % (seed, s) for s in (gsuffix.get(mood) or gsuffix[None])]
+        else:
+            qs = ["%s %s" % (seed, s) for s in (suffix.get(mood) or ["live set", "boiler room", "mix"])]
+        return {"queries": qs, "mode": "long", "subject": seed, "seed": seed, "energy": mood,
+                "why": "from your taste (%s)" % seed + (", %s" % mood if mood else "")}
+    if is_genre(subj):
+        qs = ["%s %s" % (subj, s) for s in (gsuffix.get(energy) or gsuffix[None])]
+        return {"queries": qs, "mode": "long", "subject": subj, "seed": subj, "energy": energy, "why": "%s mix" % subj}
+    known = {norm(s) for s, _, kind in taste(state) if kind == "artist"}
+    if energy or req["long"] or norm(subj) in known and len(subj.split()) <= 3:
+        # an artist + a vibe ("high energy fred again") or an artist you like: a long set, not one 3-minute song
+        qs = ["%s %s" % (subj, s) for s in (suffix.get(energy) or ["live set", "boiler room", "mix"])]
+        return {"queries": qs, "mode": "long", "subject": subj, "seed": subj, "energy": energy,
+                "why": "%s, %s" % (subj, energy or "long set")}
+    # a specific song or an artist: the best match, then similar music continues (YouTube's radio for it)
+    return {"queries": [subj, subj + " official audio"], "mode": "song", "subject": subj, "seed": subj,
+            "energy": None, "why": subj}
+
+
+# ---------------------------------------------------------------- searching YouTube
+def search(q, n=12):
+    out = []
+    if shutil.which("yt-dlp"):
+        try:
+            r = subprocess.run(["yt-dlp", "--flat-playlist", "--no-warnings", "--print",
+                                "%(id)s\t%(title)s\t%(channel,uploader)s\t%(duration)s\t%(view_count)s",
+                                "ytsearch%d:%s" % (n, q)], capture_output=True, text=True, timeout=20)
+            for line in r.stdout.splitlines():
+                p = line.split("\t")
+                if len(p) == 5 and re.fullmatch(r"[\w-]{11}", p[0]):
+                    out.append({"id": p[0], "title": p[1], "channel": "" if p[2] == "NA" else p[2],
+                                "dur": float(p[3]) if p[3] not in ("NA", "None", "") else None,
+                                "views": int(float(p[4])) if p[4] not in ("NA", "None", "") else 0})
+        except Exception:
+            pass
+    if not out:
+        out = search_page(q)
+    return out
+
+
+def _secs(s):
+    try:
+        parts = [int(x) for x in s.split(":")]
+    except Exception:
+        return None
+    t = 0
+    for x in parts:
+        t = t * 60 + x
+    return t
+
+
+def search_page(q):
+    """No yt-dlp: read YouTube's results page."""
+    url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote_plus(q)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)", "Accept-Language": "en"})
+        html = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "replace")
+        i = html.find("ytInitialData = ")
+        data, _ = json.JSONDecoder().raw_decode(html[i + len("ytInitialData = "):])
+    except Exception:
+        return []
+    out = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            v = o.get("videoRenderer")
+            if isinstance(v, dict) and v.get("videoId"):
+                title = "".join(r.get("text", "") for r in v.get("title", {}).get("runs", []))
+                ch = "".join(r.get("text", "") for r in v.get("ownerText", {}).get("runs", []))
+                views = re.sub(r"\D", "", v.get("viewCountText", {}).get("simpleText", "") or "")
+                out.append({"id": v["videoId"], "title": title, "channel": ch,
+                            "dur": _secs(v.get("lengthText", {}).get("simpleText", "")), "views": int(views or 0)})
+            for x in o.values():
+                walk(x)
+        elif isinstance(o, list):
+            for x in o:
+                walk(x)
+    walk(data)
+    return out
+
+
+def score(c, pl, state, recent_ids):
+    title, ch = c["title"] or "", c["channel"] or ""
+    tl, chl = title.lower(), ch.lower()
+    if c["id"] in state["banned"]:
+        return None
+    dur = c.get("dur")
+    if dur is not None and dur < 70:
+        return None                                       # shorts and snippets
+    if NOT_MUSIC.search(tl) and not MUSIC_TITLE.search(tl):
+        return None
+    if NEWS_CHANNEL.search(chl):
+        return None
+    s = 0.0
+    words = [w for w in norm(pl["subject"]).split()
+             if len(w) > 1 and w not in ("music", "mix", "set", "by", "the", "of", "and", "from", "feat", "ft", "song")]
+    hay = norm(title + " " + ch)
+    if words:
+        hit = sum(1 for w in words if re.search(r"\b" + re.escape(w), hay))
+        frac = hit / len(words)
+        need = 0.75 if pl["mode"] == "song" else (1.0 if len(words) <= 2 else 0.6)
+        if frac < need:
+            return None                                   # it has to be what you asked for
+        s += 4 * frac
+    if MUSIC_TITLE.search(title):
+        s += 2
+    if MUSIC_CHANNEL.search(ch):
+        s += 2 if not ch.lower().endswith(" - topic") else 3
+    if NOT_MUSIC.search(tl):
+        s -= 3
+    if pl["mode"] == "long":
+        if dur is None:
+            s -= 1
+        elif dur >= 1500:
+            s += 3 + min(dur, 7200) / 7200
+        elif dur >= 900:
+            s += 1
+        else:
+            s -= 4
     else:
-        t[bucket].pop(n, None)
-        print(f"Dropped {n}.")
-    save(t)
-elif cmd == "taste":
-    t = load()
-    top = lambda d: ", ".join(k for k, _ in sorted(d.items(), key=lambda x: -x[1])[:8])
-    print("Artists: " + top(t["artists"]) + "\nGenres: " + top(t["genres"]))
-PY
-}
+        if dur is not None and 90 <= dur <= 600:
+            s += 2
+        elif dur is not None and dur > 1200 and not re.search(r"\b(mix|set|album)\b", pl["subject"]):
+            s -= 2
+    en = pl.get("energy")
+    if en in ENERGY_TITLE:
+        if ENERGY_TITLE[en].search(title):
+            s += 1.5
+        if OPPOSITE.get(en) in ENERGY_TITLE and ENERGY_TITLE[OPPOSITE[en]].search(title):
+            s -= 1.5
+    s += min(4.5, math.log10(max(c.get("views") or 0, 1)) / 1.6)
+    if c["id"] in recent_ids:
+        s -= 6                                            # you just heard it
+    a = artist_of(title, ch)
+    if a:
+        s += 0.4 * state["scores"].get(norm(a), 0.0)
+    return s
 
-case "${1:-}" in
-  stop) pkill -f -- "--title=friday-music" && echo "stopped" || echo "nothing playing"; exit 0 ;;
-  now)  cat "$D/music-now" 2>/dev/null || echo "nothing playing"; exit 0 ;;
-  like|dislike|taste) planner "$@"; exit 0 ;;
-  --say) shift; planner plan "$@"; exit 0 ;;
-  --go) ;;
-  *)    planner plan "${*:-something}" >/dev/null ;;
-esac
 
-Q="$(planner field query)"
+def pick(pl, state, fresh=True):
+    recent = [p.get("id") for p in state["plays"][-25:]]
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        results = list(ex.map(search, pl["queries"]))
+    seen, scored = set(), []
+    for res in results:
+        for c in res:
+            if c["id"] in seen:
+                continue
+            seen.add(c["id"])
+            sc = score(c, pl, state, recent if fresh else [])
+            if sc is not None:
+                scored.append((sc, c))
+    if not scored:
+        return None, []
+    scored.sort(key=lambda x: -x[0])
+    best = scored[0][0]
+    # a little variety among near-equals, so "something nice" isn't the same video every time
+    top = [c for sc, c in scored if sc >= best - (1.2 if pl["why"].startswith("from your taste") else 0.4)][:4]
+    return random.choice(top), scored[:6]
 
-pick_id() {   # best video for the plan: yt-dlp metadata when present, else read YouTube's results page
-  if command -v yt-dlp >/dev/null 2>&1; then
-    timeout 20 yt-dlp --flat-playlist --print "%(id)s	%(title)s	%(channel)s	%(duration)s" "ytsearch10:$Q" 2>/dev/null | planner pick
-  else
-    ENC="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote_plus(sys.argv[1]))' "$Q")"
-    curl -s --max-time 10 -A "Mozilla/5.0 (X11; Linux x86_64)" -H "Accept-Language: en" \
-      "https://www.youtube.com/results?search_query=$ENC" | grep -o '"videoId":"[A-Za-z0-9_-]\{11\}"' \
-      | awk -F'"' '!seen[$4]++ {print $4}' | head -3 | shuf -n1
-  fi
-}
 
-ID="$(pick_id)"
-if [ -z "$ID" ]; then
-  ENC="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote_plus(sys.argv[1]))' "$Q")"
-  setsid -f xdg-open "https://www.youtube.com/results?search_query=$ENC" >/dev/null 2>&1
-  echo "couldn't pick a video; opened the search instead"; exit 0
-fi
-URL="https://www.youtube.com/watch?v=$ID"
-planner learn 2>/dev/null
+# ---------------------------------------------------------------- playing
+def mpv_cmd(args):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.5)
+        s.connect(SOCK)
+        s.sendall((json.dumps({"command": args}) + "\n").encode())
+        data = s.recv(65536).decode(errors="replace")
+        s.close()
+        for line in data.splitlines():
+            j = json.loads(line)
+            if "error" in j:
+                return j
+    except Exception:
+        return None
+    return None
 
-if command -v mpv >/dev/null 2>&1 && command -v yt-dlp >/dev/null 2>&1; then
-  pkill -f -- "--title=friday-music" 2>/dev/null
-  TITLE="$(timeout 10 yt-dlp --print title "$URL" 2>/dev/null)"
-  setsid -f mpv --no-video --really-quiet --title=friday-music --force-media-title="${TITLE:-$Q}" \
-    --ytdl-format='bestaudio/best' "$URL" >/dev/null 2>&1
-  echo "${TITLE:-$Q}" > "$D/music-now"
-  echo "playing in the background: ${TITLE:-$Q}"
-else
-  setsid -f xdg-open "$URL&autoplay=1" >/dev/null 2>&1
-  echo "$URL" > "$D/music-now"
-  echo "playing in your browser: $URL"
-fi
+
+def player_pid():
+    """Friday's own mpv, by the pid it was started with (checked, so a reused pid is never mistaken for it)."""
+    try:
+        pid = int(open(PIDF).read().strip())
+        argv = open("/proc/%d/cmdline" % pid, "rb").read().split(b"\0")
+        if os.path.basename(argv[0].decode(errors="replace")) == "mpv" and TITLE_TAG.encode() in argv:
+            return pid
+    except Exception:
+        pass
+    return None
+
+
+def playing():
+    return player_pid() is not None
+
+
+def now_info():
+    try:
+        with open(NOWJ) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def note_end(state, explicit_skip=False):
+    """The current track is being replaced or stopped: if you bailed early, that's a skip."""
+    info = now_info()
+    if not info.get("id") or not state["plays"]:
+        return
+    last = state["plays"][-1]
+    if last.get("id") != info["id"] or last.get("ended"):
+        return
+    listened = time.time() - last.get("t", time.time())
+    last["ended"] = int(time.time())
+    if explicit_skip or listened < 45:
+        last["skipped"] = True
+        bump(state, last.get("seed"), -0.6 if explicit_skip else -0.4)
+    elif listened > 600:
+        bump(state, last.get("seed"), +0.3)               # you let it play: a quiet thumbs-up
+
+
+def stop_player():
+    pid = player_pid()
+    if pid:
+        try:
+            os.kill(pid, 15)
+        except OSError:
+            pass
+    for p in (SOCK, PIDF):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def play(c, pl, state, why_prefix=""):
+    url = "https://www.youtube.com/watch?v=" + c["id"]
+    radio = pl["mode"] == "song"
+    if radio:
+        url += "&list=RD" + c["id"]                      # the song, then similar songs (YouTube's mix for it)
+    title = c["title"] or pl["subject"]
+    os.makedirs(RT, mode=0o700, exist_ok=True)
+    info = {"id": c["id"], "title": title, "channel": c.get("channel", ""), "mode": pl["mode"], "seed": pl.get("seed"),
+            "why": why_prefix + pl["why"], "radio": radio, "t": int(time.time()), "request": pl.get("request", "")}
+    if DRY:
+        return info, "dry-run"
+    note_end(state)
+    if shutil.which("mpv") and shutil.which("yt-dlp"):
+        stop_player()
+        cmd = ["mpv", "--no-video", "--really-quiet", TITLE_TAG, "--force-media-title=" + title,
+               "--input-ipc-server=" + SOCK, "--ytdl-format=bestaudio/best"]
+        if radio:
+            cmd += ["--ytdl-raw-options=yes-playlist=", "--prefetch-playlist=yes"]
+            if pl.get("from_next"):
+                cmd += ["--playlist-start=1"]             # "more like this": carry on from the next similar track
+        pr = subprocess.Popen(cmd + [url], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, start_new_session=True)
+        with open(PIDF, "w") as f:
+            f.write(str(pr.pid))
+        how = "background"
+    else:
+        try:
+            subprocess.Popen(["xdg-open", url + ("&index=2" if pl.get("from_next") else "") + "&autoplay=1"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            return info, "couldn't open a player (install mpv and yt-dlp, or set a default browser)"
+        how = "browser"
+    with open(NOW, "w") as f:
+        f.write(title + "\n")
+    with open(NOWJ, "w") as f:
+        json.dump(info, f)
+    state["plays"].append({"t": int(time.time()), "id": c["id"], "title": title, "channel": c.get("channel", ""),
+                           "artist": artist_of(title, c.get("channel", "")), "seed": pl.get("seed"),
+                           "request": pl.get("request", ""), "mode": pl["mode"]})
+    save_state(state)
+    return info, how
+
+
+def out(info, how, extra=None):
+    if JSON_OUT:
+        d = dict(info or {})
+        d["how"] = how
+        if extra:
+            d.update(extra)
+        print(json.dumps(d))
+    elif info:
+        if extra and extra.get("candidates"):
+            for c in extra["candidates"]:
+                print("   %5.1f  %s  [%s]" % tuple(c))
+        print(("would play" if how == "dry-run" else "playing in the background" if how == "background"
+               else "playing in your browser") + ": " + info["title"] + "  (" + info.get("why", "") + ")")
+    else:
+        print(how)
+
+
+PLANF = os.path.join(RT, "music-plan.json")
+
+
+def describe(pl):
+    """A short spoken description of a plan: "some chill afro house", "a high-energy Fred again set", "delilah"."""
+    subj = re.sub(r"\.+$", "", pl.get("subject") or "").strip()
+    label = {"high": "high-energy", "chill": "chill", "sad": "mellow", "happy": "feel-good"}.get(pl.get("energy"))
+    if pl["mode"] == "song" or not subj:
+        return subj or "something good"
+    if is_genre(subj):
+        return "some " + ((label + " ") if label and label not in subj else "") + subj
+    return "a " + ((label + " ") if label else "") + subj + " set"
+
+
+def make_plan(text, exact=False):
+    state = load_state()
+    if exact:
+        pl = {"queries": [text, text + " official audio"], "mode": "long" if LONG_WORDS.search(text.lower()) else "song",
+              "subject": text, "seed": text, "energy": None, "why": text}
+    else:
+        pl = plan(parse(text), state)
+    pl["request"] = text
+    return pl, state
+
+
+def request(text, exact=False, why_prefix="", pl=None):
+    if pl is None:
+        pl, state = make_plan(text, exact)
+    else:
+        state = load_state()
+    c, top = pick(pl, state)
+    if not c and pl["mode"] == "long":
+        pl["mode"] = "song"                                # no long set found: a song + its radio is fine too
+        c, top = pick(pl, state)
+    if not c:
+        out(None, "couldn't find anything good for that on YouTube", {"ok": False})
+        return 1
+    info, how = play(c, pl, state, why_prefix)
+    out(info, how, {"candidates": [[round(s, 1), x["title"], x["channel"]] for s, x in top]} if DRY else None)
+    return 0
+
+
+def main():
+    if not ARGS:
+        return request("something nice")
+    cmd = ARGS[0].lower()
+    state = load_state()
+    if cmd == "stop":
+        if playing():
+            note_end(state)
+            save_state(state)
+            stop_player()
+            print("stopped")
+        else:
+            print("nothing playing")
+        return 0
+    if cmd == "now":
+        info = now_info()
+        if not playing() and not (info and DRY):
+            print("nothing playing")
+            return 0
+        r = mpv_cmd(["get_property", "media-title"])
+        title = (r or {}).get("data") or info.get("title") or "something"
+        print(json.dumps({"title": title, "why": info.get("why", "")}) if JSON_OUT else title)
+        return 0
+    if cmd == "taste":
+        print(json.dumps({"seeds": seeds(), "learned": state["scores"],
+                          "taste": [[s, round(w, 2), k] for s, w, k in sorted(taste(state), key=lambda x: -x[1])],
+                          "recent": [p.get("title") for p in state["plays"][-10:]]}, indent=1))
+        return 0
+    if cmd == "row":
+        # the panel's quick picks: "For you" + your top four
+        row = [{"k": "for you", "t": "For you"}]
+        for s in seeds()[:4]:
+            label = re.sub(r"\.+$", "", s).strip()
+            label = label[:1].upper() + label[1:]
+            if len(label) > 12:
+                label = label.split()[-1].capitalize() if is_genre(s) else label.split()[0]
+            row.append({"k": s, "t": label})
+        print(json.dumps(row))
+        return 0
+    if cmd in ("like", "love"):
+        if len(ARGS) > 1:                                  # an artist playing somewhere else (Spotify, the browser…)
+            a = " ".join(ARGS[1:]).strip()[:60]
+            bump(state, a, +2)
+            state["plays"].append({"t": int(time.time()), "id": "", "title": a, "artist": a, "seed": a, "mode": "elsewhere"})
+            save_state(state)
+            print("noted: you like " + a)
+            return 0
+        info = now_info()
+        bump(state, info.get("seed"), +1.5)
+        a = artist_of(info.get("title", ""), info.get("channel", ""))
+        bump(state, a, +1.5)
+        save_state(state)
+        print("noted: you like " + (a or info.get("seed") or "this"))
+        return 0
+    if cmd in ("dislike", "next", "skip", "else"):
+        info = now_info()
+        if cmd in ("next", "skip") and info.get("radio") and playing():
+            r = mpv_cmd(["playlist-next", "weak"])
+            if r is not None and r.get("error") == "success":
+                print("next track")
+                return 0
+        if info.get("id"):
+            if cmd == "dislike":
+                state["banned"].append(info["id"])
+                bump(state, info.get("seed"), -1.5)
+                a = artist_of(info.get("title", ""), info.get("channel", ""))
+                if a and norm(a) != norm(info.get("seed") or ""):
+                    bump(state, a, -1.0)
+            note_end(state, explicit_skip=True)
+            save_state(state)
+        req = info.get("request") or "something nice"
+        if cmd == "dislike":
+            req = "something nice"                         # you didn't like that direction: back to your taste
+        return request(req, why_prefix="something else: ")
+    if cmd == "more":
+        info = now_info()
+        if not info.get("id"):
+            return request("something nice")
+        if not DRY:
+            bump(state, info.get("seed"), +0.8)
+            save_state(state)
+        pl = {"mode": "song", "subject": info.get("title", ""), "seed": info.get("seed"), "why": "more like " +
+              info.get("title", "this"), "request": info.get("request", ""), "from_next": True}
+        c = {"id": info["id"], "title": info.get("title"), "channel": info.get("channel", "")}
+        i2, how = play(c, pl, state)                       # its radio: this, then similar
+        out(i2, how)
+        return 0
+    if cmd in PRESETS and len(ARGS) == 1:
+        return request(PRESETS[cmd])                       # the panel's one-word buttons
+    if cmd == "for you":
+        return request("something nice")
+    if cmd == "--plan":                               # decide now, describe it (friday-local says it), play with --go
+        pl, _ = make_plan(" ".join(ARGS[1:]).strip() or "something nice")
+        os.makedirs(RT, mode=0o700, exist_ok=True)
+        with open(PLANF, "w") as f:
+            json.dump(pl, f)
+        print(describe(pl))
+        return 0
+    if cmd == "--go":
+        try:
+            with open(PLANF) as f:
+                pl = json.load(f)
+            os.unlink(PLANF)
+        except Exception:
+            return request("something nice")
+        return request(pl.get("request", ""), pl=pl)
+    if cmd == "--exact":
+        return request(" ".join(ARGS[1:]).strip() or "something nice", exact=True)
+    return request(" ".join(ARGS).strip())
+
+
+if __name__ == "__main__":
+    sys.exit(main())

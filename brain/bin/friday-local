@@ -37,7 +37,7 @@ HOME = os.path.expanduser("~")
 FH = os.environ.get("FRIDAY_HOME", os.path.join(HOME, ".local/share/friday"))
 BIN = os.path.join(FH, "bin")
 STATE = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.join(HOME, ".local/state")), "friday")
-RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "friday")
+RUNTIME = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/friday-%d" % os.getuid(), "friday")
 BANK = os.path.join(STATE, "phrases.json")
 os.environ["PATH"] = ":".join([BIN, HOME + "/.local/bin", "/usr/local/bin", "/usr/bin", os.environ.get("PATH", "")])
 
@@ -57,6 +57,22 @@ def load_config():
 
 load_config()
 ARGS = sys.argv[1:]
+
+
+def _first_name():
+    if os.environ.get("FRIDAY_NAME"):
+        return os.environ["FRIDAY_NAME"]
+    try:
+        import pwd
+        gecos = pwd.getpwuid(os.getuid()).pw_gecos.split(",")[0].split()
+        if gecos:
+            return gecos[0]
+        return pwd.getpwuid(os.getuid()).pw_name.capitalize()
+    except Exception:
+        return "there"
+
+
+NAME = _first_name()
 VOICE = "--voice" in ARGS
 IN_CHAT = "--in-chat" in ARGS
 RAW = ARGS[ARGS.index("--") + 1] if "--" in ARGS and ARGS.index("--") + 1 < len(ARGS) else (ARGS[-1] if ARGS else "")
@@ -162,13 +178,13 @@ P = {
     "time_late": ["It's {time}. Bit late, no?", "{time}. Shouldn't you be asleep?", "It's {time}. Night owl mode, I see."],
     "date": ["It's {weekday}, {date}.", "Today's {weekday}, {date}.", "{weekday}, {date}."],
     "time_city": ["It's {time} in {city}.", "In {city} it's {time} right now.", "{city}: {time}, {cityday}."],
-    "greet": ["Hey Onkar. What's up?", "Hey! What do you need?", "Hi. What can I do for you?", "Yo. What's the plan?"],
-    "greet_tod": ["Good {part}, Onkar. What's on your mind?", "Good {part}! What are we doing?"],
+    "greet": ["Hey {name}. What's up?", "Hey! What do you need?", "Hi. What can I do for you?", "Yo. What's the plan?"],
+    "greet_tod": ["Good {part}, {name}. What's on your mind?", "Good {part}! What are we doing?"],
     "howareyou": ["Doing great, thanks. You?", "All good here, running smooth. How about you?",
                   "Pretty good, honestly. What's up with you?", "Never better. What's going on?"],
     "thanks": ["Anytime.", "You got it.", "Happy to help.", "No problem.", "Sure thing."],
-    "bye": ["Later, Onkar.", "See you.", "Catch you later.", "Bye for now."],
-    "night": ["Goodnight, Onkar. Sleep well.", "Night! Get some rest.", "Goodnight. See you tomorrow."],
+    "bye": ["Later, {name}.", "See you.", "Catch you later.", "Bye for now."],
+    "night": ["Goodnight, {name}. Sleep well.", "Night! Get some rest.", "Goodnight. See you tomorrow."],
     "identity": ["I'm Friday, your assistant on this laptop. Claude's brain, your machine's hands.",
                  "Friday. I run your desktop, and Claude does the heavy thinking."],
     "abilities": ["The everyday stuff happens right here, even offline: time, timers, reminders, volume, brightness, "
@@ -189,7 +205,13 @@ P = {
     "prev": ["Going back.", "Previous track."],
     "nothing_playing": ["Nothing's playing right now.", "There's nothing playing at the moment."],
     "now_playing": ["That's {track}.", "You're listening to {track}.", "This is {track}."],
-    "play": ["Playing {what}.", "On it, {what} coming up.", "Here's some {what}."],
+    "play": ["Playing {what}.", "On it, {what} coming up.", "Here's {what}."],
+    "play_taste": ["Got you. Putting on something you'll like.", "Here's something in your lane.",
+                   "On it, something good coming up.", "Picked one for you, give it a sec."],
+    "play_pick": ["Here's {what}.", "Putting on {what}.", "Okay, {what}, coming up."],
+    "music_like": ["Noted, more of that.", "Good to know, I'll remember you like this.", "Saved that to your taste."],
+    "music_dislike": ["Fair, switching it up.", "Got it, not that. Finding something better.", "Noted. Trying something else."],
+    "music_more": ["More like this, coming up.", "Keeping this vibe going.", "On it, similar stuff next."],
     "stop_music": ["Stopped the music.", "Music off."],
     "open": ["Opening {app}.", "{app}, coming up.", "Launching {app}."],
     "open_site": ["Opening {site}.", "Here's {site}."],
@@ -301,6 +323,7 @@ def say(intent, **kw):
         os.replace(LAST + ".tmp", LAST)
     except OSError:
         pass
+    kw.setdefault("name", NAME)
     out = choice.format(**{k: v for k, v in kw.items()})
     return out[:1].upper() + out[1:] if out else out
 
@@ -599,6 +622,9 @@ def k_media(t):
         run(["playerctl", "play"])
         return reply("media", say("resume"))
     if re.fullmatch(r"(next|skip)( (song|track|one|this))?|skip (this|it|the)( song| track| one)?|play (the )?next( song| track)?|next please", t):
+        if friday_music_on():
+            spawn([os.path.join(BIN, "friday-music"), "next"])
+            return reply("media", say("next"))
         if not players():
             return reply("media", say("nothing_playing"))
         run(["playerctl", "next"])
@@ -615,23 +641,60 @@ def k_media(t):
         if code != 0 or not out:
             return reply("media", say("nothing_playing"))
         return reply("media", say("now_playing", track=out.replace(" — ", ", ") if VOICE else out))
-    m = re.fullmatch(r"play (some |a |me (some )?|the )?(.+?)( (music|songs|playlist|mix|on youtube))?", t)
+    # your taste: "I like this", "not this", "more like this"
+    fm = friday_music_on()
+    if re.fullmatch(r"(i (really )?(like|love|dig) (this|it|this song|this one|this track|this mix|this set)|this (is )?(fire|a banger|"
+                    r"so good|great|amazing|sick|heat)|(good|great|nice) (song|track|pick|choice|one)|banger|save this( song)?)", t):
+        if not fm:
+            if not players():
+                return None
+            code, out = run(["playerctl", "metadata", "--format", "{{artist}}"])
+            if code == 0 and out.strip():
+                run([os.path.join(BIN, "friday-music"), "like", out.strip()])   # Spotify, the browser…: still learn it
+            return reply("music", say("music_like"))
+        run([os.path.join(BIN, "friday-music"), "like"])
+        return reply("music", say("music_like"))
+    if fm and re.fullmatch(r"(i (don't|do not|dont) (like|love) (this|it|this song|this one)|not this( one| song)?|nah( not this)?|"
+                           r"(play )?something else|change (the |this )?(song|track|music|it)|i hate (this|it)|this (is )?(bad|"
+                           r"boring|trash|mid)|not feeling (this|it)|next vibe)", t):
+        spawn([os.path.join(BIN, "friday-music"), "dislike"])
+        return reply("music", say("music_dislike"))
+    if fm and re.fullmatch(r"(play )?more (like|of) (this|that|it)|(keep|more of) (this|the) (vibe|going)|similar (songs|music|stuff)|"
+                           r"play (something )?similar", t):
+        spawn([os.path.join(BIN, "friday-music"), "more"])
+        return reply("music", say("music_more"))
+    m = re.fullmatch(r"(?:(?:can you |could you |please )?(?:play|put on|throw on|queue up|blast|start playing|spin)) (.+?)( please)?", t)
     if m:
-        what = m.group(3).strip()
-        if what in ("music", "something", "some music", "a song", "songs", "anything"):
-            if players():
-                run(["playerctl", "play"])
-                return reply("media", say("resume"))
-        if re.search(r"\b(screen|video|game|file|folder|this|that|it|from|here|there|movie|episode|podcast)\b", what):
+        what = m.group(1).strip()
+        if what in ("music", "some music", "the music", "my music") and players():
+            run(["playerctl", "play"])                       # something paused: carry on with it
+            return reply("media", say("resume"))
+        if re.search(r"\b(screen|video|game|file|folder|this|that|it|from|here|there|movie|episode|podcast|audiobook|"
+                     r"recording|voice ?note)\b", what) and not re.search(r"\b(something|songs?|music|mix|set)\b", what):
             return None
-        if " and " in what and not re.search(r"(drum and bass|rock and roll|r and b|rhythm and blues)", what):
-            return None
+        if " and " in what and not re.search(r"(drum and bass|rock and roll|r and b|rhythm and blues|\w+ and \w+ mix)", what) \
+                and re.search(r"\b(open|then|also|turn|set|remind|call|send)\b", what):
+            return None                                       # "play X and open Y": a job for Claude
         if not online():
             return reply("need_online", say("need_online"))
-        code, planned = run([os.path.join(BIN, "friday-music"), "--say", what])    # taste decides what "something nice" means
-        spoken = planned.strip().splitlines()[-1] if code == 0 and planned.strip() else what
-        spawn([os.path.join(BIN, "friday-music"), "--go"])
-        return reply("music", say("play", what=spoken))
+        # it understands the whole request and your taste; it decides now so Friday can say what it picked
+        code, desc = run([os.path.join(BIN, "friday-music"), "--plan", t], timeout=4)
+        spawn([os.path.join(BIN, "friday-music"), "--go" if code == 0 else t])
+        desc = desc.strip().splitlines()[-1] if code == 0 and desc.strip() else ""
+        if not desc or desc == "something good":
+            return reply("music", say("play_taste"))
+        return reply("music", say("play_pick", what=desc))
+
+
+def friday_music_on():
+    """Is Friday's own music player the one playing?"""
+    try:
+        rt = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/friday-%d" % os.getuid(), "friday")
+        pid = int(open(os.path.join(rt, "mpv-music.pid")).read().strip())
+        argv = open("/proc/%d/cmdline" % pid, "rb").read().split(b"\0")
+        return os.path.basename(argv[0].decode(errors="replace")) == "mpv" and b"--title=friday-music" in argv
+    except Exception:
+        return False
 
 
 SITES = {
