@@ -144,11 +144,26 @@ project-friday offline remove small    # free the space again
 | Size | Model | Download | Runs well on | Good for |
 |---|---|---|---|---|
 | `small` | `qwen3:1.7b` | 1.4 GB | any laptop | quick answers, basic tasks |
-| `balanced` | `qwen3:4b` | 2.5 GB | 8 GB RAM | a good everyday helper |
-| `smart` | `qwen3:8b` | 5.2 GB | 16 GB RAM or a 6 GB GPU | noticeably smarter |
-| `smartest` | `qwen3:14b` | 9.3 GB | 32 GB RAM or a 12 GB GPU | best quality |
+| `balanced` | `qwen3:4b` | 2.5 GB | 8 GB RAM | a good everyday helper (recommended without a GPU) |
+| `smart` | `qwen3:8b` | 5.2 GB | a 6 GB GPU (16 GB RAM works, but slow and heavy) | noticeably smarter |
+| `smartest` | `qwen3:14b` | 9.3 GB | a 12 GB GPU (32 GB RAM works, but slow and heavy) | best quality |
 
 Any other [Ollama model](https://ollama.com/library) that supports tools works too (`project-friday offline use gemma3:4b`), or point `project-friday set local-url http://127.0.0.1:8080/v1/chat/completions` at another server on your machine (llama.cpp, LM Studio). It answers in the same panel and voice, can still run commands, read files and use Friday's helpers (through the same guard, so the same things are allowed, asked about or refused), and says once per chat that it's standing in; when Claude's back, Claude picks up the chat. Be realistic about it: a small local model is good for questions, quick tasks and chat, slower on a CPU-only laptop, and no match for Claude on big jobs. It'll say so.
+
+## Staying light
+
+Friday is meant to cost nothing when you're not using it:
+
+| Part | While you're not using it | While it works |
+|---|---|---|
+| **Panel** | unmapped: no window, no compositor or blur work, nothing drawn | a normal window |
+| **Supervisor** (`friday-start`) | waits on the panel's process, no polling | — |
+| **Offline brain** | not running: the model leaves memory 2 minutes after an answer and Friday stops Ollama's server shortly after | runs at low CPU/disk priority on half your cores, one model at a time |
+| **Voice, wake word off** | no microphone, no models in memory (unloaded 5 minutes after you last talked) | loads when you press the talk key |
+| **Voice, wake word on** | a small always-on listener plus the speech model in memory (~0.5 GB); while a video or music is playing it only checks clear "Hey Friday"s, and backs off after false alarms | |
+| **Background** | Claude usage every 15 minutes (3 while the panel is open; `usage-check off` stops it), a phrase refresh once a week | |
+
+`project-friday status` shows what Friday is using right now. Tune it: `set local-keep 30s` (less RAM) or `10m` (faster follow-ups), `set local-threads 2`, `set voice-unload 2`, `set stt-threads 2`; `project-friday offline stop` frees the offline brain immediately. On a laptop without a GPU, the `small` or `balanced` offline brain is the sweet spot: every reply runs on your CPU, and the bigger ones make it work much harder. If Ollama was installed with its own installer, it runs as a system service all the time; Friday doesn't need that (`sudo systemctl disable --now ollama`).
 
 ## Modes and settings
 

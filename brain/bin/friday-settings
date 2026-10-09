@@ -31,6 +31,9 @@ S = [
     ("local-model", "FRIDAY_LOCAL_MODEL", None, "", "the offline brain's Ollama model (empty = the best one you've pulled; "
      "project-friday offline setup picks one)", False),
     ("local-url", "FRIDAY_LOCAL_URL", None, "", "use another local model server instead (llama.cpp, LM Studio: an OpenAI-style URL)", False),
+    ("local-keep", "FRIDAY_LOCAL_KEEP", None, "2m", "how long the offline model stays in memory after answering "
+     "(e.g. 30s, 2m, 10m; shorter = less RAM, longer = faster follow-ups)", False),
+    ("local-threads", "FRIDAY_LOCAL_THREADS", None, "auto", "CPU threads the offline model may use (auto = half your cores)", False),
     ("local-skills", "FRIDAY_LOCAL", ["on", "off"], "on", "answer everyday things on the laptop first (time, timers, volume, music…)", False),
     # -- voice
     ("speak", "FRIDAY_SPEAK", ["on", "off"], "on", "read answers aloud when you talk to Friday", True),
@@ -44,6 +47,9 @@ S = [
     ("stt-device", "FRIDAY_STT_DEVICE", ["auto", "cpu", "cuda"], "auto", "where speech recognition runs", True),
     ("silence", "FRIDAY_SILENCE_END", None, "1.1", "seconds of quiet that end what you're saying", True),
     ("vocab", "FRIDAY_VOCAB", None, "", "names and jargon speech recognition should expect (comma separated)", True),
+    ("stt-threads", "FRIDAY_STT_THREADS", None, "auto", "CPU threads speech recognition may use (auto = half, max 4)", True),
+    ("voice-unload", "FRIDAY_VOICE_UNLOAD", None, "5", "minutes before unused speech models leave memory (the wake word keeps "
+     "recognition loaded)", True),
     ("voice-debug", "FRIDAY_VOICE_DEBUG", ["0", "1"], "0", "log what you say and every wake-word guess to the voice log", True),
     # -- you
     ("name", "FRIDAY_NAME", None, "", "what Friday calls you (empty = first name on your account)", False),
@@ -148,7 +154,11 @@ def cmd_list():
     text = read_cfg()
     print("%sFriday settings%s  %s(mode: %s · change with: project-friday set NAME VALUE · %s)%s" %
           (B, N, D, mode_of(text), CFG.replace(HOME, "~"), N))
-    groups = [("Brain", S[:6]), ("Voice", S[6:16]), ("You", S[16:20]), ("Privacy & background", S[20:])]
+    def grp(first, last):
+        names = [x[0] for x in S]
+        return S[names.index(first):names.index(last) + 1]
+    groups = [("Brain", grp("brain", "local-skills")), ("Voice", grp("speak", "voice-debug")),
+              ("You", grp("name", "rom-dirs")), ("Privacy & background", grp("phrases", "input-trust"))]
     for title, items in groups:
         print("\n" + B + title + N)
         for name, var, choices, default, desc, _ in items:

@@ -54,6 +54,19 @@ NO_SPEECH_TIMEOUT = 6.0
 MAX_UTTERANCE = 25.0
 MAX_GAIN = float(os.environ.get("FRIDAY_MAX_GAIN", "10"))       # software gain ceiling for quiet mics
 DEBUG = os.environ.get("FRIDAY_VOICE_DEBUG", "") == "1"
+# Efficiency: speech models leave memory after this many minutes unused (the wake word keeps Whisper loaded,
+# since it needs it), and transcription uses at most this many CPU threads (leave the rest for you).
+UNLOAD_AFTER = float(os.environ.get("FRIDAY_VOICE_UNLOAD", "5")) * 60
+
+
+def _stt_threads():
+    v = os.environ.get("FRIDAY_STT_THREADS", "auto")
+    if v.isdigit() and int(v) > 0:
+        return int(v)
+    return max(2, min(4, (os.cpu_count() or 4) // 2))
+
+
+STT_THREADS = _stt_threads()
 WAKE_PHRASES = ["hey friday", "okay friday", "hi friday", "friday"]
 HALLUCINATIONS = {"thank you", "thanks for watching", "you", "bye", "thank you so much", "thanks"}
 WAKE_RE = re.compile(r"\b(hey|hi|okay|ok|hay)\W{0,2}\s*fri\s*-?\s*day\b(?!'?s)", re.I)
@@ -234,6 +247,25 @@ class Engines:
         self._lock = threading.Lock()
         self._load_lock = threading.Lock()
         self._piper_lock = threading.Lock()
+        self.used = time.time()                 # last time a model did any work (for unloading when idle)
+
+    def unload_idle(self, keep_whisper):
+        """Give the memory back when Friday hasn't needed its ears or voice for a while."""
+        if time.time() - self.used < UNLOAD_AFTER:
+            return
+        freed = []
+        if self.whisper is not None and not keep_whisper and not self._lock.locked():
+            with self._load_lock:
+                self.whisper = None
+            freed.append("whisper")
+        if self.piper is not None:
+            with self._piper_lock:
+                self.piper = None
+            freed.append("piper")
+        if freed:
+            import gc
+            gc.collect()
+            log("idle: unloaded %s" % ", ".join(freed))
 
     def load_core(self):
         try:
@@ -276,10 +308,11 @@ class Engines:
 
             def load(name):
                 # Use the copy friday-voice-setup downloaded without touching the network; only fetch if missing.
+                kw = dict(device=dev, compute_type=ct, download_root=root, cpu_threads=STT_THREADS)
                 try:
-                    return WhisperModel(name, device=dev, compute_type=ct, download_root=root, local_files_only=True)
+                    return WhisperModel(name, local_files_only=True, **kw)
                 except Exception:
-                    return WhisperModel(name, device=dev, compute_type=ct, download_root=root)
+                    return WhisperModel(name, **kw)
 
             self.whisper = load(STT_MODEL)
             log("whisper ready:", STT_MODEL, dev, ct)
@@ -294,6 +327,7 @@ class Engines:
         if self.piper is not None:
             return
         try:
+            self.used = time.time()
             from piper import PiperVoice
             onnx = os.path.join(VOICE_DIR, "piper", PIPER_VOICE + ".onnx")
             if os.path.exists(onnx):
@@ -307,6 +341,7 @@ class Engines:
         model = self.whisper
         if model is None or self.np is None or not pcm:
             return None
+        self.used = time.time()
         audio = self.np.frombuffer(pcm, dtype=self.np.int16).astype(self.np.float32) / 32768.0
         peak = float(self.np.max(self.np.abs(audio))) if audio.size else 0.0
         if 0 < peak < 0.5:                                  # quiet mic: bring speech up to a healthy level
@@ -534,6 +569,9 @@ class Voice:
         self.speak_beat = 0.0                   # last sign of life from the speaker thread
         self.last_wake = 0.0
         self.last_check = 0.0
+        self.rejects = collections.deque(maxlen=8)    # recent false wakes: a video talking? check less often
+        self.media_until = 0.0
+        self.media_on = False
         self.levels = collections.deque(maxlen=60)    # last ~6 s of idle levels, for the noise floor
         self.raw_ring = collections.deque(maxlen=self.ring.maxlen)     # raw level of each chunk in the ring
         self.cand_peak = 0.0
@@ -592,6 +630,7 @@ class Voice:
             self.wake_on = True
             self.state = self.IDLE
             self.mic.start()
+            threading.Thread(target=self.e.load_whisper, daemon=True).start()   # the wake check needs it
             emit("ready", wake=True)
         elif c.startswith("say+ "):           # append a sentence to what Friday is saying
             try:
@@ -638,8 +677,9 @@ class Voice:
             play(self.sound_soft if followup else self.sound_on)
         if not quiet:
             emit("prewake" if pending else "wake")
-        # Whisper loads lazily the first time you talk, then stays warm.
-        threading.Thread(target=self.e.load_whisper, daemon=True).start()
+        # Whisper loads when you actually talk to Friday (it's already loaded while the wake word is on).
+        if not quiet:
+            threading.Thread(target=self.e.load_whisper, daemon=True).start()
 
     def after_listen(self):
         self.cmd_rec = None
@@ -667,6 +707,7 @@ class Voice:
                     if self.partial and self.clean(self.partial):
                         emit("partial", text=self.clean(self.partial))
                 else:
+                    self.rejects.append(now)
                     log("wake rejected (heard %s, level %.4f%s)" % (said(heard), self.cand_peak, ", quiet" if self.quiet else ""))
                     self.state = self.IDLE if self.wake_on else self.MUTED
                     if not self.quiet:                   # nothing was shown for a quiet check: nothing to undo
@@ -804,6 +845,14 @@ class Voice:
         now = time.time()
         if not hit or now - self.last_wake < 2.0 or now - self.last_check < 1.0:
             return
+        # Each check runs Whisper, which is the expensive part. When something keeps sounding like "Friday"
+        # (a video, a call, music), only clear "hey Friday"s are checked, and less often.
+        recent = [t for t in self.rejects if now - t < 90]
+        if (len(recent) >= 2 or self.media_playing(now)) and not strong:
+            self.wake_rec.Reset()
+            return
+        if len(recent) >= 4 and now - self.last_check < 4.0:
+            return
         self.wake_rec.Reset()
         self.last_check = now
         if self.e.whisper is None:
@@ -817,6 +866,17 @@ class Voice:
         debug("candidate: strong=%s level %.4f noise %.4f -> checking" % (strong, self.cand_peak, self.noise))
         self.begin_listen(chime_on=True, pending=True, quiet=True)
         threading.Thread(target=self._verify, args=(ring,), daemon=True).start()
+
+    def media_playing(self, now):
+        """Is something playing right now (video, music)? Asked at most every 10 s."""
+        if now > self.media_until:
+            self.media_until = now + 10
+            try:
+                r = subprocess.run(["playerctl", "-a", "status"], capture_output=True, text=True, timeout=1)
+                self.media_on = "Playing" in r.stdout
+            except Exception:
+                self.media_on = False
+        return self.media_on
 
     def _verify(self, ring):
         try:
@@ -984,16 +1044,22 @@ class Voice:
             emit("ready", wake=True)
         else:
             emit("muted")
-        # warm the models in the background so the first request is fast
-        threading.Thread(target=lambda: (self.e.load_whisper(), self.e.load_piper()), daemon=True).start()
+        # The wake word needs Whisper ready to check you; with it off, nothing loads until you talk to Friday.
+        if self.wake_on:
+            threading.Thread(target=self.e.load_whisper, daemon=True).start()
+        last_tidy = time.time()
         while True:
             try:
                 while True:
                     self.handle(self.cmds.get_nowait())
             except queue.Empty:
                 pass
+            if time.time() - last_tidy > 30:
+                last_tidy = time.time()
+                if self.state in (self.IDLE, self.MUTED) and not (self.speaker and self.speaker.is_alive()):
+                    self.e.unload_idle(keep_whisper=self.wake_on)
             if self.state in (self.MUTED,) and self.cmd_rec is None:
-                time.sleep(0.1)
+                time.sleep(0.25)
                 continue
             chunk = self.mic.read(0.15)
             if chunk is None:

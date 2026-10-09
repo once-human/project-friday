@@ -43,6 +43,7 @@ ${B}Offline brain${N} (free model on this laptop: works with no internet or Clau
   offline models             the sizes and which one suits this laptop
   offline use MODEL          switch model (a tier or any Ollama model; downloads it if needed)
   offline remove MODEL       delete a downloaded model
+  offline stop               free its memory now (it also stops by itself when idle)
   offline status · test      what's set up · ask it something
 
 ${B}Voice & music${N}
@@ -77,6 +78,12 @@ case "$cmd" in
   status)
     echo "${B}Project Friday${N} $("$0" version 2>/dev/null)  ·  mode: $(NO_COLOR=1 "$BIN/friday-settings" mode 2>/dev/null | head -1 | sed 's/^Mode: //')"
     if running; then ok "running"; else bad "not running  ($ME start)"; fi
+    # what Friday costs right now (memory, CPU) — the panel, the voice, and the offline model if it's loaded
+    mem() { local p; p="$(pgrep -f -- "$1" | tr '\n' ',' | sed 's/,$//')"; [ -n "$p" ] && ps -o rss=,pcpu= -p "$p" 2>/dev/null | awk '{m+=$1; c+=$2} END {printf "%d %.0f", m/1024, c}'; }
+    read -r qm qc <<<"$(mem "$QS")"; read -r vm vc <<<"$(mem 'friday_voice[.]py')"; read -r om oc <<<"$(mem '(^|/)ollama (serve|runner)')"
+    parts="panel ${qm:-0} MB"; [ -n "$vm" ] && parts+=", voice $vm MB"; [ -n "$om" ] && parts+=", offline model $om MB"
+    tot=$(( ${qm:-0} + ${vm:-0} + ${om:-0} )); cpu=$(( ${qc:-0} + ${vc:-0} + ${oc:-0} ))
+    ok "using ${tot} MB, ${cpu}% CPU right now ($parts)"
     pgrep -f -- "friday-start$" >/dev/null && ok "auto-restart on" || meh "auto-restart off (it starts at your next login)"
     pgrep -f -- "friday_voice.py" >/dev/null && ok "voice on" || { [ -d "$FH/.venv" ] && meh "voice installed, not running" || meh "voice not installed  ($ME voice setup)"; }
     if command -v claude >/dev/null || [ -x "$HOME/.local/bin/claude" ]; then
@@ -137,6 +144,13 @@ for l in sys.stdin:
         if [ -n "${1:-}" ] && [[ "$1" != -* ]]; then exec "$BIN/friday-offline-setup" --model "$1" "${@:2}"; fi
         exec "$BIN/friday-offline-setup" "$@" ;;
       models|sizes|list) exec "$BIN/friday-offline-setup" --models ;;
+      stop|unload)
+        if pgrep -u "$(id -u)" -f -- '(^|/)ollama serve' >/dev/null; then
+          pkill -u "$(id -u)" -f -- '(^|/)ollama serve'; echo "Stopped the offline brain (it starts again by itself when it's needed)."
+        elif pgrep -f -- '(^|/)ollama serve' >/dev/null; then
+          echo "Ollama is running as a system service. Friday doesn't need that (it starts Ollama on demand):"
+          echo "  sudo systemctl disable --now ollama"
+        else echo "The offline brain isn't running."; fi ;;
       use|switch)
         [ -n "${2:-}" ] || die "usage: $ME offline use small|balanced|smart|smartest|<ollama model>"
         "$BIN/friday-offline-setup" --model "$2" --yes ;;
