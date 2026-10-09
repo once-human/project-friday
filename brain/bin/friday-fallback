@@ -1,99 +1,554 @@
 #!/usr/bin/env python3
-"""friday-fallback — answer one Friday turn with a free model when Claude's usage limit is hit.
+"""friday-fallback — Friday's backup brain for when Claude's usage limit is reached (or Claude is down).
 
-Called by friday-ask. Reads the system prompt from $FRIDAY_FB_SYSTEM and the request from stdin, and prints
-the same stream-json events Claude Code does, so the panel can't tell the difference.
+    friday-fallback --wrap CLAUDE ARGS…   run Claude Code; if it comes back with "limit reached" (or overloaded),
+                                          answer with the backup model instead. stdin = the request. (friday-ask uses this)
+    friday-fallback --run                 answer with the backup model directly. stdin = the request.
+    friday-fallback --limited             exit 0 if friday-usage says you're at your limit right now (prints the reset time)
+    friday-fallback --transcript ID       a backup chat as plain text (so Claude can pick it up once it's back)
+    friday-fallback --status              which backup model would answer, and why
 
-It can talk but it can't act: no shell, no files. On-device skills (music, volume, timers…) are unaffected.
+The backup is a free model you choose in config.env (keys stay in that file, which Friday's guard never lets Claude
+write and asks before Claude reads):
+    GEMINI_API_KEY=…      Google Gemini Flash, free key at https://aistudio.google.com/apikey   (best free option)
+    GROQ_API_KEY=…        Groq, free key at https://console.groq.com/keys                       (very fast)
+    OPENROUTER_API_KEY=…  OpenRouter's free models, https://openrouter.ai/keys
+    Ollama                runs on this laptop, nothing leaves it: https://ollama.com (no key; used if it's running)
+    FRIDAY_FALLBACK=auto|gemini|groq|openrouter|ollama|custom|off     (auto tries them in that order)
+    FRIDAY_FALLBACK_MODEL=…   override the model; custom also needs FRIDAY_FALLBACK_URL and FRIDAY_FALLBACK_KEY
 
-Providers, first one that's configured wins (keys go in ~/.local/share/friday/config.env):
-  FRIDAY_FALLBACK_URL + FRIDAY_FALLBACK_KEY [+ FRIDAY_FALLBACK_MODEL]   any OpenAI-compatible endpoint
-  OPENROUTER_API_KEY   free models on OpenRouter   (FRIDAY_FALLBACK_MODEL to choose; ":free" ones cost nothing)
-  GEMINI_API_KEY       Google AI Studio free tier  (OpenAI-compatible endpoint)
-  Ollama on localhost:11434   fully offline, uses whichever model you've pulled
+It can still act: it runs commands, reads files and looks at the screen through the same friday-approve guard
+Claude uses, so the same things are allowed, asked about, or refused.
 """
-import json, os, sys, urllib.error, urllib.request
+import base64
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
 
-SYSTEM = os.environ.get("FRIDAY_FB_SYSTEM", "")
-NOTE = ("\n\nNote: Onkar's Claude usage limit is used up, so you are running on a backup model for now. You cannot "
-        "run commands, open files or look at the screen right now. Answer from what you know and the desktop "
-        "context in the request, be upfront (one short clause) if he's asking for something that needs those, and "
-        "never claim you did something you didn't. On-device things like music, volume and timers still work "
-        "without you.")
+sys.dont_write_bytecode = True
+HOME = os.path.expanduser("~")
+FH = os.environ.get("FRIDAY_HOME", os.path.join(HOME, ".local/share/friday"))
+RT = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/friday-%d" % os.getuid(), "friday")
+CHATS = os.path.join(RT, "fallback")
+KEYS = ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "FRIDAY_FALLBACK_KEY")
+MAX_ROUNDS = 8
+LIMIT_ERR = re.compile(r"usage limit|limit reached|hit your (usage )?limit|out of (extra )?usage|weekly limit|"
+                       r"5-hour limit|session limit|limit will reset|resets? (at )?\d|rate[_ ]limit|overloaded|"
+                       r"api error: (5\d\d|429)|\b529\b", re.I)
+LIMIT_TEXT = re.compile(r"^\s*(claude( ai)? usage limit reached|you'?ve (hit|reached) your (usage |session |weekly )?limit|"
+                        r"(5-hour|weekly|session|usage) limit reached)", re.I)
 
 
-def emit(o):
-    print(json.dumps(o, ensure_ascii=False), flush=True)
-
-
-def providers():
-    e = os.environ.get
-    if e("FRIDAY_FALLBACK_URL"):
-        yield ("custom", e("FRIDAY_FALLBACK_URL").rstrip("/"), e("FRIDAY_FALLBACK_KEY", ""), e("FRIDAY_FALLBACK_MODEL", ""))
-    if e("OPENROUTER_API_KEY"):
-        yield ("OpenRouter", "https://openrouter.ai/api/v1", e("OPENROUTER_API_KEY"),
-               e("FRIDAY_FALLBACK_MODEL", "meta-llama/llama-3.3-70b-instruct:free"))
-    if e("GEMINI_API_KEY"):
-        yield ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", e("GEMINI_API_KEY"),
-               e("FRIDAY_FALLBACK_MODEL", "gemini-2.5-flash"))
-    try:                                                         # a local Ollama, if one is running
-        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as r:
-            models = [m["name"] for m in json.load(r).get("models", [])]
-        if models:
-            yield ("Ollama", "http://127.0.0.1:11434/v1", "ollama", e("FRIDAY_FALLBACK_MODEL", models[0]))
-    except Exception:
+def load_config():
+    """config.env is a shell file; pick up plain NAME=value lines (keys, FRIDAY_* settings)."""
+    try:
+        with open(os.path.join(FH, "config.env")) as f:
+            for line in f:
+                m = re.match(r"\s*(?:export\s+)?([A-Z][A-Z0-9_]*)=(.*)", line)
+                if m and m.group(1) not in os.environ:
+                    v = m.group(2).strip()
+                    if v[:1] in "\"'" and v.count(v[0]) >= 2:
+                        v = v[1:v.index(v[0], 1)]
+                    else:
+                        v = v.split(" #")[0].strip()
+                    os.environ[m.group(1)] = v
+    except OSError:
         pass
 
 
-def stream(base, key, model, prompt):
-    body = json.dumps({"model": model, "stream": True, "temperature": 0.7, "messages": [
-        {"role": "system", "content": SYSTEM + NOTE}, {"role": "user", "content": prompt}]}).encode()
-    req = urllib.request.Request(base + "/chat/completions", data=body, headers={
-        "Content-Type": "application/json", "Authorization": "Bearer " + key,
-        "HTTP-Referer": "https://github.com/once-human/project-friday", "X-Title": "Friday"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        for raw in r:
-            line = raw.decode("utf-8", "replace").strip()
-            if not line.startswith("data:"):
-                continue
-            data = line[5:].strip()
-            if data == "[DONE]":
-                return
+load_config()
+
+
+def emit(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------- is Claude out of usage?
+def usage_limit():
+    """(limited, reset_epoch) from friday-usage's cache, if it's fresh."""
+    try:
+        with open(os.path.join(RT, "usage.json")) as f:
+            u = json.load(f)
+    except Exception:
+        return False, None
+    if not u.get("ok") or time.time() - u.get("updated", 0) > 20 * 60:
+        return False, None
+    now, hit = time.time(), []
+    for k in ("five_hour", "seven_day"):
+        v = u.get(k) or {}
+        if (v.get("pct") or 0) >= 100 and (v.get("resets_at") or 0) > now:
+            hit.append(v["resets_at"])
+    return (True, max(hit)) if hit else (False, None)
+
+
+def reset_from_text(msg):
+    m = re.search(r"\|(\d{10})\b", msg or "")
+    if m:
+        return int(m.group(1))
+    m = re.search(r"resets?\s+(?:at\s+)?([0-9]{1,2}(?::[0-9]{2})?\s*(?:am|pm)?)", msg or "", re.I)
+    return m.group(1).strip() if m else None
+
+
+def when(reset):
+    if not reset:
+        _, reset = usage_limit()
+    if isinstance(reset, (int, float)):
+        t = time.localtime(reset)
+        s = time.strftime("%-I:%M %p", t).lower().replace(":00 ", " ")
+        if time.strftime("%Y%m%d", t) != time.strftime("%Y%m%d"):
+            s = time.strftime("%a ", t) + s
+        return s
+    return reset or ""
+
+
+# ---------------------------------------------------------------- the backup model
+def providers():
+    pick = (os.environ.get("FRIDAY_FALLBACK") or "auto").lower()
+    model = os.environ.get("FRIDAY_FALLBACK_MODEL")
+    out = []
+    gem = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if gem and pick in ("auto", "gemini"):
+        out.append({"name": "Gemini", "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                    "key": gem, "model": (pick == "gemini" and model) or os.environ.get("FRIDAY_GEMINI_MODEL") or
+                    "gemini-flash-latest", "vision": True})
+    if os.environ.get("GROQ_API_KEY") and pick in ("auto", "groq"):
+        out.append({"name": "Groq", "url": "https://api.groq.com/openai/v1/chat/completions",
+                    "key": os.environ["GROQ_API_KEY"], "model": (pick == "groq" and model) or
+                    os.environ.get("FRIDAY_GROQ_MODEL") or "openai/gpt-oss-120b", "vision": False})
+    if os.environ.get("OPENROUTER_API_KEY") and pick in ("auto", "openrouter"):
+        out.append({"name": "OpenRouter", "url": "https://openrouter.ai/api/v1/chat/completions",
+                    "key": os.environ["OPENROUTER_API_KEY"], "model": (pick == "openrouter" and model) or
+                    os.environ.get("FRIDAY_OPENROUTER_MODEL") or "openrouter/free", "vision": False})
+    if pick == "custom" and os.environ.get("FRIDAY_FALLBACK_URL") and model:
+        out.append({"name": "your backup model", "url": os.environ["FRIDAY_FALLBACK_URL"],
+                    "key": os.environ.get("FRIDAY_FALLBACK_KEY", ""), "model": model,
+                    "vision": os.environ.get("FRIDAY_FALLBACK_VISION") == "1"})
+    if pick in ("auto", "ollama"):
+        o = ollama((pick == "ollama" and model) or os.environ.get("FRIDAY_OLLAMA_MODEL"))
+        if o:
+            out.append(o)
+    return out
+
+
+def ollama(want=None):
+    host = os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434"
+    if not host.startswith("http"):
+        host = "http://" + host
+    try:
+        tags = json.loads(urllib.request.urlopen(host.rstrip("/") + "/api/tags", timeout=1.5).read())
+        names = [m["name"] for m in tags.get("models", [])]
+    except Exception:
+        return None
+    if not names:
+        return None
+    if not want:
+        # the most capable everyday model you've pulled, roughly
+        pref = ["gpt-oss", "qwen3", "gemma4", "gemma3", "llama3.3", "mistral-small", "qwen2.5", "llama3.1", "llama3.2",
+                "phi4", "mistral"]
+        want = next((n for p in pref for n in names if n.startswith(p) and "embed" not in n), None) or \
+            next((n for n in names if "embed" not in n), names[0])
+    return {"name": "Ollama (%s, on this laptop)" % want.split(":")[0], "url": host.rstrip("/") + "/v1/chat/completions",
+            "key": "", "model": want, "vision": bool(re.search(r"vl|llava|vision|gemma3|gemma4", want))}
+
+
+def call(p, messages, tools):
+    body = {"model": p["model"], "messages": messages, "temperature": 0.6}
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    req = urllib.request.Request(p["url"], data=json.dumps(body).encode(), method="POST",
+                                 headers={"Content-Type": "application/json", "User-Agent": "friday-fallback/1.0",
+                                          **({"Authorization": "Bearer " + p["key"]} if p["key"] else {})})
+    with urllib.request.urlopen(req, timeout=120) as r:
+        return json.loads(r.read().decode())
+
+
+# ---------------------------------------------------------------- acting, through the same guard as Claude
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "run_command",
+        "description": "Run a bash command on the user's Linux computer and get its output. Friday's helpers "
+                       "(friday-context, friday-music, friday-remind, friday-web, friday-open, friday-do, …) are on PATH. "
+                       "A safety guard checks every command: read-only ones run, risky ones show the user an approval "
+                       "card, dangerous ones are refused.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+    {"type": "function", "function": {
+        "name": "read_file",
+        "description": "Read a text file on the user's computer (absolute path or ~/…).",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+]
+SCREEN_TOOL = {"type": "function", "function": {
+    "name": "look_at_screen", "description": "Take a screenshot of the user's screen and look at it.",
+    "parameters": {"type": "object", "properties": {}}}}
+
+
+def guard(tool, inp, sid):
+    """Ask friday-approve exactly like Claude Code does. -> (allowed, reason)"""
+    data = json.dumps({"session_id": sid, "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": inp,
+                       "cwd": FH})
+    try:
+        r = subprocess.run([os.path.join(FH, "bin", "friday-approve")], input=data, capture_output=True, text=True,
+                           timeout=160)
+        out = json.loads(r.stdout.strip().splitlines()[-1])["hookSpecificOutput"]
+        return out.get("permissionDecision") == "allow", out.get("permissionDecisionReason", "")
+    except Exception as e:
+        return False, "the safety guard couldn't check this (%s)" % type(e).__name__
+
+
+def tool_env():
+    env = {k: v for k, v in os.environ.items() if k not in KEYS and not k.endswith("_API_KEY")}
+    env["PATH"] = os.path.join(FH, "bin") + ":" + HOME + "/.local/bin:/usr/local/bin:/usr/bin:" + env.get("PATH", "")
+    return env
+
+
+def run_tool(name, args, sid, prov):
+    """-> (tool_name_for_ui, ui_input, ok, text_result, image_b64_or_None)"""
+    if name == "run_command":
+        cmd = str(args.get("command", "")).strip()
+        ok, why = guard("Bash", {"command": cmd}, sid)
+        if not ok:
+            return "Bash", {"command": cmd}, False, "Not run: " + why, None
+        try:
+            r = subprocess.run(["bash", "-c", cmd], cwd=FH, capture_output=True, text=True, timeout=90, env=tool_env(),
+                               stdin=subprocess.DEVNULL)
+            out = (r.stdout + ("\n[stderr]\n" + r.stderr if r.stderr.strip() else ""))[-8000:]
+            return "Bash", {"command": cmd}, r.returncode == 0, "exit %d\n%s" % (r.returncode, out), None
+        except subprocess.TimeoutExpired:
+            return "Bash", {"command": cmd}, False, "timed out after 90 s", None
+    if name == "read_file":
+        path = os.path.expanduser(str(args.get("path", "")))
+        ok, why = guard("Read", {"file_path": path}, sid)
+        if not ok:
+            return "Read", {"file_path": path}, False, "Not read: " + why, None
+        try:
+            with open(path, errors="replace") as f:
+                return "Read", {"file_path": path}, True, f.read(24000), None
+        except OSError as e:
+            return "Read", {"file_path": path}, False, str(e), None
+    if name == "look_at_screen" and prov.get("vision"):
+        ok, why = guard("Bash", {"command": "friday-screen"}, sid)
+        if not ok:
+            return "Bash", {"command": "friday-screen"}, False, "Not allowed: " + why, None
+        r = subprocess.run([os.path.join(FH, "bin", "friday-screen")], capture_output=True, text=True, timeout=30,
+                           env=tool_env())
+        path = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+        try:
+            with open(path, "rb") as f:
+                img = base64.b64encode(f.read()).decode()
+            return "Bash", {"command": "friday-screen"}, True, "Screenshot attached below.", img
+        except OSError:
+            return "Bash", {"command": "friday-screen"}, False, "couldn't take a screenshot", None
+    return name, args, False, "unknown tool", None
+
+
+# ---------------------------------------------------------------- context: who Friday is, and the chat so far
+def system_prompt(prov, note):
+    def expand(text, depth=0):
+        def sub(m):
+            p = os.path.join(FH, m.group(1))
             try:
-                delta = json.loads(data)["choices"][0].get("delta", {}).get("content") or ""
+                return expand(open(p).read(), depth + 1) if depth < 2 else ""
+            except OSError:
+                return ""
+        return re.sub(r"(?m)^@([\w./-]+\.md)\s*$", sub, text)
+    try:
+        base = expand(open(os.path.join(FH, "CLAUDE.md")).read())
+    except OSError:
+        base = "You are Friday, an assistant on the user's Linux desktop."
+    tools = "run_command, read_file" + (", look_at_screen" if prov.get("vision") else "")
+    return (base + "\n\n## Right now: you are Friday's backup brain\n"
+            "Claude (Friday's usual brain) is unavailable: %s. You are %s standing in. Stay in character as Friday, "
+            "follow everything above, and be honest about uncertainty. The tools you have are: %s (not the Claude Code "
+            "tools named above: use run_command for anything you'd do in Bash, read_file to read a file). For "
+            "big jobs (long coding work, large refactors) say plainly that it's better to wait for Claude.\n\n%s"
+            % (note, prov["name"], tools, os.environ.get("FRIDAY_SURFACE_TEXT", "")))
+
+
+def chat_path(sid):
+    return os.path.join(CHATS, re.sub(r"[^\w-]", "", sid) + ".json")
+
+
+def load_chat(sid):
+    try:
+        with open(chat_path(sid)) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_chat(sid, msgs):
+    os.makedirs(CHATS, mode=0o700, exist_ok=True)
+    keep = [m for m in msgs if m.get("role") in ("user", "assistant") and isinstance(m.get("content"), str)
+            and m["content"].strip()]
+    with open(chat_path(sid), "w") as f:
+        json.dump(keep[-30:], f)
+    os.chmod(chat_path(sid), 0o600)
+
+
+def request_only(text):
+    """Friday's prompts carry a [desktop context] block; keep just what was asked, for history."""
+    m = re.search(r"\[request\]\n(.*)$", text or "", re.S)
+    return (m.group(1) if m else text or "").strip()
+
+
+def claude_history(session_id):
+    """The Claude chat this continues (Claude Code keeps it under ~/.claude/projects), as plain turns."""
+    import glob
+    files = glob.glob(os.path.join(HOME, ".claude", "projects", "*", re.sub(r"[^\w-]", "", session_id) + ".jsonl"))
+    out = []
+    if not files:
+        return out
+    try:
+        for line in open(files[0], errors="replace"):
+            try:
+                j = json.loads(line)
             except Exception:
                 continue
-            if delta:
-                yield delta
+            m = j.get("message") or {}
+            c = m.get("content")
+            if j.get("type") == "user" and m.get("role") == "user":
+                if isinstance(c, str):
+                    txt = request_only(c)
+                elif isinstance(c, list):
+                    txt = request_only(" ".join(b.get("text", "") for b in c if b.get("type") == "text"))
+                else:
+                    txt = ""
+                if txt:
+                    out.append({"role": "user", "content": txt[:4000]})
+            elif j.get("type") == "assistant" and isinstance(c, list):
+                txt = "".join(b.get("text", "") for b in c if b.get("type") == "text").strip()
+                if txt:
+                    if out and out[-1]["role"] == "assistant":
+                        out[-1]["content"] += "\n\n" + txt[:4000]
+                    else:
+                        out.append({"role": "assistant", "content": txt[:4000]})
+    except OSError:
+        pass
+    return out[-16:]
+
+
+# ---------------------------------------------------------------- answering
+def say_text(text):
+    """Stream text to the panel the way Claude Code does (it speaks and highlights as it goes)."""
+    emit({"type": "stream_event", "event": {"type": "content_block_start", "index": 0,
+                                            "content_block": {"type": "text", "text": ""}}})
+    for chunk in re.findall(r"[^\n]*?(?:[.!?](?=\s)|\n|$)\s*", text):
+        if chunk:
+            emit({"type": "stream_event", "event": {"type": "content_block_delta", "index": 0,
+                                                    "delta": {"type": "text_delta", "text": chunk}}})
+
+
+def answer(prompt, reason_note, reset=None):
+    session = os.environ.get("FRIDAY_SESSION", "")
+    sid = session if session.startswith("fb-") else "fb-" + uuid.uuid4().hex[:16]
+    emit({"type": "system", "subtype": "init", "session_id": sid, "model": "fallback"})
+    voice = os.environ.get("FRIDAY_VOICE") == "1"
+    provs = providers()
+    if not provs:
+        msg = ("Claude's usage limit is reached%s, and there's no backup model set up yet. Everyday things like "
+               "music, timers, volume and opening apps still work. To keep chatting when this happens, add a free "
+               "Gemini key as GEMINI_API_KEY in Friday's config.env (get one at aistudio.google.com/apikey), or "
+               "install Ollama to run a model on this laptop." % ((", back at " + when(reset)) if when(reset) else ""))
+        if voice:
+            msg += "\n[[end]]"
+        say_text(msg)
+        emit({"type": "result", "subtype": "success", "is_error": False, "result": msg, "session_id": sid})
+        return 0
+
+    history = load_chat(sid)
+    first = not history
+    if first and session and not session.startswith("fb-"):
+        history = claude_history(session)                  # carry on the chat Claude was in
+    msgs_base = history + [{"role": "user", "content": prompt}]
+    last_err = ""
+    for prov in provs:
+        msgs = [{"role": "system", "content": system_prompt(prov, reason_note)}] + list(msgs_base)
+        tools = TOOLS + ([SCREEN_TOOL] if prov.get("vision") else [])
+        try:
+            text = run_turn(prov, msgs, tools, sid)
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace")[:300]
+            if e.code == 400 and "tool" in detail.lower() and tools:
+                try:
+                    text = run_turn(prov, msgs, [], sid)       # a model without tool support: just talk
+                except Exception as e2:
+                    last_err = "%s: %s" % (prov["name"], e2)
+                    continue
+            else:
+                last_err = "%s: HTTP %d %s" % (prov["name"], e.code, re.sub(r"\s+", " ", detail)[:160])
+                continue
+        except Exception as e:
+            last_err = "%s: %s" % (prov["name"], type(e).__name__)
+            continue
+        if first:                                          # say once per chat who's answering, and until when
+            back = when(reset)
+            note = "%s%s, so %s is answering for now." % (
+                reason_note, (" (back at %s)" % back) if back and "limit" in reason_note else "",
+                prov["name"].split(" (")[0])
+            say_text((note + " ") if voice else ("_" + note + "_\n\n"))
+        say_text(text)
+        save_chat(sid, history + [{"role": "user", "content": request_only(prompt)[:4000]},
+                                  {"role": "assistant", "content": text}])
+        emit({"type": "result", "subtype": "success", "is_error": False, "result": text, "session_id": sid})
+        return 0
+    msg = "The backup model didn't answer either (%s). Everyday things still work on-device." % last_err
+    emit({"type": "result", "subtype": "error", "is_error": True, "result": msg, "session_id": sid})
+    return 0
+
+
+def run_turn(prov, msgs, tools, sid):
+    for _ in range(MAX_ROUNDS):
+        r = call(prov, msgs, tools)
+        m = (r.get("choices") or [{}])[0].get("message") or {}
+        calls = m.get("tool_calls") or []
+        if not calls:
+            return (m.get("content") or "").strip() or "(no answer)"
+        keep = {k: v for k, v in m.items() if v is not None}     # echo it back as-is (some models need their signatures)
+        keep["role"] = "assistant"
+        msgs.append(keep)
+        images = []
+        for c in calls:
+            fn = (c.get("function") or {})
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            tid = c.get("id") or "call_" + uuid.uuid4().hex[:8]
+            ui_name, ui_inp, ok, result, img = run_tool(fn.get("name", ""), args, sid, prov)
+            emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": tid, "name": ui_name,
+                                                               "input": ui_inp}]}})
+            emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                                           "is_error": not ok}]}})
+            msgs.append({"role": "tool", "tool_call_id": tid, "content": result})
+            if img:
+                images.append(img)
+        for img in images:
+            msgs.append({"role": "user", "content": [
+                {"type": "text", "text": "Here is the screenshot."},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + img}}]})
+    return "I went back and forth too many times on that one. Try asking a narrower question?"
+
+
+# ---------------------------------------------------------------- wrapping Claude Code
+def wrap(argv, prompt):
+    """Run Claude Code, pass its stream through; if it reports a usage limit before saying anything real, swap in the backup."""
+    env = {k: v for k, v in os.environ.items() if k not in KEYS}   # Claude never sees the backup's keys
+    child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             bufsize=1, env=env)
+
+    def stop(*_):
+        try:
+            child.terminate()
+        except Exception:
+            pass
+        sys.exit(143)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    try:
+        child.stdin.write(prompt)
+        child.stdin.close()
+    except BrokenPipeError:
+        pass
+
+    held, released, text, limit_msg = [], False, "", None
+    for line in child.stdout:
+        s = line.strip()
+        if not s:
+            continue
+        try:
+            ev = json.loads(s)
+        except Exception:
+            ev = None
+        if ev is None:
+            if not released and LIMIT_ERR.search(s) and not text:
+                limit_msg = s
+                continue
+            held.append(line) if not released else (sys.stdout.write(line), sys.stdout.flush())
+            continue
+        t = ev.get("type")
+        if t == "result":
+            msg = str(ev.get("result") or "")
+            if not released and ((ev.get("is_error") and LIMIT_ERR.search(msg)) or LIMIT_TEXT.search(text or msg)):
+                limit_msg = msg or text
+                continue                                    # swallow it: the backup answers instead
+        if t == "stream_event":
+            d = (ev.get("event") or {}).get("delta") or {}
+            if d.get("type") == "text_delta":
+                text += d.get("text", "")
+            cb = (ev.get("event") or {}).get("content_block") or {}
+            if cb.get("type") == "tool_use":
+                released = release(held, released)
+        if t == "assistant" and any(b.get("type") == "tool_use" for b in (ev.get("message") or {}).get("content", [])):
+            released = release(held, released)
+        if released or t == "system":
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        else:
+            held.append(line)
+            if len(text) > 120 and not LIMIT_TEXT.search(text):
+                released = release(held, released)
+    rc = child.wait()
+    if limit_msg is not None or (not released and LIMIT_TEXT.search(text)):
+        if os.environ.get("FRIDAY_FALLBACK", "auto").lower() == "off":
+            release(held, False)
+            if limit_msg:
+                emit({"type": "result", "is_error": True, "result": limit_msg})
+            return rc
+        reason = "Claude's usage limit is reached" if not re.search(r"overloaded|api error: 5\d\d|\b529\b", limit_msg or "", re.I) \
+            else "Claude's servers are overloaded right now"
+        return answer(prompt, reason, reset_from_text(limit_msg or text))
+    release(held, released)
+    return rc
+
+
+def release(held, released):
+    if not released:
+        for l in held:
+            sys.stdout.write(l)
+        sys.stdout.flush()
+        held.clear()
+    return True
 
 
 def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    if a[0] == "--limited":
+        lim, reset = usage_limit()
+        if lim:
+            print(when(reset))
+        return 0 if lim else 1
+    if a[0] == "--status":
+        ps = providers()
+        lim, reset = usage_limit()
+        print(json.dumps({"limited": lim, "resets": when(reset) if lim else None,
+                          "backup": [{"name": p["name"], "model": p["model"], "vision": p["vision"]} for p in ps]
+                          or "none set up (add GEMINI_API_KEY or GROQ_API_KEY to config.env, or run Ollama)"}, indent=1))
+        return 0
+    if a[0] == "--transcript":
+        msgs = load_chat(a[1] if len(a) > 1 else "")
+        for m in msgs:
+            print(("User: " if m["role"] == "user" else "Friday: ") + m["content"].strip()[:1500] + "\n")
+        return 0
     prompt = sys.stdin.read()
-    tried = []
-    for name, base, key, model in providers():
-        got = []
-        try:
-            for piece in stream(base, key, model, prompt):
-                got.append(piece)
-                emit({"type": "stream_event", "event": {"type": "content_block_delta",
-                                                       "delta": {"type": "text_delta", "text": piece}}})
-            if got:
-                emit({"type": "result", "is_error": False, "result": "".join(got)})
-                return
-            tried.append(f"{name} ({model}) sent nothing")
-        except urllib.error.HTTPError as e:
-            tried.append(f"{name} ({model}): HTTP {e.code}")
-        except Exception as e:
-            tried.append(f"{name} ({model}): {str(e)[:80]}")
-        if got:                                                  # died mid-answer: keep what we have
-            emit({"type": "result", "is_error": False, "result": "".join(got)})
-            return
-    why = "; ".join(tried) if tried else "no backup model is set up"
-    emit({"type": "result", "is_error": True, "result": (
-        "Your Claude limit is used up and the backup model didn't answer (" + why + ").\n\n"
-        "To get a free backup, put one of these in `~/.local/share/friday/config.env`: "
-        "`OPENROUTER_API_KEY=…` (free models), `GEMINI_API_KEY=…` (Google AI Studio free tier), "
-        "or install Ollama and pull a model for a fully offline one.")})
+    if a[0] == "--run":
+        lim, reset = usage_limit()
+        return answer(prompt, "Claude's usage limit is reached" if lim else "Claude isn't available right now", reset)
+    if a[0] == "--wrap" and len(a) > 1:
+        return wrap(a[1:], prompt)
+    print(__doc__)
+    return 2
 
 
-main()
+if __name__ == "__main__":
+    sys.exit(main())
