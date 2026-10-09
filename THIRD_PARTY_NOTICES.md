@@ -23,6 +23,8 @@ If you think something here is wrong or missing, please open an issue.
 | [pyminiaudio](https://github.com/irmen/pyminiaudio) | decoding the neural voice's audio | MIT | |
 | [Piper](https://github.com/OHF-Voice/piper1-gpl) (`piper-tts`) | offline voice | GPL-3.0-or-later | Installed as a separate Python package in Friday's own virtualenv and run as its own program; Friday doesn't include or link its code. |
 | Piper voice **Jenny (Dioco)** (`en_GB-jenny_dioco-medium`) | the default offline voice | [Jenny TTS dataset terms](https://github.com/dioco-group/jenny-tts-dataset): commercial use allowed, attribution required | Attribution: the offline voice is "Jenny (Dioco)". |
+| [Ollama](https://github.com/ollama/ollama) | the offline brain's model server (optional) | MIT | From your distro (Arch) or Ollama's official installer. Runs only on your laptop. |
+| [Qwen3](https://github.com/QwenLM/Qwen3) models (Alibaba Cloud) | the offline brain (optional) | Apache-2.0 | Downloaded through Ollama; size picked for your RAM. |
 | [uv](https://github.com/astral-sh/uv) (Astral) | installing the voice packages quickly | MIT or Apache-2.0 | Optional; falls back to the system Python. |
 | [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp) | background music | GPL-2.0+/LGPL-2.1+ (mpv), Unlicense (yt-dlp) | From your distro's packages. |
 | Desktop tools: `grim`, `slurp`, `wl-clipboard`, `playerctl`, `brightnessctl`, `wtype`, `ydotool`, `xdotool`, `xclip`, `jq`, … | screenshots, clipboard, media, input | their own (mostly MIT/GPL) | From your distro's packages. |
@@ -34,12 +36,11 @@ Not software Friday ships, but you should know where data goes:
 | Service | When | What it receives |
 |---|---|---|
 | Anthropic (via Claude Code) | every request that isn't answered on-device, and the weekly phrase refresh (one small Haiku call) | your request, the desktop context Friday attaches (focused window title, clipboard/selection preview when relevant), screenshots you ask about, and tool output |
-| Your backup model, if you set one up (Google Gemini API, Groq, OpenRouter; Ollama stays on your laptop) | only when Claude's usage limit is reached or Claude is overloaded | the same as Anthropic would: your request, Friday's instructions with `me.md` and its notes, desktop context, and command output/screenshots for the actions it takes. Each provider's own terms apply; Google's free tier may use it to improve its products. |
 | `api.anthropic.com/api/oauth/usage` | the usage rings | Claude Code's local login token, read-only, to fetch your plan usage. Undocumented endpoint. |
 | Microsoft's speech service (via edge-tts) | spoken answers, when online and `FRIDAY_TTS` isn't `piper` | the text being read aloud |
 | [wttr.in](https://wttr.in) | "what's the weather" | the place you asked about (or your IP's rough location) |
 | YouTube (via yt-dlp / your browser) | music | the search terms (built from your request and, for vague requests, your music taste) |
-| Hugging Face, alphacephei.com, GitHub, your distro's mirrors | install / voice setup only | ordinary downloads |
+| Hugging Face, alphacephei.com, ollama.com, GitHub, your distro's mirrors | install / voice / offline-brain setup only | ordinary downloads |
 
 ## Trademarks
 

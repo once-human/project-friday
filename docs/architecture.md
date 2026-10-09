@@ -16,9 +16,9 @@ IPC (`qs -c friday ipc call friday <fn>`): `toggle`, `show`, `hide`, `ask <text>
 
 | Helper | Role |
 |---|---|
-| `project-friday` | The command you use (`friday` for short): start/stop/restart/status/update/logs/config/ask/music/voice/backup/uninstall. Thin wrapper over the helpers below. |
+| `project-friday` | The command you use (`friday` for short): start/stop/restart/status/update/logs/config/ask/music/voice/offline/uninstall. Thin wrapper over the helpers below. |
 | `friday-ask` | Finds `claude`, adds desktop context (time, focused window, clipboard when you say "this"), runs `claude -p --output-format stream-json` with the policy hook. |
-| `friday-fallback` | The backup brain. Wraps Claude Code's stream; if Claude reports a usage limit (or is overloaded) before saying anything, the request goes to a free model instead (Gemini Flash, Groq, OpenRouter's free router, or Ollama on the laptop), which can still run commands, read files and look at the screen through `friday-approve`. It speaks the same stream-json, so the panel doesn't know the difference. When Claude is back, it gets the backup chat as context. |
+| `friday-fallback` | The offline brain. Offline? It answers straight away. Online, it wraps Claude Code's stream, and if Claude reports a usage limit, is overloaded or can't be reached before saying anything, the request goes to a local model instead (Ollama, started on demand; Qwen3 by default). It streams the same stream-json, so the panel and voice don't know the difference, runs commands/reads files/looks at the screen through `friday-approve`, and sends a heartbeat so slow CPUs don't trip the stall watchdog. When Claude is back, it gets the offline chat as context. Set up by `friday-offline-setup`. |
 | `friday-approve` | Claude Code `PreToolUse` hook: allow / ask (approval card over IPC) / deny. Appends every decision to `audit.log`. |
 | `friday-context` | One JSON line of "right now" for the UI and for Claude. |
 | `friday-screen`, `friday-windows`, `friday-open`, `friday-web`, `friday-do` | Eyes and hands. |

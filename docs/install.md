@@ -36,6 +36,7 @@ Hyprland without ii is a close second: everything except those three ii hooks.
 | Link | `~/.config/quickshell/friday → <repo>/shell`, `~/.local/share/friday → <repo>/brain`. Your personal files (`me.md`, `memory/`, `config.env`, `device-profile.md`) live in `brain/` and are git-ignored. |
 | Desktop | Shortcut, autostart and app-menu entries (search "Friday" in your launcher). See the table below. |
 | Voice | Optional: `friday-voice-setup` (Python env via `uv`, Vosk, Whisper `small.en`, Piper, the neural voice packages). |
+| Offline brain | Optional: `friday-offline-setup` installs Ollama (Arch package, else Ollama's official installer) and pulls a Qwen3 model sized to your RAM/GPU, so Friday keeps answering offline or out of Claude usage. |
 | Command | Links `project-friday` (and `friday`, when that name is free) into `~/.local/bin`, and offers to put `~/.local/bin` on your PATH if it isn't. |
 | Start | `project-friday restart`. From then on it starts at login and restarts itself if it crashes. |
 
