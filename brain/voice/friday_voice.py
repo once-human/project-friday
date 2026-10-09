@@ -40,7 +40,7 @@ SPEAK_ON = os.environ.get("FRIDAY_SPEAK", "on") != "off"
 PIPER_VOICE = os.environ.get("FRIDAY_PIPER_VOICE", "en_GB-jenny_dioco-medium")
 SILENCE_END = float(os.environ.get("FRIDAY_SILENCE_END", "1.1"))  # seconds of quiet that end a request
 PAUSE_SENTENCE = float(os.environ.get("FRIDAY_PAUSE_SENTENCE", "0.34"))  # breath after a full stop
-PAUSE_COMMA = float(os.environ.get("FRIDAY_PAUSE_COMMA", "0.14"))        # beat after a comma
+COMMA_HOLD = int(os.environ.get("FRIDAY_COMMA_HOLD", "2"))             # how much longer Friday pauses at commas (0 = Piper's own)
 NO_SPEECH_TIMEOUT = 6.0
 MAX_UTTERANCE = 25.0
 MAX_GAIN = float(os.environ.get("FRIDAY_MAX_GAIN", "10"))       # software gain ceiling for quiet mics
@@ -303,6 +303,87 @@ class Engines:
         if text.lower().strip(" .!?,") in HALLUCINATIONS and len(pcm) < RATE * 2 * 2:
             return ""
         return text
+
+    def synth_sentence(self, text):
+        """One sentence as ONE utterance, so the intonation flows across commas like a person's does
+        (synthesizing clause by clause made every comma sound like a full stop). Commas get a slightly
+        longer breath by repeating Piper's own pause token. Returns float32 audio in [-1, 1], or None if
+        this Piper version can't do it (then the caller uses synth())."""
+        v, np = self.piper, self.np
+        if v is None or np is None or not hasattr(v, "phoneme_ids_to_audio"):
+            return None
+        try:
+            from piper import SynthesisConfig
+            cfg = SynthesisConfig(length_scale=float(os.environ.get("FRIDAY_SPEECH_PACE", "1.0")),
+                                  noise_scale=0.6, noise_w_scale=0.85)
+            idmap = v.config.phoneme_id_map
+            comma = (idmap.get(",") or [None])[0]
+            pad = (idmap.get("_") or [0])[0]
+            parts = []
+            for ph in v.phonemize(text):
+                ids = v.phonemes_to_ids(ph)
+                if comma is not None and COMMA_HOLD > 0:
+                    held = []
+                    for x in ids:
+                        held.append(x)
+                        if x == comma:
+                            held += [pad, comma] * COMMA_HOLD
+                    ids = held
+                r = v.phoneme_ids_to_audio(ids, cfg)
+                a = np.asarray(r[0] if isinstance(r, tuple) else r, dtype=np.float32).reshape(-1)
+                peak = float(np.max(np.abs(a))) if a.size else 0.0
+                if peak > 1e-8:
+                    a = a / peak * 0.95                       # same loudness as Piper's own normalising
+                parts.append(a)
+                parts.append(np.zeros(int(self.piper_rate * 0.12), dtype=np.float32))
+            return np.concatenate(parts[:-1]) if parts else None
+        except Exception as e:
+            log("sentence synthesis unavailable, using the plain path:", repr(e))
+            return None
+
+    def word_times(self, audio, words):
+        """When each word starts (seconds) in a sentence's audio. Clause boundaries snap to the real pauses
+        Piper made at the commas; inside a clause, time is shared out by word length."""
+        np, sr = self.np, self.piper_rate
+        n = len(words)
+        w = int(sr * 0.01)
+        if n == 0 or audio is None or len(audio) < w * 3:
+            return [0.0] * n
+        m = len(audio) // w
+        env = np.abs(audio[: m * w]).reshape(m, w).mean(axis=1)
+        voiced = env > env.max() * 0.03
+        on = np.nonzero(voiced)[0]
+        if on.size == 0:
+            return [0.0] * n
+        vs, ve = int(on[0]), int(on[-1]) + 1
+        gaps, st = [], None                                    # silent runs of 60 ms+ inside the sentence
+        for i in range(vs, ve):
+            if not voiced[i]:
+                st = i if st is None else st
+            elif st is not None:
+                if i - st >= 6:
+                    gaps.append((st, i))
+                st = None
+        breaks = [k for k, wd in enumerate(words[:-1]) if wd[-1:] in ",;:"]
+        groups, spans = [words], [(vs, ve)]
+        if breaks and len(gaps) >= len(breaks):
+            cut = sorted(sorted(gaps, key=lambda g: g[1] - g[0], reverse=True)[: len(breaks)])
+            groups, prev = [], 0
+            for k in breaks:
+                groups.append(words[prev:k + 1])
+                prev = k + 1
+            groups.append(words[prev:])
+            starts = [vs] + [g[1] for g in cut]
+            ends = [g[0] for g in cut] + [ve]
+            spans = list(zip(starts, ends))
+        times = []
+        for g, (a, b) in zip(groups, spans):
+            wts = [len(x) + 1 for x in g]
+            tot, acc = max(1, sum(wts)), 0
+            for wt in wts:
+                times.append((a + (b - a) * acc / tot) * 0.01)
+                acc += wt
+        return times
 
     def synth(self, text):
         """Yield raw s16 mono audio chunks for text (works with piper-tts 1.2 and 1.3+)."""
@@ -689,39 +770,41 @@ class Voice:
                 waited = 0.0
                 if item is self._END:
                     break
-                # One whole answer at a time: spoken clause by clause with real pauses, and every word lit up
-                # at the moment you hear it.
+                # One whole answer at a time, sentence by sentence: each sentence is a single utterance
+                # (natural intonation, real breaths at commas), with a pause after each full stop and every
+                # word lit up at the moment you hear it.
                 text = speechify(item)
-                clauses = []                        # (clause text, pause after in seconds)
-                for sent in re.split(r"(?<=[.!?…])\s+", text):
-                    pieces = re.split(r"(?<=[,;:])\s+", sent.strip())
-                    for k, piece in enumerate(pieces):
-                        if piece:
-                            last = k == len(pieces) - 1
-                            clauses.append((piece, PAUSE_SENTENCE if last else PAUSE_COMMA))
-                words = [w for c, _ in clauses for w in c.split()]
-                emit("words", words=words, base=idx)
-                for clause, pause in clauses:
+                sentences = [x.strip() for x in re.split(r"(?<=[.!?…])\s+", text) if x.strip()]
+                emit("words", words=[w for x in sentences for w in x.split()], base=idx)
+                for si, sent in enumerate(sentences):
                     if self.speak_stop.is_set():
                         break
-                    audio = b"".join(self.e.synth(clause))
+                    sw = sent.split()
+                    fa = self.e.synth_sentence(sent)
+                    if fa is not None:
+                        audio = (fa * 32767).astype(self.e.np.int16).tobytes()
+                        times = self.e.word_times(fa, sw)
+                    else:
+                        audio = b"".join(self.e.synth(sent))
+                        dur = len(audio) / 2 / rate
+                        wts = [len(x) + 2 + (3 if x[-1:] in ",;:" else 0) for x in sw]
+                        tot, acc, times = max(1, sum(wts)), 0, []
+                        for wt in wts:
+                            times.append(0.04 + dur * 0.92 * acc / tot)
+                            acc += wt
                     now = time.time()
                     if t0 is not None and now > t0 + written / rate:
                         t0 = now - written / rate   # playback ran dry while we waited: re-align the clock
                     if t0 is None:
                         t0 = now
-                    dur = len(audio) / 2 / rate
-                    cw = clause.split()
-                    weights = [len(w) + 2 + (3 if w[-1:] in ",;:" else 0) for w in cw]
-                    total = max(1, sum(weights))
-                    offset = max(0.0, t0 + written / rate - now) + min(0.06, dur * 0.05)
-                    for wgt in weights:
-                        tm = threading.Timer(offset, emit, args=("word",), kwargs={"i": idx})
+                    at = max(0.0, t0 + written / rate - now)
+                    for tt in times:
+                        tm = threading.Timer(at + tt, emit, args=("word",), kwargs={"i": idx})
                         tm.daemon = True
                         tm.start()
                         timers.append(tm)
-                        offset += dur * 0.95 * wgt / total
                         idx += 1
+                    pause = PAUSE_SENTENCE if si < len(sentences) - 1 else 0.18
                     audio += b"\x00\x00" * int(rate * pause)
                     step = rate // 5 * 2            # write in 200 ms slices so "stop" is instant
                     for k in range(0, len(audio), step):
