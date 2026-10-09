@@ -1,20 +1,50 @@
 #!/usr/bin/env bash
-# friday-remind <when> <message…>   when: 10m | 1h30m | 45s | 18:30 | tomorrow 09:00
+# friday-remind <when> <message…>   when: 10m | 1h30m | 45s | 600s | 18:30 | tomorrow 09:00 | 2026-10-10 09:00
 # friday-remind --list | --cancel <id>
+# A real systemd timer: survives Friday restarts. When it fires you get a notification, a chime,
+# and Friday says it out loud (if its voice is set up).
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/friday"
 if [ "$1" = "--list" ]; then systemctl --user list-timers 'friday-remind-*' --no-pager; exit; fi
 if [ "$1" = "--cancel" ]; then systemctl --user stop "friday-remind-$2.timer"; exit; fi
 WHEN="$1"; shift
 [ "$WHEN" = "tomorrow" ] && { WHEN="tomorrow $1"; shift; }
 MSG="${*:-Reminder}"
-ID="$(date +%s)"
+ID="$(date +%s%N | cut -c1-13)"
+NOW="$(date +%s)"
 if [[ "$WHEN" =~ ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$ ]] && [ -n "$WHEN" ]; then
   SPEC=(--on-active="$WHEN")
+  h="${BASH_REMATCH[1]%h}"; m="${BASH_REMATCH[2]%m}"; s="${BASH_REMATCH[3]%s}"
+  AT=$(( NOW + ${h:-0} * 3600 + ${m:-0} * 60 + ${s:-0} ))
 else
   T="$(date -d "$WHEN" +%s 2>/dev/null)" || { echo "can't understand time: $WHEN" >&2; exit 2; }
-  [ "$T" -le "$(date +%s)" ] && T="$(date -d "tomorrow $WHEN" +%s)"
+  [ "$T" -le "$NOW" ] && T="$(date -d "tomorrow $WHEN" +%s)"
   SPEC=(--on-calendar="$(date -d "@$T" '+%Y-%m-%d %H:%M:%S')")
+  AT="$T"
 fi
+# what happens when it fires (the message is passed as an argument, never pasted into the script)
+FIRE='
+notify-send -a Friday -u critical -i alarm "Reminder" "$1"
+for s in /usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga /usr/share/sounds/freedesktop/stereo/complete.oga; do
+  [ -f "$s" ] && { (pw-play "$s" || paplay "$s") >/dev/null 2>&1; break; }
+done
+case "$1" in "Timer done"*) say="Your timer is done." ;; *) say="Hey, reminder: $1" ;; esac
+qs -c friday ipc call friday announce "$say" >/dev/null 2>&1 || true'
 systemd-run --user --quiet --unit "friday-remind-$ID" "${SPEC[@]}" --timer-property=AccuracySec=1s \
-  /usr/bin/notify-send -a Friday -u critical -i alarm "Reminder" "$MSG" \
-  && echo "reminder $ID set ($WHEN): $MSG"
+  --setenv=PATH="$PATH" --setenv=WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" \
+  /usr/bin/bash -c "$FIRE" friday-remind "$MSG" || exit 1
+# remember it, so "what are my reminders?" can answer (expired ones are dropped as we go)
+mkdir -p "$STATE"
+python3 - "$STATE/reminders.json" "$ID" "$AT" "$MSG" <<'PY'
+import json, os, sys, time
+path, rid, at, msg = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+try:
+    items = json.load(open(path))
+except Exception:
+    items = []
+items = [r for r in items if r.get("at", 0) > time.time()] + [{"id": rid, "at": at, "msg": msg}]
+with open(path + ".tmp", "w") as f:
+    json.dump(items, f)
+os.replace(path + ".tmp", path)
+PY
+echo "reminder $ID set ($WHEN): $MSG"
