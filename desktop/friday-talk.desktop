@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Talk to Friday
+Comment=Push-to-talk
+Exec=sh -c 'qs -c friday ipc call friday listen'
+Icon=friday
+Terminal=false
+Categories=Utility;
+Keywords=assistant;claude;ai;friday;
+StartupNotify=false

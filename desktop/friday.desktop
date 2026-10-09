@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Friday
+Comment=Ask Friday anything
+Exec=sh -c '$HOME/.local/share/friday/bin/friday-toggle'
+Icon=friday
+Terminal=false
+Categories=Utility;
+Keywords=assistant;claude;ai;friday;
+StartupNotify=false

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Friday
+Comment=Starts Project Friday (your Claude-powered desktop assistant)
+Exec=sh -c '$HOME/.local/share/friday/bin/friday-start'
+Icon=friday
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel

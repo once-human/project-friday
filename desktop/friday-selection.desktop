@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Friday on selection
+Comment=Explain, rewrite or translate the text you've highlighted
+Exec=sh -c '$HOME/.local/share/friday/bin/friday-toggle --selection'
+Icon=friday
+Terminal=false
+Categories=Utility;
+Keywords=assistant;claude;ai;friday;
+StartupNotify=false

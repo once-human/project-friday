@@ -1,0 +1,15 @@
+# Project Friday for compositors that start graphical-session.target (niri, and others run via uwsm/systemd).
+# install.sh copies this to ~/.config/systemd/user/ and enables it there.
+[Unit]
+Description=Project Friday (Claude-powered desktop assistant)
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/friday/bin/friday-start
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target
