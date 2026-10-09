@@ -62,10 +62,10 @@ WAKE_RE = re.compile(r"\b(hey|hi|okay|ok|hay)\W{0,2}\s*fri\s*-?\s*day\b(?!'?s)",
 ADDRESS_RE = re.compile(r"(?:^|[.!?…]\s+)\W*fri\s*-?\s*day\b(?!'?s)", re.I)
 LEADING_WAKE_RE = re.compile(r"^\W*((hey|hi|okay|ok|hay)\W*\s*)?fri\s*-?\s*day\b(?!s)\W*", re.I)
 # Words Whisper should expect from you. Biasing the decoder like this fixes most jargon errors.
+# Add your own names, projects and jargon with FRIDAY_VOCAB in config.env (your name is added automatically).
 VOCAB = os.environ.get("FRIDAY_VOCAB", (
-    "Friday, Claude, Claude Code, Hyprland, Quickshell, illogical-impulse, Arch Linux, pacman, yay, "
-    "PixelOS, OrangeFox, adb, fastboot, sideload, Redmi, POCO, GitHub, commit, push, repo, kitty, "
-    "Chrome, YouTube, Fred again, Onkar"))
+    "Friday, Claude, Claude Code, Hyprland, Quickshell, illogical-impulse, Arch Linux, pacman, GitHub, "
+    "commit, push, repo, terminal, Chrome, Firefox, YouTube, Spotify")) + (", " + os.environ["FRIDAY_NAME"] if os.environ.get("FRIDAY_NAME") else "")
 
 
 def emit(ev, **kw):
@@ -84,6 +84,11 @@ def log(*a):
 def debug(*a):
     if DEBUG:
         log(*a)
+
+
+def said(t):
+    """What was said, for the log: the words only with FRIDAY_VOICE_DEBUG=1 (otherwise just how long it was)."""
+    return repr(t) if DEBUG else "[%d words]" % len((t or "").split())
 
 
 def speechify(t):
@@ -654,7 +659,7 @@ class Voice:
                 if ok:
                     self.pending = False
                     self.last_wake = now
-                    log("wake confirmed: %r (level %.4f, %.2fs after the word)" % (heard, self.cand_peak, now - self.started))
+                    log("wake confirmed: %s (level %.4f, %.2fs after the word)" % (said(heard), self.cand_peak, now - self.started))
                     if self.quiet:
                         self.quiet = False
                         play(self.sound_on)
@@ -662,7 +667,7 @@ class Voice:
                     if self.partial and self.clean(self.partial):
                         emit("partial", text=self.clean(self.partial))
                 else:
-                    log("wake rejected (heard %r, level %.4f%s)" % (heard, self.cand_peak, ", quiet" if self.quiet else ""))
+                    log("wake rejected (heard %s, level %.4f%s)" % (said(heard), self.cand_peak, ", quiet" if self.quiet else ""))
                     self.state = self.IDLE if self.wake_on else self.MUTED
                     if not self.quiet:                   # nothing was shown for a quiet check: nothing to undo
                         emit("cancel", reason="false wake")
@@ -758,10 +763,10 @@ class Voice:
             log("whisper failed:", e)
         text = self.clean(text if text else fallback)
         if text:
-            log("heard: %r" % text)
+            log("heard: %s" % said(text))
             emit("final", text=text)
         else:
-            log("request dropped: nothing intelligible (vosk had %r)" % fallback)
+            log("request dropped: nothing intelligible (vosk had %s)" % said(fallback))
             emit("cancel", reason="didn't catch that")
 
     @staticmethod

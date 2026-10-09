@@ -2,8 +2,8 @@
 """Your Claude plan limits (5-hour session + weekly) -> $XDG_RUNTIME_DIR/friday/usage.json.
 
 Reads the access token Claude Code already stored for you and asks Anthropic's usage endpoint,
-the same one Claude Code's /usage screen uses. Read-only; the token never leaves this machine
-except to api.anthropic.com. NOTE: undocumented endpoint, so it may change without notice.
+the same one Claude Code's /usage screen uses. Read-only. The token is only ever sent to Anthropic's own server
+(api.anthropic.com), and is never logged or printed. NOTE: undocumented endpoint, so it may change without notice.
 Usage: friday-usage [--debug]
 """
 import json, os, sys, time, urllib.request, urllib.error
@@ -11,7 +11,7 @@ from datetime import datetime
 sys.dont_write_bytecode = True
 
 HOME = os.path.expanduser("~")
-OUTDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "friday")
+OUTDIR = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/friday-%d" % os.getuid(), "friday")
 OUT = os.path.join(OUTDIR, "usage.json")
 DEBUG = "--debug" in sys.argv
 

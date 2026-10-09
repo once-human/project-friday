@@ -6,8 +6,8 @@
 #   friday-start --once       just make sure it's running (no supervisor)
 # The watch is a pgrep every 5 s: no measurable battery cost. Nothing here talks to Claude.
 export PATH="$HOME/.local/bin:$HOME/.local/share/friday/bin:/usr/local/bin:/usr/bin:$PATH"
-RUN="${XDG_RUNTIME_DIR:-/tmp}/friday"
-mkdir -p "$RUN"
+RUN="${XDG_RUNTIME_DIR:-/tmp/friday-$(id -u)}/friday"
+(umask 077; mkdir -p "$RUN")
 QS='(^|/)(qs|quickshell)( [^ ]*)* -c friday( |$)'
 alive() { pgrep -f -- "$QS" >/dev/null; }
 start_qs() {

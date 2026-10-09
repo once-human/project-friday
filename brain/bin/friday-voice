@@ -23,5 +23,6 @@ if ! "$PY" -c "import edge_tts, miniaudio" 2>/dev/null; then
 fi
 # daemon: keep a small log of what it hears / rejects (tail -f ~/.local/share/friday/.voice/voice.log)
 LOG="$HERE/.voice/voice.log"
+umask 077; touch "$LOG" 2>/dev/null; chmod 600 "$LOG" "$LOG.1" 2>/dev/null   # yours only
 [ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt 1000000 ] && mv -f "$LOG" "$LOG.1"
 exec "$PY" -u "$HERE/voice/friday_voice.py" "$@" 2>>"$LOG"

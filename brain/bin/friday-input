@@ -18,6 +18,7 @@ sys.dont_write_bytecode = True
 os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":/usr/local/bin:/usr/bin:" + os.environ.get("PATH", "")
 
 X11 = bool(os.environ.get("DISPLAY")) and not os.environ.get("WAYLAND_DISPLAY")
+LAST = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/friday-%d" % os.getuid(), "friday", "screens", "last-screen.json")
 SETUP = ("install xdotool" if X11 else
          "install ydotool and wtype (re-running Friday's install.sh does it), then: systemctl --user enable --now ydotool  "
          "(and add yourself to the 'input' group if /dev/uinput isn't writable)")
@@ -37,7 +38,7 @@ def to_global(x, y, is_global):
     if is_global:
         return int(round(x)), int(round(y))
     try:
-        m = json.load(open("/tmp/friday/last-screen.json"))
+        m = json.load(open(LAST))
     except Exception:
         die("no screenshot mapping yet: run friday-screen first, or pass --global")
     (ox, oy), (lw, lh), (pw, ph) = m["origin"], m["logical"], m["pixels"]
@@ -170,7 +171,7 @@ def main():
             "xdotool" if X11 and shutil.which("xdotool") else "ydotool" if shutil.which("ydotool") else ("wlrctl" if shutil.which("wlrctl") else "MISSING"),
             "xdotool" if X11 and shutil.which("xdotool") else "wtype" if shutil.which("wtype") else "MISSING"))
         try:
-            print("last screenshot:", json.load(open("/tmp/friday/last-screen.json")))
+            print("last screenshot:", json.load(open(LAST)))
         except Exception:
             print("last screenshot: none")
     else:

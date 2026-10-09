@@ -3,15 +3,19 @@
 # Friday can then Read the image to see what you see. The Friday overlay hides itself for the shot.
 # Works on Hyprland / Sway / niri / wlroots (grim), KDE (spectacle), GNOME (gnome-screenshot) and X11 (maim/import/scrot).
 export PATH="$HOME/.local/share/friday/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
-mkdir -p /tmp/friday
+# private per-user folder (screenshots can show anything on your screen)
+D="${XDG_RUNTIME_DIR:-/tmp/friday-$(id -u)}/friday/screens"
+(umask 077; mkdir -p "$D") && chmod 700 "$D"
+[ -O "$D" ] && [ ! -L "$D" ] || { echo "friday-screen: $D isn't a private folder owned by you" >&2; exit 1; }
+find "$D" -maxdepth 1 -name 'screen-*' -mmin +60 -delete 2>/dev/null   # don't pile up old screenshots
 case "$(friday-wm name)" in
   hyprland|sway|niri|river|wayfire|labwc|cosmic|wayland) ext=jpg ;;
   *) ext=png ;;
 esac
-out="/tmp/friday/screen-$(date +%s).$ext"
+out="$(mktemp -p "$D" "screen-XXXXXXXX.$ext")" || exit 1
 qs -c friday ipc call friday cloak 900 >/dev/null 2>&1 && sleep 0.35
 meta="$(friday-wm shot "$out" ${1:+"$1"})" || { echo "friday-screen: couldn't take a screenshot on this desktop" >&2; exit 1; }
 # remember how this image maps onto the real screen, so friday-input can click what Friday sees
 printf '%s' "$meta" > "${out%.*}.json"
-printf '%s' "$meta" > /tmp/friday/last-screen.json
+printf '%s' "$meta" > "$D/last-screen.json"
 echo "$out"

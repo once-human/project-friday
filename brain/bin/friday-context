@@ -76,7 +76,7 @@ for touched, r in repos[:3]:
     dirty = sh(["git", "-C", r, "--no-optional-locks", "status", "--porcelain"], 1.0)
     out["repos"].append({"name": os.path.basename(r), "path": r, "dirty": len(dirty.splitlines()) if dirty else 0, "ago": ago(touched)})
 
-# the sky phone: only if an adb server is already up (never start one just to look)
+# a connected Android phone: only if an adb server is already up (never start one just to look)
 if sh(["pgrep", "-x", "adb"], 0.4):
     for line in sh(["adb", "devices", "-l"], 1.2).splitlines()[1:]:
         if line.strip() and " device " in line + " ":
@@ -86,8 +86,23 @@ if sh(["pgrep", "-x", "adb"], 0.4):
 if "phone" not in out and sh(["fastboot", "devices"], 0.6).strip():
     out["phone"] = {"serial": "", "model": "fastboot", "fastboot": True}
 
-# PixelOS / ROM tree: is a build running right now?
-for d in ("~/pixelos17", "~/sky17"):
+# an Android (AOSP / custom ROM) build running right now? Folders to watch: FRIDAY_ROM_DIRS="~/aosp ~/lineage"
+def setting(name):
+    """A FRIDAY_* value from the environment, else from config.env (the panel doesn't source it)."""
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config.env")) as f:
+            for line in f:
+                m = re.match(r"\s*(?:export\s+)?" + name + r"=(.*)$", line)
+                if m:
+                    v = m.group(1).split(" #")[0].strip()
+                    return v[1:-1] if len(v) > 1 and v[0] == v[-1] and v[0] in "\"'" else v
+    except OSError:
+        pass
+    return ""
+
+for d in setting("FRIDAY_ROM_DIRS").split():
     p = os.path.expanduser(d)
     if os.path.isdir(p):
         out["rom"] = {"dir": d, "building": bool(sh(["pgrep", "-f", "soong_ui|ninja .*out/"], 0.4))}
