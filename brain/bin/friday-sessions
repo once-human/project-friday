@@ -113,27 +113,36 @@ def sessions(n):
     return out
 
 
+STOP = set("""a an the to of for in on at by with and or but is are was were be been it this that these those my your
+our me i you we us can could would should will please just some any do does did how what why when where which who make
+let lets want need help get have has had im its into from up out about as so if then there here them they he she also
+really very maybe like now again still all new same other one two using use""".split())
+
+
+def local_title(first):
+    """A short Title Case name from the first request, made locally. (This used to ask Claude, which quietly
+    spent plan usage every time the panel opened; the local version costs nothing and is close enough.)"""
+    t = first.split("\n")[0]
+    t = re.sub(r"https?://\S+|`[^`]*`|(?<!\w)[~/][\w./-]+", " ", t)
+    t = re.sub(r"^\W*(hey|hi|ok|okay|so|um|uh|claude|friday)\b[,\s]*", "", t, flags=re.I)
+    t = re.sub(r"^(can|could|would|will) you (please )?|^(i want to|i need to|i'd like to|help me( to)?|let'?s|please)\s+",
+               "", t, flags=re.I)
+    words = re.findall(r"[A-Za-z][A-Za-z0-9+#.\-]*[A-Za-z0-9+#]|[A-Za-z]{2,}", t)
+    keep = [w for w in words if w.lower() not in STOP][:4]
+    if not keep:
+        return heuristic(first)
+    return " ".join(w if any(c.isupper() for c in w[1:]) or w.isupper() else w.capitalize() for w in keep)
+
+
 def name_them(items):
     cache = load_cache()
-    os.makedirs(NAMER, exist_ok=True)
+    changed = False
     for s in items:
-        if s["named"] or s["id"] in cache:
+        if s["named"] or (s["id"] in cache and not cache[s["id"]].startswith("~")):
             continue
-        prompt = ("Give this coding session a short title: 2 to 5 words, Title Case, a noun phrase that reads "
-                  "naturally after the word 'Continue' (e.g. 'Friday Overlay Polish', 'PixelOS Sky Build Fix'). "
-                  "Reply with the title only, no quotes or punctuation.\n\nProject folder: %s\nFirst request: %s"
-                  % (s["project"], s["first"]))
-        title = ""
-        try:
-            r = subprocess.run(["claude", "-p", "--model", "haiku", prompt], cwd=NAMER,
-                               capture_output=True, text=True, timeout=45)
-            title = r.stdout.strip().splitlines()[0].strip().strip('"\'.') if r.returncode == 0 and r.stdout.strip() else ""
-        except Exception:
-            pass
-        if title and len(title) <= 48 and not title.lower().startswith(("i ", "sorry", "error")):
-            cache[s["id"]] = title
-        else:
-            cache[s["id"]] = "~" + heuristic(s["first"])   # "~" = tried; don't spend again
+        cache[s["id"]] = local_title(s["first"])
+        changed = True
+    if changed:
         save_cache(cache)
 
 
