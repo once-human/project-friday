@@ -250,6 +250,13 @@ def policy_segment(toks, followed_by_pipe_from_fetch):
     helper = trusted_helper(toks[0])
     if helper:
         prog = helper
+        if prog == "project-friday":
+            sub = args[0] if args else "help"
+            if sub in ("status", "version", "help", "-h", "--help", "logs", "log", "backup", "fallback", "usage", "music",
+                       "play", "open", "show", "close", "hide"):
+                return redirect_verdict
+            return worst(redirect_verdict, Q("project-friday %s changes Friday itself" % sub,
+                                             "high" if sub in ("update", "upgrade", "uninstall") else "medium"))
         if prog in HELPERS_ASK:
             return worst(redirect_verdict, Q(f"{prog} {HELPERS_ASK[prog]}", "low"))
         if prog == "friday-web":
@@ -384,7 +391,9 @@ def trusted_helper(tok):
     """Friday's own helper, found by real path (not just by name)? Returns its name, or None."""
     import shutil
     name = os.path.basename(tok)
-    if not name.startswith("friday-"):
+    if name == "friday":
+        name = "project-friday"                      # the short alias of the command
+    if not name.startswith("friday-") and name != "project-friday":
         return None
     mine = os.path.realpath(os.path.join(JH, "bin", name))
     if not os.path.isfile(mine):

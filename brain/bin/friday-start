@@ -50,7 +50,7 @@ while true; do
     if [ $(( now - last )) -lt 90 ]; then fails=$(( fails + 1 )); else fails=0; fi
     last=$now
     if [ "$fails" -ge 5 ]; then
-      notify-send -a Friday "Friday keeps crashing" "Stopped restarting it. Run 'qs -c friday' in a terminal to see why." 2>/dev/null
+      notify-send -a Friday "Friday keeps crashing" "Stopped restarting it. Run 'project-friday logs' (or 'qs -c friday') in a terminal to see why." 2>/dev/null
       exit 1
     fi
     start_qs

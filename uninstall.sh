@@ -34,6 +34,12 @@ for f in "$HOME/.config/autostart/friday.desktop" "$HOME/.local/share/applicatio
   [ -e "$f" ] && rm -f "$f" && say "removed $f"
 done
 
+# the project-friday / friday command (the PATH line it may have added stays: Claude Code lives in ~/.local/bin too)
+for n in project-friday friday; do
+  f="$HOME/.local/bin/$n"
+  [ -L "$f" ] && case "$(readlink "$f")" in */brain/bin/project-friday) rm -f "$f"; say "removed $f" ;; esac
+done
+
 # GNOME / XFCE shortcuts
 if command -v gsettings >/dev/null 2>&1 && gsettings list-schemas 2>/dev/null | grep -q media-keys; then
   python3 - <<'PY'

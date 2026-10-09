@@ -24,6 +24,7 @@ QS_TAG="v0.3.2"; QS_COMMIT="4f508be500dea6e5732cc3d50382a0048b17e7b1"
 FONT_URL="https://raw.githubusercontent.com/google/material-design-icons/49d4db35df873165d6bd6ba09b063c7dafbac2f4/variablefont/MaterialSymbolsRounded%5BFILL%2CGRAD%2Copsz%2Cwght%5D.ttf"
 FONT_SHA256="32e4011709e055596eb8d2dd0f7cb547b47c1d40ac9ecb8fad54f7f7eac202e7"
 YES=0; VOICE=ask; DEPS=1; DRY=0
+USER_PATH="$PATH"
 for a in "$@"; do
   case "$a" in
     -y|--yes) YES=1 ;;
@@ -355,6 +356,42 @@ PY
     note "(would add to $f:) $line"
   fi
 }
+# ---- the command: project-friday (and friday)
+run mkdir -p "$HOME/.local/bin"
+CLI="$REPO/brain/bin/project-friday"
+for n in project-friday friday; do
+  dst="$HOME/.local/bin/$n"
+  if [ "$n" = friday ]; then
+    other="$(PATH="$USER_PATH" command -v friday 2>/dev/null || true)"
+    if { [ -e "$dst" ] || [ -L "$dst" ]; } && [ "$(readlink -f "$dst")" != "$(readlink -f "$CLI")" ]; then
+      # shellcheck disable=SC2088
+      note "~/.local/bin/friday is something else, so the command is just: project-friday"; continue
+    fi
+    if [ -n "$other" ] && [ "$(readlink -f "$other")" != "$(readlink -f "$CLI")" ] && [ "$other" != "$dst" ]; then
+      note "'friday' is already $other, so the command is just: project-friday"; continue
+    fi
+  fi
+  run ln -sfn "$CLI" "$dst"
+done
+SHORT=""; [ "$(readlink -f "$HOME/.local/bin/friday" 2>/dev/null)" = "$(readlink -f "$CLI")" ] && SHORT=" (or just: friday)"
+case ":$USER_PATH:" in
+  *":$HOME/.local/bin:"*|*":$HOME/.local/bin/:"*) ;;
+  *)
+    sh_name="$(basename "${SHELL:-bash}")"
+    # shellcheck disable=SC2088
+    if ask "~/.local/bin isn't on your PATH, so 'project-friday' won't be found. Add it for $sh_name?" y; then
+      case "$sh_name" in
+        fish) run mkdir -p "$HOME/.config/fish/conf.d"
+              [ "$DRY" = 1 ] || printf '# added by Project Friday\nfish_add_path -g $HOME/.local/bin\n' > "$HOME/.config/fish/conf.d/friday-path.fish" ;;
+        zsh)  mark_block "$HOME/.zshrc" 'export PATH="$HOME/.local/bin:$PATH"' ;;
+        *)    mark_block "$HOME/.bashrc" 'export PATH="$HOME/.local/bin:$PATH"' ;;
+      esac
+      note "open a new terminal for it to take effect"
+    else
+      note "then run it as: ~/.local/bin/project-friday"
+    fi ;;
+esac
+
 xdg_autostart() {
   run mkdir -p "$HOME/.config/autostart"
   run cp "$REPO/desktop/friday-autostart.desktop" "$HOME/.config/autostart/friday.desktop"
@@ -470,5 +507,5 @@ echo
 say "Friday is installed$([ "$STARTED" = 1 ] && echo " and running" || echo "; it starts with your next desktop login")."
 note "Keys: $KEYS_NOTE"
 have claude && ! "$REPO/brain/bin/friday-login" --check 2>/dev/null | grep -q ok && note "First time? Friday shows a Sign in card; or run: claude"
-note "Update later: cd $REPO && git pull && ./install.sh     Uninstall: $REPO/uninstall.sh"
+note "Everything else is one command$SHORT: project-friday status · restart · update · help"
 [ "$DESK" = hyprland ] || note "Best experience: Arch + Hyprland + illogical-impulse (see README → Recommended setup)"

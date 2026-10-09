@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# project-friday (also: friday) — one command for everything Friday.
+#   Installed as ~/.local/bin/project-friday (and ~/.local/bin/friday when that name is free) by install.sh.
+set -o pipefail
+FH="${FRIDAY_HOME:-$HOME/.local/share/friday}"
+BIN="$FH/bin"
+REPO="$(cd "$(dirname "$(readlink -f "$FH")")" 2>/dev/null && pwd)"     # ~/.local/share/friday -> <repo>/brain
+[ -f "$REPO/install.sh" ] || REPO=""
+RUNDIR="${XDG_RUNTIME_DIR:-/tmp/friday-$(id -u)}/friday"
+export PATH="$BIN:$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+ME="$(basename "$0")"
+
+if [ -t 1 ]; then B=$'\e[1m'; D=$'\e[2m'; G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; N=$'\e[0m'; else B=; D=; G=; R=; Y=; N=; fi
+ok()   { printf '  %s●%s %s\n' "$G" "$N" "$*"; }
+bad()  { printf '  %s●%s %s\n' "$R" "$N" "$*"; }
+meh()  { printf '  %s●%s %s\n' "$Y" "$N" "$*"; }
+die()  { printf '%s%s%s\n' "$R" "$*" "$N" >&2; exit 1; }
+QS='(^|/)(qs|quickshell)( [^ ]*)* -c friday( |$)'
+running() { pgrep -f -- "$QS" >/dev/null; }
+
+usage() {
+  cat <<EOF
+${B}Project Friday${N} — $ME <command>
+
+  ${B}start${N}              start Friday (and keep it running)
+  ${B}stop${N}               stop Friday until you start it again or log in
+  ${B}restart${N}            restart Friday (use this if it ever gets stuck)
+  ${B}status${N}             is it running, signed in, voice, backup model, usage
+  ${B}open${N} / ${B}close${N}       show or hide the panel
+  ${B}ask${N} "…"            open Friday and ask something
+  ${B}update${N}             pull the latest version, re-link, restart
+  ${B}logs${N} [-f]          recent logs (voice + shell); -f to follow
+  ${B}config${N}             edit your settings (config.env)
+  ${B}me${N}                 edit what Friday knows about you (me.md)
+  ${B}music${N} "…"          play something ("something nice", "high energy fred again"); stop, next, like, taste
+  ${B}voice${N} setup|test   install the speech models / check mic and voice
+  ${B}backup${N}             which backup model answers when Claude's limit is hit
+  ${B}usage${N}              your Claude plan usage
+  ${B}version${N}            which version you're on
+  ${B}uninstall${N}          remove everything Friday added (your brain/ files stay)
+EOF
+}
+
+cmd="${1:-help}"; shift 2>/dev/null
+case "$cmd" in
+  start)
+    if running; then echo "Friday is already running."; exit 0; fi
+    setsid -f "$BIN/friday-start" >/dev/null 2>&1
+    for _ in 1 2 3 4 5 6 7 8 9 10; do sleep 0.5; running && { echo "Friday is running. Super+Space to open it."; exit 0; }; done
+    echo "Starting… (if it doesn't appear, run: $ME logs)" ;;
+  stop)
+    "$BIN/friday-start" --stop ;;
+  restart|reload)
+    "$BIN/friday-start" --restart >/dev/null
+    for _ in $(seq 1 20); do sleep 0.5; running && { echo "Friday restarted."; exit 0; }; done
+    echo "Restarting… if it doesn't come back, run: $ME logs" ;;
+  open|show)  running || "$0" start >/dev/null; qs -c friday ipc call friday show >/dev/null 2>&1 ;;
+  close|hide) qs -c friday ipc call friday hide >/dev/null 2>&1 ;;
+  toggle)     "$BIN/friday-toggle" "$@" ;;
+  ask)
+    [ $# -gt 0 ] || die "usage: $ME ask \"what's on my screen?\""
+    running || { "$0" start >/dev/null; sleep 1.5; }
+    qs -c friday ipc call friday ask "$*" >/dev/null 2>&1 || die "Friday isn't responding; try: $ME restart" ;;
+  status)
+    echo "${B}Project Friday${N} $("$0" version 2>/dev/null)"
+    if running; then ok "running"; else bad "not running  ($ME start)"; fi
+    pgrep -f -- "friday-start$" >/dev/null && ok "auto-restart on" || meh "auto-restart off (it starts at your next login)"
+    pgrep -f -- "friday_voice.py" >/dev/null && ok "voice on" || { [ -d "$FH/.venv" ] && meh "voice installed, not running" || meh "voice not installed  ($ME voice setup)"; }
+    if command -v claude >/dev/null || [ -x "$HOME/.local/bin/claude" ]; then
+      if "$BIN/friday-login" --check 2>/dev/null | grep -q ok; then ok "Claude Code signed in"; else bad "Claude Code not signed in  (run: claude, then /login)"; fi
+    else bad "Claude Code not installed"; fi
+    b="$("$BIN/friday-fallback" --status 2>/dev/null | python3 -c 'import json,sys
+d=json.load(sys.stdin); b=d.get("backup")
+print(", ".join("%s (%s)" % (x["name"], x["model"]) for x in b) if isinstance(b, list) else "")' 2>/dev/null)"
+    [ -n "$b" ] && ok "backup model: $b" || meh "no backup model for when Claude's limit is hit  ($ME backup)"
+    if [ -f "$RUNDIR/usage.json" ]; then
+      python3 - "$RUNDIR/usage.json" <<'PY' 2>/dev/null
+import json, sys, time
+u = json.load(open(sys.argv[1]))
+if u.get("ok"):
+    def left(t):
+        s = max(0, int(t - time.time())); return "%dh %02dm" % (s // 3600, s % 3600 // 60)
+    parts = []
+    for k, n in (("five_hour", "5-hour"), ("seven_day", "weekly")):
+        v = u.get(k)
+        if v: parts.append("%s %d%% (resets in %s)" % (n, v["pct"], left(v.get("resets_at") or time.time())))
+    print("  \033[32m●\033[0m Claude usage: " + ", ".join(parts))
+PY
+    fi ;;
+  update|upgrade)
+    [ -n "$REPO" ] || die "Can't find Friday's folder (expected ~/.local/share/friday to link into the repo)."
+    echo "Updating $REPO"
+    git -C "$REPO" pull --ff-only || die "git pull failed (local changes?). Check: git -C \"$REPO\" status"
+    "$REPO/install.sh" --yes --no-deps --no-voice && "$0" restart ;;
+  logs|log)
+    if [ "${1:-}" = "-f" ]; then tail -n 30 -f "$FH/.voice/voice.log" 2>/dev/null; exit; fi
+    echo "${B}voice${N} ${D}($FH/.voice/voice.log)${N}"; tail -n 25 "$FH/.voice/voice.log" 2>/dev/null || echo "  (no voice log)"
+    echo; echo "${B}shell${N} ${D}(qs log -c friday)${N}"; qs log -c friday 2>/dev/null | tail -n 40 || echo "  (not available)"
+    echo; echo "${B}last decisions${N} ${D}($FH/audit.log)${N}"
+    tail -n 8 "$FH/audit.log" 2>/dev/null | python3 -c 'import json,sys
+for l in sys.stdin:
+    try: j=json.loads(l); print("  %s  %-5s %s" % (j["t"][11:], j["decision"], j.get("what","")[:90].replace("\n"," ")))
+    except Exception: pass' ;;
+  config|settings) [ -f "$FH/config.env" ] || cp "$FH/config.example.env" "$FH/config.env"; "${EDITOR:-${VISUAL:-nano}}" "$FH/config.env" && echo "Saved. Most settings apply to the next request; voice ones after: $ME restart" ;;
+  me)        [ -f "$FH/me.md" ] || cp "$FH/me.example.md" "$FH/me.md"; "${EDITOR:-${VISUAL:-nano}}" "$FH/me.md" ;;
+  music|play) exec "$BIN/friday-music" "${@:-something nice}" ;;
+  voice)
+    case "${1:-}" in
+      setup|install) exec "$BIN/friday-voice-setup" ;;
+      test) exec "$BIN/friday-voice" --test ;;
+      *) die "usage: $ME voice setup | test" ;;
+    esac ;;
+  backup|fallback) "$BIN/friday-fallback" --status; echo; echo "Set one up in config.env ($ME config): GEMINI_API_KEY (free at https://aistudio.google.com/apikey), GROQ_API_KEY, OPENROUTER_API_KEY, or run Ollama." ;;
+  usage)     "$BIN/friday-usage" >/dev/null 2>&1; "$0" status | grep -i "usage" || echo "Couldn't read your Claude usage (signed in?)." ;;
+  version|-v|--version)
+    if [ -n "$REPO" ] && git -C "$REPO" rev-parse --short HEAD >/dev/null 2>&1; then
+      echo "$(git -C "$REPO" rev-parse --short HEAD) ($(git -C "$REPO" log -1 --format=%cd --date=short))"
+    else echo "unknown"; fi ;;
+  uninstall) [ -n "$REPO" ] || die "Can't find Friday's folder."; exec "$REPO/uninstall.sh" "$@" ;;
+  help|-h|--help) usage ;;
+  *) echo "Unknown command: $cmd"; echo; usage; exit 2 ;;
+esac
