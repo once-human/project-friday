@@ -38,15 +38,9 @@ PanelWindow {
     property real appear: 0      // card: scale / lift / fade
     property real dim: 0         // backdrop: its own softer fade
     property real reveal: 0      // content: follows the card by a beat
-    // one-tap music: a row split into five
+    // one-tap music: "For you" + your favourites (FRIDAY_MUSIC), a row split into five
     property int vibeSel: 0
-    readonly property var vibes: [
-        { k: "house", t: "House" },
-        { k: "afro", t: "Afro" },
-        { k: "fred", t: "Fred" },
-        { k: "techno", t: "Techno" },
-        { k: "chill", t: "Chill" }
-    ]
+    readonly property var vibes: Brain.musicRow
     // changes once a minute, not every tick, so the rows don't rebuild under your cursor
     readonly property int minuteTick: Math.floor(Brain.now / 60000)
     function ago(epochSec) {
@@ -60,7 +54,7 @@ PanelWindow {
     // one quiet line about your world, most useful first
     readonly property string statusLine: {
         const p = [];
-        if (win.cx.rom && win.cx.rom.building) p.push("PixelOS is building");
+        if (win.cx.rom && win.cx.rom.building) p.push("your Android build is running");
         if (win.cx.phone) p.push(win.cx.phone.fastboot ? "phone in fastboot" : win.cx.phone.model + " connected");
         const repos = win.cx.repos ? win.cx.repos : [];
         if (repos.length > 0 && repos[0].dirty > 0) p.push(repos[0].name + " has " + repos[0].dirty + " uncommitted " + (repos[0].dirty === 1 ? "change" : "changes"));
@@ -74,6 +68,8 @@ PanelWindow {
     property bool showHistory: false
     readonly property bool home: (Brain.messages.count === 0 || win.showHistory) && Brain.authState !== "needed" && Brain.approval === null
     readonly property bool highRisk: Brain.approval !== null && Brain.approval.risk === "high"
+    // a long approval has to be scrolled to the end before Allow works
+    readonly property bool approvalSeen: cmdFlick.contentHeight <= cmdFlick.height + 2 || cmdFlick.atYEnd
 
     // ---------------------------------------------------------------- live context
     readonly property var cx: Brain.ctx ? Brain.ctx : ({})
@@ -492,7 +488,7 @@ PanelWindow {
                                 event.accepted = true;
                             } else if (enter) {
                                 if (Brain.approval && input.text.length === 0) {
-                                    if (!win.highRisk || ctrl) Brain.resolveApproval(true);
+                                    if ((!win.highRisk || ctrl) && win.approvalSeen) Brain.resolveApproval(true);
                                 } else if (Brain.authState === "needed") {
                                     Brain.startLogin();
                                 } else if (win.home) {
@@ -1089,24 +1085,39 @@ PanelWindow {
                             }
                         }
 
+                        // the whole thing you're approving, never cut off: long ones scroll, and Allow waits until
+                        // you've scrolled to the end
                         Rectangle {
                             Layout.fillWidth: true
                             radius: 10
                             color: Theme.well
-                            implicitHeight: cmdText.implicitHeight + 20
-                            Text {
-                                id: cmdText
+                            implicitHeight: Math.min(cmdText.implicitHeight, 220) + 20
+                            Flickable {
+                                id: cmdFlick
                                 x: 12
                                 y: 10
                                 width: parent.width - 24
-                                text: Brain.approval ? Brain.approval.command : ""
-                                wrapMode: Text.WrapAnywhere
-                                maximumLineCount: 6
-                                elide: Text.ElideRight
-                                font.family: Theme.mono
-                                font.pixelSize: 13
-                                color: Theme.text
+                                height: parent.height - 20
+                                clip: true
+                                contentHeight: cmdText.implicitHeight
+                                boundsBehavior: Flickable.StopAtBounds
+                                Text {
+                                    id: cmdText
+                                    width: cmdFlick.width
+                                    text: Brain.approval ? Brain.approval.command : ""
+                                    wrapMode: Text.WrapAnywhere
+                                    font.family: Theme.mono
+                                    font.pixelSize: 13
+                                    color: Theme.text
+                                }
                             }
+                        }
+                        Text {
+                            visible: !win.approvalSeen
+                            text: "Scroll to read all of it before allowing"
+                            font.family: Theme.sans
+                            font.pixelSize: 12
+                            color: Theme.warn
                         }
 
                         RowLayout {
@@ -1121,6 +1132,8 @@ PanelWindow {
                                 label: "Allow"
                                 primary: true
                                 tone: win.highRisk ? Theme.danger : Theme.accent
+                                enabled: win.approvalSeen
+                                opacity: enabled ? 1 : 0.4
                                 onClicked: Brain.resolveApproval(true)
                             }
                         }

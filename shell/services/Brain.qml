@@ -80,6 +80,7 @@ Singleton {
         root.shown = true;
         root.refreshContext();
         if (!sessionsProc.running) sessionsProc.running = true;
+        if (!musicRowProc.running) musicRowProc.running = true;
         if (root.authState === "unknown") root.checkAuth();
     }
     function withSelection(text) {
@@ -90,7 +91,7 @@ Singleton {
     // clipboard -> selection mode (text), or ask about the image
     function useClipboard(kind) {
         if (kind === "image") {
-            root.ask("There's an image on my clipboard. Save it with `friday-clip image /tmp/friday/clip.png`, look at it, and tell me what it is and anything useful about it.", "What's in the image I copied?");
+            root.ask("There's an image on my clipboard. Save it with `friday-clip image \"$FRIDAY_SCRATCH/clip.png\"`, look at it, and tell me what it is and anything useful about it.", "What's in the image I copied?");
             return;
         }
         clipProc.running = true;
@@ -129,6 +130,24 @@ Singleton {
         }
     }
 
+    // the music row: "For you" + your top picks from FRIDAY_MUSIC (friday-music row)
+    property var musicRow: [
+        { k: "for you", t: "For you" }, { k: "chill house", t: "Chill house" }, { k: "lofi", t: "Lofi" },
+        { k: "pop hits", t: "Pop hits" }, { k: "indie", t: "Indie" }
+    ]
+    Process {
+        id: musicRowProc
+        command: [root.binDir + "friday-music", "row"]
+        stdout: StdioCollector {
+            id: musicRowOut
+            onStreamFinished: {
+                try {
+                    const r = JSON.parse(musicRowOut.text);
+                    if (Array.isArray(r) && r.length > 0 && JSON.stringify(r) !== JSON.stringify(root.musicRow)) root.musicRow = r;
+                } catch (e) { }
+            }
+        }
+    }
     function playVibe(kind) {
         Quickshell.execDetached([root.binDir + "friday-music", kind]);
         root.hide();
@@ -351,7 +370,7 @@ Singleton {
         const text = String(r.text ?? "");
         root.messages.setProperty(i, "body", text);
         root.messages.setProperty(i, "done", true);
-        root.localNotes = [...root.localNotes, "Onkar: " + t + "\nFriday (on-device): " + text].slice(-6);
+        root.localNotes = [...root.localNotes, "User: " + t + "\nFriday (on-device): " + text].slice(-6);
         root.lastActivity = Date.now();
         if (root.voiceTurn && root.shown) {
             root.speechRanges = [[0, text.length]];
@@ -462,6 +481,7 @@ Singleton {
 
     // ---------------------------------------------------------------- stream-json from `claude -p`
     function handleLine(line) {
+        stallWatch.restart();
         const clean = line.trim();
         if (clean.length === 0) return;
         let ev;
@@ -490,12 +510,13 @@ Singleton {
                 if (blocks[i].type !== "tool_use") continue;
                 const d = root.describe(blocks[i]);
                 root.pushStep(blocks[i].id, d[0], d[1]);
+                root.openTools++;
             }
         } else if (ev.type === "user") {
             const blocks = ev.message?.content;
             if (Array.isArray(blocks)) {
                 for (let i = 0; i < blocks.length; i++)
-                    if (blocks[i].type === "tool_result") root.finishStep(blocks[i].tool_use_id, !blocks[i].is_error);
+                    if (blocks[i].type === "tool_result") { root.finishStep(blocks[i].tool_use_id, !blocks[i].is_error); root.openTools = Math.max(0, root.openTools - 1); }
             }
         } else if (ev.type === "result") {
             if (ev.is_error) {
@@ -543,7 +564,7 @@ Singleton {
             // A spoken question gets a spoken answer, already playing sentence by sentence; close it out.
             if (root.voiceTurn && root.shown && root.queued === "" && i >= 0 && i < root.messages.count) {
                 root.feedSpeech(true);
-                // Friday decides: keep listening for your reply, or wrap up ("Goodnight, Onkar") and close.
+                // Friday decides: keep listening for your reply, or wrap up ("Goodnight!") and close.
                 // No tag means it didn't say, so it listens; a few seconds of silence still ends it.
                 root.expectReply = root.lastTag !== "end";
                 root.endAfterSpeaking = root.lastTag === "end";
@@ -564,13 +585,25 @@ Singleton {
     }
 
     // ---------------------------------------------------------------- approvals
+    property var approvalQueue: []              // more requests while one is on screen wait their turn
     function requestApproval(payload) {
+        let a;
         try {
-            root.approval = JSON.parse(payload);
+            a = JSON.parse(payload);
         } catch (e) {
             console.log("[Friday] bad approval payload:", e);
             return;
         }
+        // friday-approve makes ids with uuid4().hex; anything else didn't come from it
+        if (!a || !/^[0-9a-f]{32}$/.test(String(a.id ?? ""))) {
+            console.log("[Friday] ignored an approval request with a malformed id");
+            return;
+        }
+        if (root.approval) {                        // never swap the card you're looking at
+            root.approvalQueue = [...root.approvalQueue, a];
+            return;
+        }
+        root.approval = a;
         root.show();
         // In a spoken conversation, ask out loud and listen for the answer.
         if (root.voiceTurn || root.voiceSession) root.askApprovalAloud(false);
@@ -590,8 +623,16 @@ Singleton {
         const a = root.approval;
         if (!a) return;
         root.approval = null;
-        Quickshell.execDetached(["bash", "-c",
-            "mkdir -p '" + root.runtimeDir + "/res' && printf %s " + (allow ? "allow" : "deny") + " > '" + root.runtimeDir + "/res/" + a.id + "'"]);
+        if (/^[0-9a-f]{32}$/.test(String(a.id))) {
+            // arguments, not a pasted-together command line: nothing in the request can become shell code
+            Quickshell.execDetached(["bash", "-c", 'umask 077; mkdir -p "$1/res" && printf %s "$2" > "$1/res/$3"',
+                                     "friday", root.runtimeDir, allow ? "allow" : "deny", String(a.id)]);
+        }
+        if (root.approvalQueue.length > 0) {        // the next one, if any
+            const next = root.approvalQueue[0];
+            root.approvalQueue = root.approvalQueue.slice(1);
+            root.requestApproval(JSON.stringify(next));
+        }
     }
 
     // ---------------------------------------------------------------- live context + instant controls
@@ -797,6 +838,7 @@ Singleton {
     function onVoiceEvent(line) {
         let e;
         try { e = JSON.parse(line); } catch (err) { return; }
+        voiceWatch.restart();
         switch (e.ev) {
         case "hello": break;
         case "ready": root.voiceState = root.restState; break;
@@ -843,12 +885,15 @@ Singleton {
             if (t.length === 0) break;
             if (root.approval) {                 // answer an approval card out loud
                 const high = root.approval.risk === "high";
+                // Only a short, clear answer counts: "yes", "go ahead", "confirm". A "yes" buried in a longer
+                // sentence (or in a video playing nearby) doesn't approve anything.
+                const short = t.split(/\s+/).length <= 5;
                 if (/^\W*(no|nope|nah|don'?t|do not|deny|stop|cancel|wait|hold on|not now|skip)\b/i.test(t)) {
                     root.resolveApproval(false);
                     root.voiceCmd("say " + JSON.stringify("Okay, skipped."));
-                } else if (high && /\b(confirm(ed)?|i'?m sure|yes,? i'?m sure|definitely)\b/i.test(t)) {
+                } else if (high && short && /^\W*(confirm(ed)?|yes,? confirm|i'?m sure|yes,? i'?m sure)\b/i.test(t)) {
                     root.resolveApproval(true);
-                } else if (!high && /\b(yes|yeah|yep|yup|sure|okay|ok|allow|approve|go ahead|do it|run it|go for it|proceed|haan|please)\b/i.test(t)) {
+                } else if (!high && short && /^\W*(yes|yeah|yep|yup|sure|okay|ok|allow( it)?|approve( it)?|go ahead|do it|run it|go for it|proceed|haan|confirm)\b/i.test(t)) {
                     root.resolveApproval(true);
                 } else {
                     root.askApprovalAloud(true);           // didn't catch a clear yes/no: ask again
@@ -912,6 +957,42 @@ Singleton {
         }
     }
     Timer { id: voiceRestart; interval: 4000; onTriggered: voiceProc.running = true }
+    // Watchdogs, so Friday can never sit frozen on your screen:
+    //  * voice: listening/transcribing/speaking with no word from the voice process for 45 s -> cancel, then restart it
+    //  * a turn: no output at all for 3 minutes (and no approval card waiting on you) -> stop it and say so
+    Timer {
+        id: voiceWatch
+        interval: 60000
+        onTriggered: {
+            if (!(root.hearing || root.voiceState === "speaking")) return;
+            console.log("[Friday] voice went quiet in state " + root.voiceState + "; cancelling");
+            root.voiceCmd("cancel");
+            root.voiceState = root.restState;
+            root.voiceSession = false;
+            root.expectReply = false;
+            root.endAfterSpeaking = false;
+            voiceKick.restart();
+        }
+    }
+    Timer {
+        id: voiceKick                            // still no sign of life after the cancel: restart the voice process
+        interval: 6000
+        onTriggered: if (voiceProc.running && voiceWatch.running === false) { voiceProc.running = false; voiceRestart.restart(); }
+    }
+    property int openTools: 0                   // tool calls started but not finished (a long build is not "stuck")
+    Timer {
+        id: stallWatch
+        interval: 180000
+        repeat: true
+        running: proc.running
+        onRunningChanged: if (running) root.openTools = 0
+        onTriggered: {
+            if (!proc.running || root.approval || root.openTools > 0) return;
+            console.log("[Friday] no output for 3 min; stopping the turn");
+            proc.running = false;
+            root.addText((root.gotText ? "\n\n" : "") + "_That got stuck (nothing back for 3 minutes), so I stopped it. Try again?_");
+        }
+    }
     // When the voice code is updated, restart it so the shell and the voice never speak different protocols.
     FileView {
         path: root.home + "/.local/share/friday/voice/friday_voice.py"

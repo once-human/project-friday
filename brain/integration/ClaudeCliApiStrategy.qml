@@ -17,22 +17,41 @@ ApiStrategy {
         if (turns.length > 1) {
             prompt += "Earlier in this sidebar chat:\n\n";
             for (let i = 0; i < turns.length - 1; i++) {
-                prompt += (turns[i].role === "user" ? "Onkar: " : "Friday: ") + turns[i].rawContent + "\n\n";
+                prompt += (turns[i].role === "user" ? "User: " : "Friday: ") + turns[i].rawContent + "\n\n";
             }
-            prompt += "Current message from Onkar:\n";
+            prompt += "Current message:\n";
         }
         prompt += turns.length > 0 ? turns[turns.length - 1].rawContent : "";
         pendingPrompt = prompt;
         return {};
     }
 
+    // UTF-8 -> base64, by hand (so it's exact for any language and needs nothing from Qt)
+    function b64(str) {
+        const bytes = [];
+        for (const ch of String(str)) {
+            let c = ch.codePointAt(0);
+            if (c < 0x80) bytes.push(c);
+            else if (c < 0x800) bytes.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+            else if (c < 0x10000) bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+            else bytes.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+        }
+        const A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let out = "";
+        for (let i = 0; i < bytes.length; i += 3) {
+            const n = (bytes[i] << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0);
+            out += A[(n >> 18) & 63] + A[(n >> 12) & 63] + (i + 1 < bytes.length ? A[(n >> 6) & 63] : "=") + (i + 2 < bytes.length ? A[n & 63] : "=");
+        }
+        return out;
+    }
+
+    // The chat goes into the script as base64 (letters, digits, + / =), so nothing anyone types or pastes can
+    // ever be read as shell code.
     function finalizeScriptContent(scriptContent) {
-        const eof = "__FRIDAY_EOF_7f3a91__";
         return "#!/usr/bin/env bash\n"
             + "unset FRIDAY_PROMPT FRIDAY_SESSION\n"
             + "export FRIDAY_SURFACE=sidebar\n"
-            + "exec \"$HOME/.local/share/friday/bin/friday-ask\" <<'" + eof + "'\n"
-            + pendingPrompt + "\n" + eof + "\n";
+            + "printf %s '" + b64(pendingPrompt) + "' | base64 -d | exec \"$HOME/.local/share/friday/bin/friday-ask\"\n";
     }
 
     function describeTool(block) {
