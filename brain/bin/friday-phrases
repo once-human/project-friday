@@ -93,9 +93,10 @@ def main():
     spec = {k: {"examples": v[:3], "required": sorted(CORE[k]), "optional": sorted(SLOTS[k] - CORE[k])}
             for k, v in P.items() if k not in skip and k != "joke"}
     prompt = (
-        "You write short spoken replies for Friday, a voice assistant on Onkar's Linux laptop (think JARVIS: calm, "
-        "quick, a little dry wit; he talks casually, Indian English, 'man', 'bro' are fine occasionally). "
-        "For EACH answer type below, write 6 NEW ways to say it. Rules: natural spoken English, one or two short "
+        "You write short spoken replies for Friday, a voice assistant on someone's Linux laptop (think JARVIS: calm, "
+        "quick, a little dry wit; casual and friendly, never cheesy). "
+        + ("How they talk: " + os.environ["FRIDAY_STYLE"] + ". " if os.environ.get("FRIDAY_STYLE") else "")
+        + "For EACH answer type below, write 6 NEW ways to say it. Rules: natural spoken English, one or two short "
         "sentences, no emoji, no markdown, vary the structure, don't be cheesy or over-the-top. Use EXACTLY the "
         "{placeholders} given: every 'required' one must appear, 'optional' ones may, no others, keep the curly braces. Also add an answer type "
         "\"joke\" with 10 new, original, clean, genuinely funny one-liners (tech, Linux, coding, everyday life), "
