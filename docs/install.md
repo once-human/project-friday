@@ -36,9 +36,10 @@ Hyprland without ii is a close second: everything except those three ii hooks.
 | Link | `~/.config/quickshell/friday → <repo>/shell`, `~/.local/share/friday → <repo>/brain`. Your personal files (`me.md`, `memory/`, `config.env`, `device-profile.md`) live in `brain/` and are git-ignored. |
 | Desktop | Shortcut, autostart and app-menu entries (search "Friday" in your launcher). See the table below. |
 | Voice | Optional: `friday-voice-setup` (Python env via `uv`, Vosk, Whisper `small.en`, Piper, the neural voice packages). |
-| Start | `friday-start --restart`. From then on it starts at login and restarts itself if it crashes. |
+| Command | Links `project-friday` (and `friday`, when that name is free) into `~/.local/bin`, and offers to put `~/.local/bin` on your PATH if it isn't. |
+| Start | `project-friday restart`. From then on it starts at login and restarts itself if it crashes. |
 
-Run it again any time: it's idempotent, and it's also how you update (`git pull && ./install.sh`).
+Run it again any time: it's idempotent, and it's also how you update (`project-friday update` does `git pull` + `./install.sh` + restart for you).
 
 ### Per desktop
 
@@ -66,11 +67,12 @@ Then bind a key to `~/.local/share/friday/bin/friday-toggle` (and `friday-toggle
 ## Updating, stopping, removing
 
 ```bash
-cd <repo> && git pull && ./install.sh     # update
-~/.local/share/friday/bin/friday-start --restart   # restart after editing things
-~/.local/share/friday/bin/friday-start --stop      # stop until next login
-./uninstall.sh            # remove every hook Friday added (your brain/ files stay)
-./uninstall.sh --voice    # ...and delete the ~700 MB of speech models
+project-friday update       # pull the latest, re-link, restart
+project-friday restart      # restart after editing things (or if it's stuck)
+project-friday stop         # stop until next login
+project-friday status       # what's running and set up
+project-friday uninstall    # remove every hook Friday added (your brain/ files stay)
+project-friday uninstall --voice    # ...and delete the ~700 MB of speech models
 ```
 
 ## Troubleshooting the install

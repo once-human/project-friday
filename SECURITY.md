@@ -4,7 +4,7 @@ Project Friday is a personal project, maintained in my spare time, with no bug b
 
 ## Reporting a problem
 
-Please **don't open a public issue** for anything exploitable. Use GitHub's private reporting instead: the repository's **Security** tab → **Report a vulnerability**. Include what you did, what happened, and the Friday commit you were on (`git -C ~/Projects/project-friday rev-parse --short HEAD`, or wherever you cloned it). I'll reply when I can and credit you in the fix if you'd like.
+Please **don't open a public issue** for anything exploitable. Use GitHub's private reporting instead: the repository's **Security** tab → **Report a vulnerability**. Include what you did, what happened, and the Friday version you were on (`project-friday version`). I'll reply when I can and credit you in the fix if you'd like.
 
 For anything that isn't exploitable (a command the guard asks about that it shouldn't, a confusing approval card), a normal issue is fine.
 
@@ -47,4 +47,4 @@ Other protections:
 
 ## Supported versions
 
-Only the latest commit on `main`. Update with `git pull && ./install.sh`.
+Only the latest commit on `main`. Update with `project-friday update`.

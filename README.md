@@ -51,12 +51,26 @@ The installer asks once before using `sudo`, then does everything itself:
 
 1. detects your distro, package manager and desktop
 2. installs what's missing: **Quickshell** (from the AUR, a COPR, or built from source), **Claude Code** (Anthropic's official installer), clipboard, screenshot, media and audio tools, and the icon font
-3. links Friday in (`~/.config/quickshell/friday → shell/`, `~/.local/share/friday → brain/`), so `git pull && ./install.sh` updates it
+3. links Friday in (`~/.config/quickshell/friday → shell/`, `~/.local/share/friday → brain/`), so `project-friday update` keeps it current
 4. adds a keyboard shortcut, autostart (Friday restarts itself if it ever crashes) and app-menu entries for your desktop
 5. offers voice (~700 MB of local speech models), then starts Friday
 
 Flags: `--yes` (no questions), `--no-voice`, `--no-deps` (don't touch system packages), `--dry-run` (show what it would do).
-Remove everything with `./uninstall.sh`.
+
+After that, everything is one command, `project-friday` (or just `friday` if nothing else on your system uses that name):
+
+| | |
+|---|---|
+| `project-friday status` | running? signed in? voice, backup model, Claude usage |
+| `project-friday restart` | if it ever gets stuck |
+| `project-friday start` · `stop` | |
+| `project-friday update` | pull the latest version, re-link, restart |
+| `project-friday ask "…"` | open Friday and ask something from a terminal or script |
+| `project-friday config` · `me` | edit your settings · what Friday knows about you |
+| `project-friday music "…"` | play something (`stop`, `next`, `like`, `taste`) |
+| `project-friday voice setup` · `voice test` | install / check voice |
+| `project-friday logs` | recent voice and shell logs, and the guard's last decisions |
+| `project-friday uninstall` | remove everything Friday added (your `brain/` files stay) |
 You need a Claude **Pro, Max, Team, Enterprise or Console** account for Claude Code; the first time, Friday shows a **Sign in** card.
 
 ### Make it yours
@@ -97,9 +111,9 @@ Details, manual install and per-distro notes: [docs/install.md](docs/install.md)
 The installer offers it; to add it later:
 
 ```bash
-~/.local/share/friday/bin/friday-voice-setup     # ~700 MB of local models, one time
-~/.local/share/friday/bin/friday-start --restart
-~/.local/share/friday/bin/friday-voice --test    # say something; it should repeat it back
+project-friday voice setup     # ~700 MB of local models, one time
+project-friday restart
+project-friday voice test      # say something; it should repeat it back
 ```
 
 | Piece | What | Why |
@@ -122,7 +136,7 @@ Claude plans have usage limits. When yours runs out, Friday hands your request t
 | **OpenRouter** | free key at [openrouter.ai/keys](https://openrouter.ai/keys) → `OPENROUTER_API_KEY=…` | routes to whichever free model is up | depends on the model it picks |
 | **Ollama** | install [Ollama](https://ollama.com), `ollama pull gpt-oss:20b` (or `qwen3`, `gemma3`) | fully offline, nothing leaves your laptop | local |
 
-With several set, it tries them in that order (`FRIDAY_FALLBACK=gemini|groq|openrouter|ollama|off` to choose). The backup gets the same context Claude would (your request, `me.md`, Friday's notes and desktop context) and acts through the same guard, so the same things are allowed, asked about or refused. It's a stand-in, not Claude: fine for questions, quick tasks and chat; for big coding jobs it'll tell you to wait. `friday-fallback --status` shows what's set up. Free tiers and model names change often, so treat this list as a starting point.
+With several set, it tries them in that order (`FRIDAY_FALLBACK=gemini|groq|openrouter|ollama|off` to choose). The backup gets the same context Claude would (your request, `me.md`, Friday's notes and desktop context) and acts through the same guard, so the same things are allowed, asked about or refused. It's a stand-in, not Claude: fine for questions, quick tasks and chat; for big coding jobs it'll tell you to wait. `project-friday backup` shows what's set up. Free tiers and model names change often, so treat this list as a starting point.
 
 ## Keys
 

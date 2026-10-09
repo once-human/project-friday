@@ -16,6 +16,7 @@ IPC (`qs -c friday ipc call friday <fn>`): `toggle`, `show`, `hide`, `ask <text>
 
 | Helper | Role |
 |---|---|
+| `project-friday` | The command you use (`friday` for short): start/stop/restart/status/update/logs/config/ask/music/voice/backup/uninstall. Thin wrapper over the helpers below. |
 | `friday-ask` | Finds `claude`, adds desktop context (time, focused window, clipboard when you say "this"), runs `claude -p --output-format stream-json` with the policy hook. |
 | `friday-fallback` | The backup brain. Wraps Claude Code's stream; if Claude reports a usage limit (or is overloaded) before saying anything, the request goes to a free model instead (Gemini Flash, Groq, OpenRouter's free router, or Ollama on the laptop), which can still run commands, read files and look at the screen through `friday-approve`. It speaks the same stream-json, so the panel doesn't know the difference. When Claude is back, it gets the backup chat as context. |
 | `friday-approve` | Claude Code `PreToolUse` hook: allow / ask (approval card over IPC) / deny. Appends every decision to `audit.log`. |
@@ -73,7 +74,7 @@ little usage. Phrasings come from built-in variations plus `~/.local/state/frida
 
 `friday-start` is run once by Hyprland at login. It starts `qs -c friday`, checks every 5 s and restarts it if it
 died (it gives up with a notification after 5 crashes in a row), and kicks off the weekly phrase refresh.
-`friday-start --restart` after updates, `--stop` to stop until next login.
+`project-friday restart` after updates (it calls `friday-start --restart`), `project-friday stop` to stop until next login.
 
 Nothing calls Claude in the background except that weekly phrase refresh. Session titles are made locally, and
 `friday-usage` only reads the usage meter.
