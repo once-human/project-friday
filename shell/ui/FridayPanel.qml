@@ -220,9 +220,7 @@ PanelWindow {
         if (Brain.hearing) return [["esc", "Cancel"]];
         if (win.showHistory) return [["↑↓", "Select"], ["↵", "Open"], ["Del", "Remove"], ["esc", "Back"]];
         if (Brain.voiceState === "speaking") return [["esc", "Stop talking"]];
-        if (win.home) return (Brain.voiceOn || Brain.voiceState === "muted")
-            ? [["↑↓", "Select"], ["↵", "Open"], ["Ctrl M", "Talk"], ["esc", Brain.selection.length > 0 ? "Clear" : "Close"]]
-            : [["↑↓", "Select"], ["↵", "Open"], ["esc", Brain.selection.length > 0 ? "Clear" : "Close"]];
+        if (win.home) return [["↑↓", "Select"], ["↵", "Open"], ["esc", Brain.selection.length > 0 ? "Clear" : "Close"]];
         return [["↵", Brain.running ? "Redirect" : "Reply"], ["Ctrl N", "New chat"], ["esc", "Close"]];
     }
 
@@ -570,15 +568,6 @@ PanelWindow {
                         icon: "stop_circle"
                         onClicked: Brain.stop()
                     }
-                    Glyph {                          // History
-                        visible: !Brain.hearing && (Brain.history.length > 0 || win.showHistory)
-                        icon: win.showHistory ? "close" : "history"
-                        onClicked: {
-                            win.showHistory = !win.showHistory;
-                            win.sel = 0;
-                            input.forceActiveFocus();
-                        }
-                    }
                     Glyph {
                         visible: !Brain.running && Brain.messages.count > 0 && !win.showHistory
                         icon: "edit_square"
@@ -722,18 +711,63 @@ PanelWindow {
                     }
                 }
 
-                // ======================================================== your world, in one line
-                Text {
-                    visible: win.home && !win.showHistory && Brain.selection.length === 0 && win.query.length === 0 && !Brain.focusActive && win.statusLine.length > 0
+                // ======================================================== your world, in one line + History
+                RowLayout {
+                    visible: win.home && Brain.selection.length === 0
+                             && (win.showHistory || (win.query.length === 0 && ((win.statusLine.length > 0 && !Brain.focusActive) || Brain.history.length > 0)))
                     Layout.fillWidth: true
                     Layout.leftMargin: 22
-                    Layout.rightMargin: 22
+                    Layout.rightMargin: 18
                     Layout.topMargin: 14
-                    text: win.statusLine
-                    elide: Text.ElideRight
-                    font.family: Theme.sans
-                    font.pixelSize: 13
-                    color: Theme.textSecondary
+                    spacing: 12
+                    Text {
+                        Layout.fillWidth: true
+                        text: win.showHistory ? "Recent chats" : (Brain.focusActive ? "" : win.statusLine)
+                        elide: Text.ElideRight
+                        font.family: Theme.sans
+                        font.pixelSize: 13
+                        color: Theme.textSecondary
+                    }
+                    // History: swaps the suggestions below for your recent chats (Ctrl+H does the same)
+                    Item {
+                        id: historyLink
+                        visible: win.showHistory || Brain.history.length > 0
+                        implicitWidth: histRow.implicitWidth
+                        implicitHeight: histRow.implicitHeight
+                        Row {
+                            id: histRow
+                            spacing: 4
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: win.showHistory ? "arrow_back" : "history"
+                                font.family: Theme.icons
+                                font.pixelSize: 15
+                                color: histMa.containsMouse ? Theme.accent : Theme.textTertiary
+                                Behavior on color { ColorAnimation { duration: Theme.fast } }
+                            }
+                            Text {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: win.showHistory ? "Back" : "History"
+                                font.family: Theme.sans
+                                font.pixelSize: 13
+                                color: histMa.containsMouse ? Theme.accent : Theme.textTertiary
+                                Behavior on color { ColorAnimation { duration: Theme.fast } }
+                            }
+                        }
+                        MouseArea {
+                            id: histMa
+                            anchors.fill: parent
+                            anchors.margins: -6
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                win.showHistory = !win.showHistory;
+                                win.sel = 0;
+                                input.text = "";
+                                input.forceActiveFocus();
+                            }
+                        }
+                    }
                 }
 
                 // ======================================================== home rows
