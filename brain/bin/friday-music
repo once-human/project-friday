@@ -1,35 +1,217 @@
 #!/usr/bin/env bash
-# friday-music <house|afro|fred|techno|chill|"any search">   actually plays it
+# friday-music <anything>      plays it: a request ("fred again boiler room", "high energy"), or a vague ask
+#                              ("something nice", "play me something") which is answered from YOUR taste
 # friday-music stop | now
+# friday-music --say "<ask>"   decide what to play, remember the plan, print a sentence to say out loud (instant, offline)
+# friday-music --go            play the plan --say just made
+# friday-music like "<artist>" | dislike "<artist>" | taste     teach it / see what it knows
 #
 # Best: mpv + yt-dlp -> plays in the background (no browser tab), shows up in your media controls
 #       (install mpv-mpris too so the bar's play/pause/next work).
 # Else: opens the first matching YouTube video in your browser, already playing.
+#
+# Taste lives in ~/.local/share/friday/music-taste.json: artists and genres you like, weighted by what you
+# actually play, with what you played recently set aside so it doesn't repeat itself.
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
 D="${XDG_RUNTIME_DIR:-/tmp}/friday"; mkdir -p "$D"
-case "${1:-chill}" in
+FRIDAY_HOME="${FRIDAY_HOME:-$HOME/.local/share/friday}"
+TASTE="$FRIDAY_HOME/music-taste.json"
+PLAN="$D/music-plan.json"
+export TASTE PLAN
+
+planner() { python3 -I - "$@" <<'PY'
+import json, os, random, re, sys, time
+
+TASTE, PLAN = os.environ["TASTE"], os.environ["PLAN"]
+SEED = {
+    "artists": {"Fred again..": 3},
+    "genres": {"house": 2, "afro house": 2, "melodic techno": 2, "chill house": 1},
+    "recent": [],
+}
+
+def load():
+    try:
+        t = json.load(open(TASTE))
+    except Exception:
+        t = {}
+    for k, v in SEED.items():
+        t.setdefault(k, json.loads(json.dumps(v)))
+    return t
+
+def save(t):
+    os.makedirs(os.path.dirname(TASTE), exist_ok=True)
+    json.dump(t, open(TASTE, "w"), indent=1, ensure_ascii=False)
+
+# words that describe a mood or a format, not a thing to search for
+MOODS = {
+    "energy": r"high[- ]?energy|energetic|hype|hyped|pump(ed)?( up)?|workout|gym|party|banger|bangers|hard|intense|lit|rave|peak",
+    "focus":  r"focus|focused|work|working|coding|study|studying|concentrat\w*|deep work|flow",
+    "chill":  r"chill|chilled|relax\w*|calm|mellow|sleep\w*|wind down|late night|slow|soft|easy",
+    "happy":  r"happy|uplifting|good vibes?|feel good|sunny|summer|morning",
+}
+FILLER = (r"\b(play|put on|some|me|something|anything|a|an|the|my|music|songs?|tracks?|playlist|mix|stuff|"
+          r"nice|good|great|cool|decent|sick|fire|best|favou?rite|favs?|usual|please|for|to|on|youtube|"
+          r"surprise|vibe|vibes?|what i like|i like|you think|i'?d like|would like|then|and|of|with|by|something)\b")
+VAGUE = re.compile(r"^\W*$")
+# how each mood wants to be served for an artist, and for a genre
+ARTIST_FMT = {
+    "energy": ["boiler room set", "live set", "festival set"],
+    "focus":  ["deep focus mix", "studio mix", "ambient mix"],
+    "chill":  ["chill mix", "live set sunrise", "acoustic live"],
+    "happy":  ["live set", "mix", "boiler room set"],
+    None:     ["boiler room set", "live set"],
+}
+GENRE_FMT = {
+    "energy": "high energy {g} set 2026 long set", "focus": "{g} deep focus mix long set",
+    "chill": "{g} chill mix long set", "happy": "uplifting {g} mix long set", None: "{g} mix 2026 long set",
+}
+ALIASES = {"fred": "Fred again..", "fredagain": "Fred again..", "fred again": "Fred again..", "fred again..": "Fred again..",
+           "house": "@house", "afro": "@afro house", "afro house": "@afro house", "techno": "@melodic techno",
+           "melodic techno": "@melodic techno", "chill": "@chill house", "deep house": "@deep house"}
+
+EXTRA = {"fred again..": {"energy": ["USB002 live"], None: ["USB002 live"]}}   # artist-specific formats worth offering
+
+def fmt_for(name, mood):
+    return random.choice(ARTIST_FMT[mood] + EXTRA.get(name.lower(), {}).get(mood, []))
+
+def mood_of(t):
+    for m, rx in MOODS.items():
+        if re.search(r"\b(" + rx + r")\b", t):
+            return m
+    return None
+
+def strip_moods(t):
+    for rx in MOODS.values():
+        t = re.sub(r"\b(" + rx + r")\b", " ", t)
+    return t
+
+def time_mood():                                                 # only the late hours change what "something nice" means
+    h = time.localtime().tm_hour
+    return "chill" if (h >= 23 or h < 5) else None
+
+def weighted(d, recent):
+    items = [(k, v) for k, v in d.items() if v > 0]
+    if not items:
+        return None
+    fresh = [(k, v) for k, v in items if k not in recent] or items
+    return random.choices([k for k, _ in fresh], weights=[v for _, v in fresh])[0]
+
+def plan(ask):
+    t = load()
+    raw = (ask or "").strip()
+    low = raw.lower()
+    mood = mood_of(low)
+    rest = re.sub(r"\s+", " ", re.sub(FILLER, " ", strip_moods(low))).strip(" .,!?-")
+    light = re.sub(r"\s+", " ", re.sub(r"^(please |can you |could you )?(play|put on)( me)?( some| a| the)? ", "", strip_moods(low))).strip(" .,!?-")
+    light = re.sub(r"( music| songs?| please| on youtube)$", "", light).strip()
+    recent = t["recent"][-4:]
+    p = {"ask": raw, "mood": mood, "long": True, "kind": "taste"}
+    artists = {a.lower(): a for a in t["artists"]}
+
+    if rest in ALIASES or rest in artists:                       # a named artist or genre, maybe with a mood
+        name = ALIASES.get(rest) or artists[rest]
+        if name.startswith("@"):
+            g = name[1:]
+            p.update(kind="genre", genre=g, query=GENRE_FMT[mood].format(g=g), say=("some " + g))
+        else:
+            fmt = fmt_for(name, mood)
+            p.update(kind="artist", artist=name, query=f"{name} {fmt}", match=name.lower().split("..")[0].strip(),
+                     say=f"{name}, {fmt}")
+    elif rest and not VAGUE.match(rest):                         # something specific: search exactly that
+        q = light if not mood else f"{light} {random.choice(ARTIST_FMT[mood])}"
+        p.update(kind="search", query=q, long=bool(mood) or len(light.split()) <= 2, say=q)
+        if mood is None and len(light.split()) >= 2:
+            p["long"] = False                                    # "artist song" -> that track
+    else:                                                        # vague: this is where taste decides
+        mood = mood or time_mood()
+        p["mood"] = mood
+        if random.random() < 0.7 and t["artists"]:
+            a = weighted(t["artists"], recent)
+            fmt = fmt_for(a, mood)
+            p.update(kind="artist", artist=a, query=f"{a} {fmt}", match=a.lower().split("..")[0].strip(),
+                     say=f"{a}, {fmt}")
+        else:
+            g = weighted(t["genres"], recent) or "house"
+            p.update(kind="genre", genre=g, query=GENRE_FMT[mood].format(g=g), say=f"some {g}")
+    if p["kind"] == "genre" and mood:
+        p["say"] = f"some {mood if mood != 'energy' else 'high energy'} {p['genre']}"
+    return p
+
+cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+if cmd == "plan":
+    p = plan(" ".join(sys.argv[2:]))
+    json.dump(p, open(PLAN, "w"))
+    print(p["say"])
+elif cmd == "field":                                             # print one field of the saved plan
+    p = json.load(open(PLAN))
+    print(p.get(sys.argv[2], ""))
+elif cmd == "pick":                                              # stdin: id<TAB>title<TAB>channel<TAB>duration; print best id
+    p = json.load(open(PLAN))
+    rows = [l.rstrip("\n").split("\t") for l in sys.stdin if l.strip()]
+    rows = [r + [""] * (4 - len(r)) for r in rows]
+    junk = re.compile(r"\b(reaction|tutorial|lyrics? video|cover|remake|karaoke|slowed|reverb|8d|nightcore|shorts?|podcast|interview|reacts?)\b", re.I)
+    rows = [r for r in rows if not junk.search(r[1])] or rows
+    m = p.get("match")
+    if m:                                                        # an artist was asked for: it has to actually be them
+        rows = [r for r in rows if m in (r[1] + " " + r[2]).lower()] or rows
+    if p.get("long"):
+        def dur(r):
+            try: return float(r[3])
+            except Exception: return 0.0
+        long = [r for r in rows if 1200 <= dur(r) <= 14400]   # a set, not a 108-hour compilation
+        rows = long or rows
+    rows = rows[:3]                                              # best few, then a little variety
+    print(random.choice(rows)[0] if rows else "")
+elif cmd == "learn":                                             # remember what is being played
+    p = json.load(open(PLAN))
+    t = load()
+    if p.get("artist"):
+        t["artists"][p["artist"]] = t["artists"].get(p["artist"], 0) + 1
+    elif p.get("genre"):
+        t["genres"][p["genre"]] = t["genres"].get(p["genre"], 0) + 1
+    key = p.get("artist") or p.get("genre")
+    if key:
+        t["recent"] = (t["recent"] + [key])[-8:]
+    save(t)
+elif cmd in ("like", "dislike"):
+    t = load()
+    name = " ".join(sys.argv[2:]).strip()
+    n = ALIASES.get(name.lower(), name)
+    bucket = "genres" if n.startswith("@") else "artists"
+    n = n.lstrip("@")
+    if cmd == "like":
+        t[bucket][n] = t[bucket].get(n, 0) + 3
+        print(f"Noted, you like {n}.")
+    else:
+        t[bucket].pop(n, None)
+        print(f"Dropped {n}.")
+    save(t)
+elif cmd == "taste":
+    t = load()
+    top = lambda d: ", ".join(k for k, _ in sorted(d.items(), key=lambda x: -x[1])[:8])
+    print("Artists: " + top(t["artists"]) + "\nGenres: " + top(t["genres"]))
+PY
+}
+
+case "${1:-}" in
   stop) pkill -f -- "--title=friday-music" && echo "stopped" || echo "nothing playing"; exit 0 ;;
   now)  cat "$D/music-now" 2>/dev/null || echo "nothing playing"; exit 0 ;;
-  house)  Q="house music mix 2026 long set"; LONG=1 ;;
-  afro)   Q="afro house mix 2026 long set"; LONG=1 ;;
-  fred)   Q="fred again.. boiler room live set"; LONG=1 ;;
-  techno) Q="melodic techno mix 2026 long set"; LONG=1 ;;
-  chill)  Q="chill house deep focus mix"; LONG=1 ;;
-  *)      Q="$*"; LONG=0 ;;
+  like|dislike|taste) planner "$@"; exit 0 ;;
+  --say) shift; planner plan "$@"; exit 0 ;;
+  --go) ;;
+  *)    planner plan "${*:-something}" >/dev/null ;;
 esac
 
-pick_id() {   # a video id for the query: yt-dlp if present (random long one for mixes), else read YouTube's results page
+Q="$(planner field query)"
+
+pick_id() {   # best video for the plan: yt-dlp metadata when present, else read YouTube's results page
   if command -v yt-dlp >/dev/null 2>&1; then
-    if [ "$LONG" = 1 ]; then
-      timeout 15 yt-dlp --flat-playlist --print id --match-filter 'duration > 1200' "ytsearch8:$Q" 2>/dev/null | shuf -n1
-    else
-      timeout 15 yt-dlp --flat-playlist --print id "ytsearch1:$Q" 2>/dev/null | head -1
-    fi
+    timeout 20 yt-dlp --flat-playlist --print "%(id)s	%(title)s	%(channel)s	%(duration)s" "ytsearch10:$Q" 2>/dev/null | planner pick
   else
     ENC="$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote_plus(sys.argv[1]))' "$Q")"
     curl -s --max-time 10 -A "Mozilla/5.0 (X11; Linux x86_64)" -H "Accept-Language: en" \
       "https://www.youtube.com/results?search_query=$ENC" | grep -o '"videoId":"[A-Za-z0-9_-]\{11\}"' \
-      | awk -F'"' '!seen[$4]++ {print $4}' | head -$([ "$LONG" = 1 ] && echo 4 || echo 1) | shuf -n1
+      | awk -F'"' '!seen[$4]++ {print $4}' | head -3 | shuf -n1
   fi
 }
 
@@ -40,6 +222,7 @@ if [ -z "$ID" ]; then
   echo "couldn't pick a video; opened the search instead"; exit 0
 fi
 URL="https://www.youtube.com/watch?v=$ID"
+planner learn 2>/dev/null
 
 if command -v mpv >/dev/null 2>&1 && command -v yt-dlp >/dev/null 2>&1; then
   pkill -f -- "--title=friday-music" 2>/dev/null

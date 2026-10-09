@@ -525,6 +525,8 @@ class Voice:
         self.cmd_rec = None
         self.speaker = None
         self.speak_stop = threading.Event()
+        self.say_q = queue.Queue()
+        self.speak_beat = 0.0                   # last sign of life from the speaker thread
         self.last_wake = 0.0
         self.last_check = 0.0
         self.levels = collections.deque(maxlen=60)    # last ~6 s of idle levels, for the noise floor
@@ -828,12 +830,24 @@ class Voice:
         if not self.e.neural_ready():
             self.e.load_piper()
             if self.e.piper is None:
+                log("can't speak: no natural voice and Piper isn't loaded")
                 return False
         if self.speaker and self.speaker.is_alive():
-            return True
-        self.speak_stop.clear()
+            stuck = time.time() - self.speak_beat > 60
+            if not self.speak_stop.is_set() and not stuck:
+                return True
+            # An old utterance that was told to stop (or went silent) and never finished would swallow every
+            # later answer. Abandon it: it keeps its own queue and stop flag, so it can't touch the new one.
+            log("speaker thread was stuck; starting a fresh one")
+            self.speak_stop.set()
+            p = getattr(self, "speak_proc", None)
+            if p and p.poll() is None:
+                p.kill()
+            self.speaker = None
+        self.speak_stop = threading.Event()
         self.say_q = queue.Queue()
-        self.speaker = threading.Thread(target=self._speak_stream, daemon=True)
+        self.speak_beat = time.time()
+        self.speaker = threading.Thread(target=self._speak_stream, args=(self.say_q, self.speak_stop), daemon=True)
         self.speaker.start()
         return True
 
@@ -851,7 +865,8 @@ class Voice:
         self.say_add(text)
         self.say_end()
 
-    def _speak_stream(self):
+    def _speak_stream(self, q, stop):
+        me = threading.current_thread()
         rate = NEURAL_HZ if self.e.neural_ready() else self.e.piper_rate
         cmd = raw_player(rate)
         if not cmd:
@@ -870,9 +885,10 @@ class Voice:
         import concurrent.futures
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)   # the next sentence is ready before this one ends
         try:
-            while not self.speak_stop.is_set():
+            while not stop.is_set():
+                self.speak_beat = time.time()
                 try:
-                    item = self.say_q.get(timeout=0.1)
+                    item = q.get(timeout=0.1)
                 except queue.Empty:
                     waited += 0.1
                     if waited > 45:                 # the brain went quiet: don't hold the mic hostage
@@ -889,9 +905,10 @@ class Voice:
                 emit("words", words=[w for x in sentences for w in x.split()], base=idx, id=tag)
                 jobs = [pool.submit(self.e.render, x, rate) for x in sentences]
                 for si, job in enumerate(jobs):
-                    if self.speak_stop.is_set():
+                    if stop.is_set():
                         break
-                    audio, times, engine = job.result()
+                    audio, times, engine = job.result(timeout=40)
+                    self.speak_beat = time.time()
                     now = time.time()
                     if t0 is not None and now > t0 + written / rate:
                         t0 = now - written / rate   # playback ran dry while we waited: re-align the clock
@@ -911,15 +928,16 @@ class Voice:
                     audio += b"\x00\x00" * int(rate * pause)
                     step = rate // 5 * 2            # write in 200 ms slices so "stop" is instant
                     for k in range(0, len(audio), step):
-                        if self.speak_stop.is_set():
+                        if stop.is_set():
                             break
                         p.stdin.write(audio[k:k + step])
                         p.stdin.flush()
+                        self.speak_beat = time.time()
                     written += len(audio) // 2
             p.stdin.close()
             # wait until the last word has actually been heard (the player may exit before its buffer drains)
             end_at = (t0 or time.time()) + written / rate + 0.15
-            while not self.speak_stop.is_set() and (p.poll() is None or time.time() < end_at):
+            while not stop.is_set() and (p.poll() is None or time.time() < end_at):
                 time.sleep(0.05)
         except (BrokenPipeError, OSError, ValueError) as e:
             log("speech output stopped:", e)
@@ -931,12 +949,13 @@ class Voice:
             pool.shutdown(wait=False, cancel_futures=True)
             if p.poll() is None:
                 p.terminate()
-            if self.state == self.SPEAK:
-                self.state = prev if prev != self.SPEAK else (self.IDLE if self.wake_on else self.MUTED)
-            self.mic.drain()                    # don't hear ourselves
-            self.ring.clear()
-            self.raw_ring.clear()
-            emit("speaking", on=False)
+            if self.speaker is me:      # an abandoned thread must not reset the new one's state
+                if self.state == self.SPEAK:
+                    self.state = prev if prev != self.SPEAK else (self.IDLE if self.wake_on else self.MUTED)
+                self.mic.drain()                    # don't hear ourselves
+                self.ring.clear()
+                self.raw_ring.clear()
+                emit("speaking", on=False)
 
     def stop_speaking(self):
         if self.speaker and self.speaker.is_alive():
@@ -945,6 +964,10 @@ class Voice:
             if p and p.poll() is None:
                 p.terminate()
             self.speaker.join(timeout=1.0)
+            if self.speaker.is_alive():
+                log("speaker thread didn't stop; abandoning it")
+                emit("speaking", on=False)
+                self.speaker = None
 
     # ----- main loop
     def run(self):

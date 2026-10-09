@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""friday-fallback — answer one Friday turn with a free model when Claude's usage limit is hit.
+
+Called by friday-ask. Reads the system prompt from $FRIDAY_FB_SYSTEM and the request from stdin, and prints
+the same stream-json events Claude Code does, so the panel can't tell the difference.
+
+It can talk but it can't act: no shell, no files. On-device skills (music, volume, timers…) are unaffected.
+
+Providers, first one that's configured wins (keys go in ~/.local/share/friday/config.env):
+  FRIDAY_FALLBACK_URL + FRIDAY_FALLBACK_KEY [+ FRIDAY_FALLBACK_MODEL]   any OpenAI-compatible endpoint
+  OPENROUTER_API_KEY   free models on OpenRouter   (FRIDAY_FALLBACK_MODEL to choose; ":free" ones cost nothing)
+  GEMINI_API_KEY       Google AI Studio free tier  (OpenAI-compatible endpoint)
+  Ollama on localhost:11434   fully offline, uses whichever model you've pulled
+"""
+import json, os, sys, urllib.error, urllib.request
+
+SYSTEM = os.environ.get("FRIDAY_FB_SYSTEM", "")
+NOTE = ("\n\nNote: Onkar's Claude usage limit is used up, so you are running on a backup model for now. You cannot "
+        "run commands, open files or look at the screen right now. Answer from what you know and the desktop "
+        "context in the request, be upfront (one short clause) if he's asking for something that needs those, and "
+        "never claim you did something you didn't. On-device things like music, volume and timers still work "
+        "without you.")
+
+
+def emit(o):
+    print(json.dumps(o, ensure_ascii=False), flush=True)
+
+
+def providers():
+    e = os.environ.get
+    if e("FRIDAY_FALLBACK_URL"):
+        yield ("custom", e("FRIDAY_FALLBACK_URL").rstrip("/"), e("FRIDAY_FALLBACK_KEY", ""), e("FRIDAY_FALLBACK_MODEL", ""))
+    if e("OPENROUTER_API_KEY"):
+        yield ("OpenRouter", "https://openrouter.ai/api/v1", e("OPENROUTER_API_KEY"),
+               e("FRIDAY_FALLBACK_MODEL", "meta-llama/llama-3.3-70b-instruct:free"))
+    if e("GEMINI_API_KEY"):
+        yield ("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", e("GEMINI_API_KEY"),
+               e("FRIDAY_FALLBACK_MODEL", "gemini-2.5-flash"))
+    try:                                                         # a local Ollama, if one is running
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1.5) as r:
+            models = [m["name"] for m in json.load(r).get("models", [])]
+        if models:
+            yield ("Ollama", "http://127.0.0.1:11434/v1", "ollama", e("FRIDAY_FALLBACK_MODEL", models[0]))
+    except Exception:
+        pass
+
+
+def stream(base, key, model, prompt):
+    body = json.dumps({"model": model, "stream": True, "temperature": 0.7, "messages": [
+        {"role": "system", "content": SYSTEM + NOTE}, {"role": "user", "content": prompt}]}).encode()
+    req = urllib.request.Request(base + "/chat/completions", data=body, headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + key,
+        "HTTP-Referer": "https://github.com/once-human/project-friday", "X-Title": "Friday"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                return
+            try:
+                delta = json.loads(data)["choices"][0].get("delta", {}).get("content") or ""
+            except Exception:
+                continue
+            if delta:
+                yield delta
+
+
+def main():
+    prompt = sys.stdin.read()
+    tried = []
+    for name, base, key, model in providers():
+        got = []
+        try:
+            for piece in stream(base, key, model, prompt):
+                got.append(piece)
+                emit({"type": "stream_event", "event": {"type": "content_block_delta",
+                                                       "delta": {"type": "text_delta", "text": piece}}})
+            if got:
+                emit({"type": "result", "is_error": False, "result": "".join(got)})
+                return
+            tried.append(f"{name} ({model}) sent nothing")
+        except urllib.error.HTTPError as e:
+            tried.append(f"{name} ({model}): HTTP {e.code}")
+        except Exception as e:
+            tried.append(f"{name} ({model}): {str(e)[:80]}")
+        if got:                                                  # died mid-answer: keep what we have
+            emit({"type": "result", "is_error": False, "result": "".join(got)})
+            return
+    why = "; ".join(tried) if tried else "no backup model is set up"
+    emit({"type": "result", "is_error": True, "result": (
+        "Your Claude limit is used up and the backup model didn't answer (" + why + ").\n\n"
+        "To get a free backup, put one of these in `~/.local/share/friday/config.env`: "
+        "`OPENROUTER_API_KEY=…` (free models), `GEMINI_API_KEY=…` (Google AI Studio free tier), "
+        "or install Ollama and pull a model for a fully offline one.")})
+
+
+main()

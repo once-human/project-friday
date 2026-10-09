@@ -5,6 +5,7 @@
 #            FRIDAY_SURFACE  overlay (default) | sidebar
 #            FRIDAY_MODEL    model for `claude --model` (optional; can also live in config.env)
 #            CLAUDE_BIN      explicit path to the claude binary (optional)
+#   If Claude's usage limit is hit, the turn is answered by friday-fallback (a free model; see that file).
 FRIDAY_HOME="${FRIDAY_HOME:-$HOME/.local/share/friday}"
 export FRIDAY_HOME
 [ -f "$FRIDAY_HOME/config.env" ] && . "$FRIDAY_HOME/config.env"
@@ -107,4 +108,21 @@ fi
 [ -n "${FRIDAY_SESSION:-}" ] && args+=(--resume "$FRIDAY_SESSION")
 
 cd "$FRIDAY_HOME" || fail 'Friday home missing.'
-exec "$CLAUDE" "${args[@]}" 2>&1 <<<"$FULL"
+
+# ---- run Claude; if the usage limit is what stopped it, answer from a free backup model instead ----
+# The error line is held back (the panel would print it as the answer); everything else streams straight through.
+LIMIT_RE='usage limit|hit your limit|limit reached|reached your limit|rate.?limit|too many requests|overloaded|credit balance|quota|"api_error_status":(429|529)'
+hit=0; got=0
+while IFS= read -r line; do
+  case "$line" in
+    *'"text_delta"'*) got=1 ;;
+    *'"type":"result"'*'"is_error":true'*)
+      if [ "$got" = 0 ] && printf '%s' "$line" | grep -qiE "$LIMIT_RE"; then hit=1; continue; fi ;;
+  esac
+  printf '%s\n' "$line"
+done < <("$CLAUDE" "${args[@]}" 2>&1 <<<"$FULL")
+
+if [ "$hit" = 1 ]; then
+  printf '{"type":"system","subtype":"friday_fallback","note":"Claude limit hit, using the backup model"}\n'
+  FRIDAY_FB_SYSTEM="$SURFACE" python3 "$FRIDAY_HOME/bin/friday-fallback" <<<"$FULL"
+fi

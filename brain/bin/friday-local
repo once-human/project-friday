@@ -622,15 +622,16 @@ def k_media(t):
             if players():
                 run(["playerctl", "play"])
                 return reply("media", say("resume"))
-            what = "chill"
         if re.search(r"\b(screen|video|game|file|folder|this|that|it|from|here|there|movie|episode|podcast)\b", what):
             return None
         if " and " in what and not re.search(r"(drum and bass|rock and roll|r and b|rhythm and blues)", what):
             return None
         if not online():
             return reply("need_online", say("need_online"))
-        spawn([os.path.join(BIN, "friday-music"), what])
-        return reply("music", say("play", what=what))
+        code, planned = run([os.path.join(BIN, "friday-music"), "--say", what])    # taste decides what "something nice" means
+        spoken = planned.strip().splitlines()[-1] if code == 0 and planned.strip() else what
+        spawn([os.path.join(BIN, "friday-music"), "--go"])
+        return reply("music", say("play", what=spoken))
 
 
 SITES = {
