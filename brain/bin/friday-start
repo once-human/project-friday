@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# friday-start — keeps Friday running for your whole session. Hyprland runs it once at login (hypr/friday.conf).
+#   friday-start              start Friday and bring it back if it ever crashes (one supervisor per session)
+#   friday-start --restart    restart Friday now, e.g. after an update (the supervisor brings it back)
+#   friday-start --stop       stop Friday until next login
+# The watch is a pgrep every 5 s: no measurable battery cost. Nothing here talks to Claude.
+export PATH="$HOME/.local/bin:$HOME/.local/share/friday/bin:/usr/local/bin:/usr/bin:$PATH"
+RUN="${XDG_RUNTIME_DIR:-/tmp}/friday"
+mkdir -p "$RUN"
+QS='(^|/)(qs|quickshell)( [^ ]*)* -c friday( |$)'
+alive() { pgrep -f -- "$QS" >/dev/null; }
+
+case "$1" in
+  --restart)
+    pkill -f -- "friday_voice.py" 2>/dev/null
+    pkill -f -- "$QS" 2>/dev/null
+    if ! pgrep -f -- "friday-start$" >/dev/null; then
+      setsid -f "$0" >/dev/null 2>&1          # no supervisor yet (first run after an update): start one
+    fi
+    echo "Friday restarting…"; exit 0 ;;
+  --stop)
+    pkill -f -- "friday-start$" 2>/dev/null
+    pkill -f -- "friday_voice.py" 2>/dev/null
+    pkill -f -- "$QS" 2>/dev/null
+    echo "Friday stopped (it starts again at your next login, or run friday-start)."; exit 0 ;;
+esac
+
+exec 9>"$RUN/supervisor.lock"
+flock -n 9 || exit 0                          # already supervised
+
+# once a week at most: fresh phrasings for on-device answers (one small Claude call; FRIDAY_PHRASES=off disables)
+( sleep 120; "$HOME/.local/share/friday/bin/friday-phrases" --if-stale >/dev/null 2>&1 ) &
+
+fails=0; last=0
+while true; do
+  if ! alive; then
+    now=$(date +%s)
+    if [ $(( now - last )) -lt 90 ]; then fails=$(( fails + 1 )); else fails=0; fi
+    last=$now
+    if [ "$fails" -ge 5 ]; then
+      notify-send -a Friday "Friday keeps crashing" "Stopped restarting it. Run 'qs -c friday' in a terminal to see why." 2>/dev/null
+      exit 1
+    fi
+    qs -c friday -d >/dev/null 2>&1
+    sleep 2
+  fi
+  sleep 5
+done

@@ -85,5 +85,5 @@ fi
 # ---- hook into illogical-impulse (search row, sidebar model, Claude usage in the bar)
 "$REPO/brain/bin/friday-integrate" || warn "ii integration skipped; Friday itself still works"
 
-say "done. Now run:  hyprctl reload && pkill -f 'qs -c friday'; qs -c friday -d"
+say "done. Now run:  hyprctl reload && $REPO/brain/bin/friday-start --restart"
 say "then press Super+Space."
