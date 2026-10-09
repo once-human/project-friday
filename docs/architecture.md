@@ -17,10 +17,12 @@ IPC (`qs -c friday ipc call friday <fn>`): `toggle`, `show`, `hide`, `ask <text>
 | Helper | Role |
 |---|---|
 | `friday-ask` | Finds `claude`, adds desktop context (time, focused window, clipboard when you say "this"), runs `claude -p --output-format stream-json` with the policy hook. |
+| `friday-fallback` | The backup brain. Wraps Claude Code's stream; if Claude reports a usage limit (or is overloaded) before saying anything, the request goes to a free model instead (Gemini Flash, Groq, OpenRouter's free router, or Ollama on the laptop), which can still run commands, read files and look at the screen through `friday-approve`. It speaks the same stream-json, so the panel doesn't know the difference. When Claude is back, it gets the backup chat as context. |
 | `friday-approve` | Claude Code `PreToolUse` hook: allow / ask (approval card over IPC) / deny. Appends every decision to `audit.log`. |
 | `friday-context` | One JSON line of "right now" for the UI and for Claude. |
 | `friday-screen`, `friday-windows`, `friday-open`, `friday-web`, `friday-do` | Eyes and hands. |
 | `friday-remind`, `friday-focus` | systemd user timers (reminders survive Friday closing). |
+| `friday-music` | Music that fits: parses the request (vibe, energy, artist, genre, song, "set"/"album"), fills vague ones from your taste (`FRIDAY_MUSIC` + what you've played, liked and skipped, in `~/.local/state/friday/music.json`), searches YouTube with several queries in parallel and scores every result (must look like music and match what you asked; news/talk/tutorials/shorts are thrown out; long sets for vibes, a song plus YouTube's radio for songs). Plays through mpv with an IPC socket (next track, now playing) or the browser. |
 | `friday-usage` | Claude plan limits → `$XDG_RUNTIME_DIR/friday/usage.json` (read by the panel and the ii bar). |
 | `friday-login` | Sign-in check and one-click sign-in terminal. |
 | `friday-profile` | Generates `device-profile.md` (hardware, packages, repos, tools) once a day. |

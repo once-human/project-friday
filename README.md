@@ -9,6 +9,14 @@ curl -fsSL https://raw.githubusercontent.com/once-human/project-friday/main/inst
 
 One command on any Linux desktop: it detects your distro and desktop, installs what's missing, and hooks Friday in. Built on **[Claude Code](https://claude.com/claude-code)** and **[Quickshell](https://quickshell.org)**, and at its best on **Arch + Hyprland + [illogical-impulse](https://github.com/end-4/dots-hyprland)**.
 
+> [!IMPORTANT]
+> **This is a personal project.** I built Friday for my own laptop and I'm sharing it because it's fun and it might be useful to you. You're very welcome to use it, fork it, rip parts out of it, whatever you like. Just know what you're getting:
+>
+> - It's provided **as is**, with no warranty and no support promise ([MIT license](LICENSE)). I fix things when I can.
+> - **It lets an AI run commands on your computer.** Risky actions show an approval card and the worst ones are blocked ([how](docs/safety.md)), but it's not a sandbox and no guard is perfect. Read the cards before you hit Allow. **You use it at your own risk.**
+> - Your requests go to Anthropic through Claude Code (your own account, your own usage), and spoken answers go to Microsoft's speech service unless you switch to the local voice. Details in [SECURITY.md](SECURITY.md).
+> - It's not affiliated with or endorsed by Anthropic, Microsoft, Google or anyone else whose stuff it uses. "Claude" is a trademark of Anthropic.
+
 ---
 
 ## What it does
@@ -23,10 +31,11 @@ One command on any Linux desktop: it detects your distro and desktop, installs w
 | **Writing tools** | Highlight text anywhere and press <kbd>Super</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd> to explain, summarize, proofread, rewrite, make it professional, or translate. |
 | **Everyday stuff without Claude** | Time, date, world clock, timers and reminders (it says them out loud when they go off), volume, brightness, play/pause/next, "play some Fred again", open apps and sites, Google something, weather, battery, Wi-Fi/Bluetooth, CPU/RAM/disk, screenshots, lock, workspaces, maths, unit conversion, coin/dice, your Claude usage, small talk and jokes. All handled on your laptop in ~0.1 s: **no Claude usage, and it works offline**. Only what it can't do goes to Claude; offline, it tells you so instead of hanging. Answers are phrased from a bank of variations that Claude refreshes once a week (one tiny call), so it doesn't sound canned. |
 | **Made for one person** | A greeting and one status line about your world, plus rows for what you actually do: jump back into your latest Claude Code sessions (auto-titled like *Continue Friday Overlay Polish*, with project and time) right where you left them, see what's on your connected phone (adb/fastboot), or start a 90-minute deep-work block. |
-| **One-tap music** | A row split five ways: House · Afro · Fred · Techno · Chill. Pick one (← → or click) and a long mix starts playing in the background (`mpv` + `yt-dlp`, installed for you), or the first YouTube result opens already playing. "Play some Fred again" works too. |
+| **Music that gets you** | "Play something nice" plays something *you'd* pick: it knows your taste (`FRIDAY_MUSIC`, plus what you play, like and skip) and the vibe you asked for. "High energy Fred again" finds his Boiler Room set; "afro house for the gym" a peak-time mix; a song plays and then keeps going with similar tracks. Every YouTube result is vetted first (music only, never a news clip), and "I love this", "not this", "more like this" teach it. The music row is *For you* plus your favourites. Plays in the background with `mpv` + `yt-dlp` (installed for you), or in your browser. |
+| **Backup brain** | When you hit your Claude limit, Friday doesn't go dark: a free model takes over (Gemini Flash, Groq, OpenRouter's free models, or a local Ollama model, your pick), still through the same safety guard, and tells you once that it's standing in. When Claude's back, it picks up the chat. |
 | **Uses your mouse and keyboard** | For apps with no command line, Friday looks at the screen, clicks and types (`friday-input`: `wtype` + `ydotool` on Wayland, `xdotool` on X11; the installer sets them up). Moving and scrolling are free; every click or keystroke shows an approval card unless you set `FRIDAY_INPUT_TRUST=1`. |
 | **Deep work** | A live countdown card with a progress ring, plus a notification when you're done. |
-| **Safe by design** | Every action passes a policy hook: read-only runs silently, changes need your approval, and `sudo` or disk-wiping commands are refused. All of it is logged. |
+| **Safe by design** | Every action passes a policy hook: read-only runs silently, changes need your approval (the card shows the whole command, and you have to scroll through it before Allow works), and `sudo`, disk-wiping commands, credentials, browser data and Friday's own files are off-limits. All of it is logged. See [SECURITY.md](SECURITY.md). |
 | **Claude limits in your bar** | Your 5-hour and weekly plan usage appear as rings next to CPU and RAM. The ring is usage; the dot is how far through the window you are. |
 | **Native to ii** | On illogical-impulse it also adds an "Ask Friday" row to the Super search, a *Friday* model to the AI sidebar, and Claude usage rings in the bar. Update-safe and reversible. |
 
@@ -47,8 +56,26 @@ The installer asks once before using `sudo`, then does everything itself:
 5. offers voice (~700 MB of local speech models), then starts Friday
 
 Flags: `--yes` (no questions), `--no-voice`, `--no-deps` (don't touch system packages), `--dry-run` (show what it would do).
-Then tell Friday about yourself in `brain/me.md` (git-ignored, like your memory and settings). Remove everything with `./uninstall.sh`.
+Remove everything with `./uninstall.sh`.
 You need a Claude **Pro, Max, Team, Enterprise or Console** account for Claude Code; the first time, Friday shows a **Sign in** card.
+
+### Make it yours
+
+Friday works out of the box, but it's much better once it knows you. Two git-ignored files in `brain/` (so your personal stuff never ends up in a commit):
+
+- **`me.md`**: who you are, what you work on, how you like answers. Friday reads it on every request. Start from [`me.example.md`](brain/me.example.md).
+- **`config.env`**: settings. Start from [`config.example.env`](brain/config.example.env). The personal ones:
+
+| Setting | What it does |
+|---|---|
+| `FRIDAY_NAME="Sam"` | What Friday calls you (defaults to the first name on your account) |
+| `FRIDAY_STYLE="casual, short, a bit of slang"` | How you talk, so on-device replies match your vibe |
+| `FRIDAY_VOCAB="Hyprland, fastboot, MyApp"` | Names and jargon the speech recogniser should expect |
+| `FRIDAY_ROM_DIRS="~/aosp ~/lineage"` | Android ROM build trees, so Friday can tell you when a build is running |
+| `FRIDAY_MUSIC="Fred again.., afro house, lofi"` | Artists and genres you like, favourites first (your music row and "play something nice") |
+| `GEMINI_API_KEY=…` (or `GROQ_API_KEY`, `OPENROUTER_API_KEY`, or Ollama) | The free backup brain for when Claude's limit is reached ([below](#backup-brain)) |
+
+Friday also keeps its own notes about how you work in `brain/memory/notes.md`; you can read and edit them any time.
 
 ### Where it runs
 
@@ -79,10 +106,23 @@ The installer offers it; to add it later:
 |---|---|---|
 | Wake word | [Vosk](https://alphacephei.com/vosk/) small **Indian-English** model, grammar locked to "hey friday", then Whisper confirms it was really you before anything shows | off by default (toggle **Hey Friday** in Friday's footer); when on it costs a few % of one core, and the double check kills most false wakes |
 | Live words | Vosk streaming partials, corrected by Whisper every ~1 s | what you see while talking is what gets sent |
-| Final transcript | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `small.en` (int8 on CPU, float16 on CUDA), biased with your own vocabulary | accurate on accents and jargon (Hyprland, PixelOS, fastboot…) |
+| Final transcript | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) `small.en` (int8 on CPU, float16 on CUDA), biased with your own vocabulary | accurate on accents and jargon (Hyprland, fastboot, your own project names via `FRIDAY_VOCAB`…) |
 | Voice | Microsoft neural voice `en-US-AvaNeural` via [edge-tts](https://github.com/rany2/edge-tts) when online, [Piper](https://github.com/OHF-Voice/piper1-gpl) `en_GB-jenny_dioco-medium` offline | sounds like a person, with the voice's own word timings driving the highlight; Piper keeps it working with no internet (`FRIDAY_TTS=piper` to always stay local; `FRIDAY_NEURAL_VOICE` to pick another voice, e.g. `en-GB-SoniaNeural`, `en-IN-NeerjaNeural`) |
 
 Tune it in `brain/config.env` (model size, voice, silence before it stops listening, wake word on/off).
+
+## Backup brain
+
+Claude plans have usage limits. When yours runs out, Friday hands your request to a free model so it keeps working (on-device skills like music, timers and volume never needed Claude anyway). Add **one** of these to `brain/config.env`:
+
+| Option | Get it | Good for | Privacy |
+|---|---|---|---|
+| **Gemini Flash** (recommended) | free key at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) → `GEMINI_API_KEY=…` | the smartest free model; it can also look at your screen | Google's free tier may use what you send to improve its products ([terms](https://ai.google.dev/gemini-api/terms)) |
+| **Groq** | free key at [console.groq.com/keys](https://console.groq.com/keys) → `GROQ_API_KEY=…` | very fast (`gpt-oss-120b`) | see Groq's terms |
+| **OpenRouter** | free key at [openrouter.ai/keys](https://openrouter.ai/keys) → `OPENROUTER_API_KEY=…` | routes to whichever free model is up | depends on the model it picks |
+| **Ollama** | install [Ollama](https://ollama.com), `ollama pull gpt-oss:20b` (or `qwen3`, `gemma3`) | fully offline, nothing leaves your laptop | local |
+
+With several set, it tries them in that order (`FRIDAY_FALLBACK=gemini|groq|openrouter|ollama|off` to choose). The backup gets the same context Claude would (your request, `me.md`, Friday's notes and desktop context) and acts through the same guard, so the same things are allowed, asked about or refused. It's a stand-in, not Claude: fine for questions, quick tasks and chat; for big coding jobs it'll tell you to wait. `friday-fallback --status` shows what's set up. Free tiers and model names change often, so treat this list as a starting point.
 
 ## Keys
 
@@ -133,7 +173,9 @@ More in [docs/architecture.md](docs/architecture.md) and [docs/safety.md](docs/s
 
 ## Notes and caveats
 
+- **Where your data goes**: requests Friday can't answer on-device go to Anthropic via Claude Code (or, when Claude's limit is reached, to the backup model you set up); spoken answers go to Microsoft's speech service when the neural voice is on (`FRIDAY_TTS=piper` keeps speech local); weather lookups send the place name to wttr.in. Listening, the wake word and everyday answers stay on your laptop. Full list in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md#services-friday-talks-to).
 - **Signing in** uses Claude Code's own login. Friday never touches browser cookies.
+- **The neural voice** uses [edge-tts](https://github.com/rany2/edge-tts), an unofficial client for Microsoft Edge's read-aloud service. It could change or stop working; Friday then falls back to Piper on its own.
 - **Plan usage** (`friday-usage`) reads the token Claude Code stored locally and calls the same endpoint as Claude Code's `/usage`. That endpoint is undocumented, so it may change. If it fails, the rings simply hide.
 - **ii updates**: `friday-integrate` re-applies its marked hooks at login, or skips them cleanly (with one notification) if ii's code changed. Friday itself never depends on them.
 
@@ -141,7 +183,16 @@ More in [docs/architecture.md](docs/architecture.md) and [docs/safety.md](docs/s
 
 Native macOS and Windows apps · Gmail / Calendar via MCP · scheduled routines · per-app skills · more on-device skills.
 
+## Contributing
+
+Issues and pull requests are welcome, but this is a side project, so replies can be slow and I may say no to things that don't fit how I use it. Forking it and making it your own is totally fine (and encouraged). Security problems: please report privately, see [SECURITY.md](SECURITY.md).
+
 ## Credits
 
-[Claude Code](https://claude.com/claude-code) · [Quickshell](https://quickshell.org) · [edge-tts](https://github.com/rany2/edge-tts) · [Piper](https://github.com/OHF-Voice/piper1-gpl) · [Vosk](https://alphacephei.com/vosk/) · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [Material Symbols](https://github.com/google/material-design-icons) (Apache 2.0) · [illogical-impulse](https://github.com/end-4/dots-hyprland) by end-4 · [Source Serif 4](https://github.com/adobe-fonts/source-serif) (SIL OFL 1.1).
-Friday is a personal project and is not affiliated with Anthropic.
+[Claude Code](https://claude.com/claude-code) · [Quickshell](https://quickshell.org) · [edge-tts](https://github.com/rany2/edge-tts) · [Piper](https://github.com/OHF-Voice/piper1-gpl) with the **Jenny (Dioco)** voice · [Vosk](https://alphacephei.com/vosk/) · [faster-whisper](https://github.com/SYSTRAN/faster-whisper) · [Material Symbols](https://github.com/google/material-design-icons) · [illogical-impulse](https://github.com/end-4/dots-hyprland) by end-4 · [Source Serif 4](https://github.com/adobe-fonts/source-serif). Licenses for all of these: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+## License
+
+[MIT](LICENSE) © Onkar Yaglewad. Provided as is, without warranty; you use it at your own risk.
+
+Project Friday is an independent personal project. It is not affiliated with, sponsored by or endorsed by Anthropic, Microsoft, Google or any other company mentioned here. "Claude" and "Claude Code" are trademarks of Anthropic, PBC; other names are trademarks of their owners.
