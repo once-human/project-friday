@@ -107,7 +107,12 @@ fi
 # ---- No internet, or Claude out of usage? Friday's offline brain (friday-fallback: a free model on this laptop,
 #      no keys, no limits) answers instead, through the same guard.
 FB="$FRIDAY_HOME/bin/friday-fallback"
-export FRIDAY_SURFACE_TEXT="$SURFACE" FRIDAY_VOICE FRIDAY_SESSION
+export FRIDAY_SURFACE_TEXT="$SURFACE" FRIDAY_VOICE FRIDAY_SESSION FRIDAY_BRAIN
+# brain: auto (Claude, local when it can't) | claude (Claude only) | local (the laptop's model for everything)
+[ "${FRIDAY_BRAIN:-auto}" = claude ] && FRIDAY_FALLBACK=off
+if [ "${FRIDAY_BRAIN:-auto}" = local ] && [ -x "$FB" ]; then
+  exec "$FB" --run <<<"$FULL"
+fi
 if [ "${FRIDAY_FALLBACK:-auto}" != off ] && [ -x "$FB" ]; then
   "$FB" --online >/dev/null 2>&1 || exec "$FB" --run <<<"$FULL"
   if [[ "${FRIDAY_SESSION:-}" == fb-* ]]; then

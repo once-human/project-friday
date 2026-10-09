@@ -3,6 +3,10 @@
 # friday-login         : opens a small terminal running Claude's own sign-in flow
 export PATH="$HOME/.local/bin:$HOME/.claude/local:$HOME/.npm-global/bin:$HOME/.bun/bin:/usr/local/bin:/usr/bin:$PATH"
 CLAUDE="${CLAUDE_BIN:-$(command -v claude)}"
+# local mode needs no Claude account (or Claude Code) at all
+if [ "$1" = "--check" ] && grep -qE '^\s*(export\s+)?FRIDAY_BRAIN=["'"'"']?local' "${FRIDAY_HOME:-$HOME/.local/share/friday}/config.env" 2>/dev/null; then
+  echo ok; exit 0
+fi
 [ -x "$CLAUDE" ] || { echo "no-cli"; exit 3; }
 
 if [ "$1" = "--check" ]; then

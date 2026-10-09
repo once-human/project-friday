@@ -159,8 +159,10 @@ def pretty(model):
 
 def providers():
     pick = (os.environ.get("FRIDAY_FALLBACK") or "auto").lower()
-    if pick == "off":
+    if pick == "off" and os.environ.get("FRIDAY_BRAIN") != "local":
         return []
+    if pick == "off":
+        pick = "auto"
     out = []
     if pick in ("auto", "ollama"):
         host = ollama_host()
@@ -173,7 +175,10 @@ def providers():
             if want:
                 out.append({"kind": "ollama", "name": pretty(want), "url": host, "model": want,
                             "vision": bool(re.search(r"vl|llava|vision|gemma3|gemma4|minicpm-v", want))})
-    if pick in ("auto", "local") and os.environ.get("FRIDAY_LOCAL_URL"):
+    url = os.environ.get("FRIDAY_LOCAL_URL", "")
+    if url and not re.match(r"^https?://(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?/", url):
+        url = ""                                           # "local" means this machine: nothing leaves the laptop
+    if pick in ("auto", "local") and url:
         out.append({"kind": "openai", "name": pretty(os.environ.get("FRIDAY_LOCAL_MODEL") or "your local model"),
                     "url": os.environ["FRIDAY_LOCAL_URL"], "model": os.environ.get("FRIDAY_LOCAL_MODEL") or "local",
                     "vision": os.environ.get("FRIDAY_LOCAL_VISION") == "1"})
@@ -479,7 +484,7 @@ def answer(prompt, reason_note, reset=None):
     reason_full = reason_note + (" (back at %s)" % back if back else "")
     provs = providers()
     if not provs:
-        msg = ("%s, and Friday's offline brain isn't set up yet. Everyday things like music, timers, volume and "
+        msg = ("%s, but Friday's offline brain isn't set up yet. Everyday things like music, timers, volume and "
                "opening apps still work. Run `project-friday offline setup` once and Friday will keep answering with a "
                "free model right on this laptop: no internet, no limits." % reason_full)
         if voice:
@@ -504,6 +509,8 @@ def answer(prompt, reason_note, reset=None):
     last_err = ""
     try:
         for prov in provs:
+            if first and reason_note.startswith("Local mode"):
+                first = False                              # you chose this: no need to announce it
             if first:                                      # say once per chat who's answering, and why
                 note = "%s, so I'm running on %s right here on your laptop." % (reason_full, prov["name"])
                 say_text((note + " ") if voice else ("_" + note + "_\n\n"))
@@ -697,7 +704,10 @@ def main():
     prompt = sys.stdin.read()
     if a[0] == "--run":
         lim, reset = usage_limit()
-        why = "Claude's usage limit is reached" if lim else ("You're offline" if not online() else "Claude isn't available right now")
+        if os.environ.get("FRIDAY_BRAIN") == "local":
+            why = "Local mode is on"
+        else:
+            why = "Claude's usage limit is reached" if lim else ("You're offline" if not online() else "Claude isn't available right now")
         return answer(prompt, why, reset)
     if a[0] == "--wrap" and len(a) > 1:
         return wrap(a[1:], prompt)

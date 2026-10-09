@@ -46,6 +46,14 @@ def epoch(iso):
 
 
 def main():
+    cfg = os.path.join(os.environ.get("FRIDAY_HOME", os.path.join(HOME, ".local/share/friday")), "config.env")
+    try:
+        if any(l.strip().replace('"', "").replace("'", "") in ("FRIDAY_USAGE=off", "export FRIDAY_USAGE=off")
+               for l in open(cfg)):
+            write({"ok": False, "error": "usage check is off (FRIDAY_USAGE=off)"})
+            return 0
+    except OSError:
+        pass
     try:
         with open(os.path.join(HOME, ".claude/.credentials.json")) as f:
             tok = json.load(f)["claudeAiOauth"]["accessToken"]

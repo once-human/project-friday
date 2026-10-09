@@ -1220,7 +1220,9 @@ def main():
 
 def offline_brain():
     """Is Friday's offline brain (a local model through Ollama, or FRIDAY_LOCAL_URL) set up?"""
-    if os.environ.get("FRIDAY_FALLBACK", "auto").lower() == "off":
+    if os.environ.get("FRIDAY_BRAIN") == "local":
+        return True
+    if os.environ.get("FRIDAY_FALLBACK", "auto").lower() == "off" or os.environ.get("FRIDAY_BRAIN") == "claude":
         return False
     return bool(shutil.which("ollama") or os.environ.get("FRIDAY_LOCAL_URL"))
 

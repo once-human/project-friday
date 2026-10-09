@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""friday-settings — every Friday setting, readable and changeable by name (project-friday settings / set / reset / mode).
+
+    friday-settings list                show every setting: current value, default, what it does
+    friday-settings get NAME            one value
+    friday-settings set NAME VALUE      change it (writes config.env; "default" puts it back)
+    friday-settings reset NAME|all      back to the default (all keeps your name/music/style; "everything" doesn't)
+    friday-settings mode [MODE]         show or switch the overall mode: default | local | private
+
+Settings live in config.env (git-ignored, yours). Lines this tool doesn't know about are never touched.
+"""
+import os
+import re
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+FH = os.environ.get("FRIDAY_HOME", os.path.join(HOME, ".local/share/friday"))
+CFG = os.path.join(FH, "config.env")
+TTY = sys.stdout.isatty()
+B, D, G, Y, N = ("\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[0m") if TTY else ("",) * 5
+
+# name, variable, allowed values (None = free text), default, what it does, needs a voice restart
+S = [
+    # -- the brain
+    ("brain", "FRIDAY_BRAIN", ["auto", "claude", "local"], "auto",
+     "auto: Claude, and the offline model when you're offline or out of usage · claude: Claude only · local: the model "
+     "on this laptop for everything (no Claude usage, works offline)", False),
+    ("claude-model", "FRIDAY_MODEL", None, "", "Claude model for typed requests (sonnet, opus, haiku…; empty = your Claude Code default)", False),
+    ("voice-claude-model", "FRIDAY_VOICE_MODEL", None, "sonnet", "Claude model for spoken conversations (fast)", False),
+    ("local-model", "FRIDAY_LOCAL_MODEL", None, "", "the offline brain's Ollama model (empty = the best one you've pulled; "
+     "project-friday offline setup picks one)", False),
+    ("local-url", "FRIDAY_LOCAL_URL", None, "", "use another local model server instead (llama.cpp, LM Studio: an OpenAI-style URL)", False),
+    ("local-skills", "FRIDAY_LOCAL", ["on", "off"], "on", "answer everyday things on the laptop first (time, timers, volume, music…)", False),
+    # -- voice
+    ("speak", "FRIDAY_SPEAK", ["on", "off"], "on", "read answers aloud when you talk to Friday", True),
+    ("tts", "FRIDAY_TTS", ["auto", "neural", "piper"], "auto",
+     "auto: natural neural voice online (sends the spoken text to Microsoft), Piper offline · piper: always on-device", True),
+    ("neural-voice", "FRIDAY_NEURAL_VOICE", None, "en-US-AvaNeural", "which natural voice (e.g. en-GB-SoniaNeural, en-IN-NeerjaNeural)", True),
+    ("neural-rate", "FRIDAY_NEURAL_RATE", None, "+4%", "natural voice speed", True),
+    ("piper-voice", "FRIDAY_PIPER_VOICE", None, "en_GB-jenny_dioco-medium", "on-device voice (re-run voice setup after changing)", True),
+    ("stt-model", "FRIDAY_STT_MODEL", ["tiny.en", "base.en", "small.en", "medium.en", "large-v3-turbo"], "small.en",
+     "speech recognition model (bigger = more accurate, slower)", True),
+    ("stt-device", "FRIDAY_STT_DEVICE", ["auto", "cpu", "cuda"], "auto", "where speech recognition runs", True),
+    ("silence", "FRIDAY_SILENCE_END", None, "1.1", "seconds of quiet that end what you're saying", True),
+    ("vocab", "FRIDAY_VOCAB", None, "", "names and jargon speech recognition should expect (comma separated)", True),
+    ("voice-debug", "FRIDAY_VOICE_DEBUG", ["0", "1"], "0", "log what you say and every wake-word guess to the voice log", True),
+    # -- you
+    ("name", "FRIDAY_NAME", None, "", "what Friday calls you (empty = first name on your account)", False),
+    ("style", "FRIDAY_STYLE", None, "", "how you talk, so on-device replies match", False),
+    ("music", "FRIDAY_MUSIC", None, "", "artists and genres you like, favourites first", False),
+    ("rom-dirs", "FRIDAY_ROM_DIRS", None, "", "Android ROM build folders to watch", False),
+    # -- privacy and background activity
+    ("phrases", "FRIDAY_PHRASES", ["on", "off"], "on", "let Claude refresh on-device phrasings (one small call a week)", False),
+    ("usage-check", "FRIDAY_USAGE", ["on", "off"], "on", "show your Claude usage rings (asks Anthropic every few minutes)", False),
+    ("input-trust", "FRIDAY_INPUT_TRUST", ["0", "1"], "0", "1: let Friday click and type without an approval card", False),
+]
+BY = {s[0]: s for s in S}
+
+MODES = {
+    "default": ({}, "Claude thinks, the offline model covers no-internet and usage limits, natural voice when online."),
+    "local": ({"brain": "local"}, "Everything is answered by the model on this laptop: no Claude usage, works offline. "
+              "Voice and the rest unchanged."),
+    "private": ({"brain": "local", "tts": "piper", "phrases": "off", "usage-check": "off"},
+                "Nothing leaves this laptop on its own: local model, on-device voice, no background calls. Things you "
+                "explicitly ask for online (music, weather, web search) still go online."),
+}
+MODE_KEYS = sorted({k for m in MODES.values() for k in m[0]})
+
+
+def read_cfg():
+    try:
+        return open(CFG).read()
+    except OSError:
+        try:
+            return open(os.path.join(FH, "config.example.env")).read()
+        except OSError:
+            return ""
+
+
+def current(text, var):
+    """The value set in config.env (last uncommented assignment wins, like the shell), or None."""
+    val = None
+    for line in text.splitlines():
+        m = re.match(r"\s*(?:export\s+)?" + re.escape(var) + r"=(.*)$", line)
+        if m:
+            v = m.group(1).strip()
+            if v[:1] in "\"'" and v.count(v[0]) >= 2:
+                v = v[1:v.index(v[0], 1)]
+            else:
+                v = v.split(" #")[0].strip()
+            val = v
+    return val
+
+
+def write(text):
+    os.makedirs(FH, exist_ok=True)
+    tmp = CFG + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CFG)
+
+
+def quote(v):
+    return '"%s"' % v.replace("\\", "\\\\").replace('"', '\\"') if re.search(r"[\s#$`\"'\\;&|<>(){}*?~]", v) or v == "" else v
+
+
+def set_var(text, var, value):
+    """Set (value) or unset (None) a variable, keeping everything else in the file as it is."""
+    lines = text.splitlines()
+    pat = re.compile(r"\s*(?:export\s+)?" + re.escape(var) + r"=")
+    lines = [l for l in lines if not pat.match(l)]          # drop live assignments; commented examples stay
+    if value is not None:
+        marker = "# ---- set with project-friday (project-friday settings)"
+        if marker not in lines:
+            lines += ["", marker]
+        lines.insert(lines.index(marker) + 1, "%s=%s" % (var, quote(value)))
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def restart_voice():
+    try:
+        r = subprocess.run(["pgrep", "-f", r"python.*friday_voice\.py"], capture_output=True, text=True)
+        for pid in r.stdout.split():
+            os.kill(int(pid), 15)                            # the panel brings the voice back in a few seconds
+        return bool(r.stdout.split())
+    except Exception:
+        return False
+
+
+def value_of(text, name):
+    s = BY[name]
+    v = current(text, s[1])
+    return (v, False) if v is not None else (s[3], True)
+
+
+def mode_of(text):
+    vals = {k: value_of(text, k)[0] for k in MODE_KEYS}
+    for m in ("private", "local"):
+        want = MODES[m][0]
+        if all(vals.get(k) == v for k, v in want.items()):
+            return m
+    return "default" if vals.get("brain") == "auto" else "custom"
+
+
+def cmd_list():
+    text = read_cfg()
+    print("%sFriday settings%s  %s(mode: %s · change with: project-friday set NAME VALUE · %s)%s" %
+          (B, N, D, mode_of(text), CFG.replace(HOME, "~"), N))
+    groups = [("Brain", S[:6]), ("Voice", S[6:16]), ("You", S[16:20]), ("Privacy & background", S[20:])]
+    for title, items in groups:
+        print("\n" + B + title + N)
+        for name, var, choices, default, desc, _ in items:
+            v, is_default = value_of(text, name)
+            shown = v if v != "" else "(empty)"
+            mark = D + "default" + N if is_default else Y + "changed" + N
+            opts = " [" + "|".join(choices) + "]" if choices else ""
+            print("  %-19s %s%-26s%s %s%s" % (name, G if not is_default else "", shown[:26], N, mark, D + opts + N))
+            print("  %-19s %s%s%s" % ("", D, desc, N))
+
+
+def cmd_set(name, value):
+    if name not in BY:
+        print("No setting called '%s'. See: project-friday settings" % name)
+        return 2
+    s = BY[name]
+    if value.lower() in ("default", "reset"):
+        value = None
+    elif name == "local-url" and not re.match(r"^https?://(127\.\d+\.\d+\.\d+|localhost|\[::1\])(:\d+)?/", value):
+        print("local-url has to be a server on this machine (http://127.0.0.1:PORT/... or http://localhost:PORT/...)")
+        return 2
+    elif s[2] and value not in s[2]:
+        print("%s can be: %s (or default)" % (name, ", ".join(s[2])))
+        return 2
+    write(set_var(read_cfg(), s[1], value))
+    print("%s → %s" % (name, value if value is not None else "default (%s)" % (s[3] or "empty")))
+    if name == "brain" and value == "local":
+        hint_local()
+    if s[5] and restart_voice():
+        print(D + "voice restarted to apply it" + N)
+    return 0
+
+
+def hint_local():
+    import shutil
+    if not shutil.which("ollama") and not current(read_cfg(), "FRIDAY_LOCAL_URL"):
+        print(Y + "The offline brain isn't set up yet: run  project-friday offline setup" + N)
+
+
+def cmd_reset(name):
+    text = read_cfg()
+    if name in ("all", "everything"):
+        keep = set() if name == "everything" else {"name", "style", "music", "rom-dirs", "vocab"}
+        for s in S:
+            if s[0] not in keep:
+                text = set_var(text, s[1], None)
+        write(text)
+        restart_voice()
+        print("Everything is back to its defaults" + ("." if not keep else
+              " (kept what's about you: name, style, music, ROM folders, vocabulary; 'reset everything' clears those too)."))
+        return 0
+    if name not in BY:
+        print("No setting called '%s'. See: project-friday settings" % name)
+        return 2
+    return cmd_set(name, "default")
+
+
+def cmd_mode(m):
+    text = read_cfg()
+    if not m:
+        cur = mode_of(text)
+        print("%sMode: %s%s" % (B, cur, N))
+        for k, (_, desc) in MODES.items():
+            print("  %s%-8s%s %s" % (G if k == cur else "", k, N, desc))
+        print(D + "Switch with: project-friday mode local   (any single setting: project-friday set …)" + N)
+        return 0
+    if m not in MODES:
+        print("Modes: " + ", ".join(MODES))
+        return 2
+    for k in MODE_KEYS:                                       # a mode is a known set of values; everything else stays
+        text = set_var(text, BY[k][1], MODES[m][0].get(k))
+    write(text)
+    print("%sMode: %s%s  %s" % (B, m, N, MODES[m][1]))
+    if m in ("local", "private"):
+        hint_local()
+    if "tts" in MODE_KEYS and restart_voice():
+        print(D + "voice restarted to apply it" + N)
+    return 0
+
+
+def main():
+    a = sys.argv[1:]
+    cmd = a[0] if a else "list"
+    if cmd in ("list", "ls", "show"):
+        cmd_list()
+        return 0
+    if cmd == "get" and len(a) == 2:
+        if a[1] not in BY:
+            return 2
+        print(value_of(read_cfg(), a[1])[0])
+        return 0
+    if cmd == "set" and len(a) >= 3:
+        return cmd_set(a[1], " ".join(a[2:]))
+    if cmd == "reset" and len(a) == 2:
+        return cmd_reset(a[1])
+    if cmd == "mode":
+        return cmd_mode(a[1] if len(a) > 1 else "")
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
