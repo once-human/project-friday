@@ -3,12 +3,22 @@
 #   friday-start              start Friday and bring it back if it ever crashes (one supervisor per session)
 #   friday-start --restart    restart Friday now, e.g. after an update (the supervisor brings it back)
 #   friday-start --stop       stop Friday until next login
+#   friday-start --once       just make sure it's running (no supervisor)
 # The watch is a pgrep every 5 s: no measurable battery cost. Nothing here talks to Claude.
 export PATH="$HOME/.local/bin:$HOME/.local/share/friday/bin:/usr/local/bin:/usr/bin:$PATH"
 RUN="${XDG_RUNTIME_DIR:-/tmp}/friday"
 mkdir -p "$RUN"
 QS='(^|/)(qs|quickshell)( [^ ]*)* -c friday( |$)'
 alive() { pgrep -f -- "$QS" >/dev/null; }
+start_qs() {
+  # GNOME's Wayland session has no layer-shell (the overlay protocol Friday uses), so there Friday runs through
+  # XWayland as an X11 overlay. Everywhere else it runs natively.
+  case "${XDG_CURRENT_DESKTOP:-}" in
+    *GNOME*|*gnome*) [ -n "${WAYLAND_DISPLAY:-}" ] && export QT_QPA_PLATFORM=xcb ;;
+  esac
+  command -v qs >/dev/null || { notify-send -a Friday "Friday can't start" "Quickshell (qs) isn't installed. Re-run Friday's install.sh." 2>/dev/null; return 1; }
+  qs -c friday -d >/dev/null 2>&1
+}
 
 case "$1" in
   --restart)
@@ -18,6 +28,8 @@ case "$1" in
       setsid -f "$0" >/dev/null 2>&1          # no supervisor yet (first run after an update): start one
     fi
     echo "Friday restarting…"; exit 0 ;;
+  --once)                                   # start it if it isn't running, without supervising (friday-toggle)
+    alive || start_qs; exit 0 ;;
   --stop)
     pkill -f -- "friday-start$" 2>/dev/null
     pkill -f -- "friday_voice.py" 2>/dev/null
@@ -41,7 +53,7 @@ while true; do
       notify-send -a Friday "Friday keeps crashing" "Stopped restarting it. Run 'qs -c friday' in a terminal to see why." 2>/dev/null
       exit 1
     fi
-    qs -c friday -d >/dev/null 2>&1
+    start_qs
     sleep 2
   fi
   sleep 5

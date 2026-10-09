@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# friday-clip — the clipboard on any Linux desktop (wl-clipboard on Wayland, xclip or xsel on X11).
+#   friday-clip get [--primary] [--max N]     print clipboard text (or the highlighted text with --primary)
+#   friday-clip set [TEXT]                    copy TEXT (or stdin)
+#   friday-clip types                         what's on the clipboard (mime types)
+#   friday-clip image PATH                    save a clipboard image as PNG
+#   friday-clip set-image PATH                copy an image file
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:$PATH"
+cmd="${1:-get}"; shift || true
+primary=0; max=""
+while [ $# -gt 0 ]; do
+  case "$1" in --primary) primary=1; shift ;; --max) max="$2"; shift 2 ;; *) break ;; esac
+done
+if [ -n "${WAYLAND_DISPLAY:-}" ] && command -v wl-paste >/dev/null; then
+  W=1
+elif [ -n "${DISPLAY:-}" ]; then
+  W=0
+else
+  exit 1
+fi
+cap() { if [ -n "$max" ]; then head -c "$max"; else cat; fi; }
+x_get() {  # $1: primary|clipboard
+  if command -v xclip >/dev/null; then xclip -o -selection "$1" 2>/dev/null
+  elif command -v xsel >/dev/null; then xsel "--$1" -o 2>/dev/null; fi
+}
+case "$cmd" in
+  get)
+    if [ "$W" = 1 ]; then
+      if [ "$primary" = 1 ]; then timeout 1 wl-paste --primary --no-newline 2>/dev/null | cap
+      else timeout 1 wl-paste --no-newline --type text 2>/dev/null | cap; fi
+    else
+      x_get "$([ "$primary" = 1 ] && echo primary || echo clipboard)" | cap
+    fi ;;
+  set)
+    if [ $# -gt 0 ]; then data="$*"; else data="$(cat)"; fi
+    if [ "$W" = 1 ]; then printf '%s' "$data" | wl-copy
+    elif command -v xclip >/dev/null; then printf '%s' "$data" | xclip -selection clipboard
+    else printf '%s' "$data" | xsel --clipboard -i; fi ;;
+  types)
+    if [ "$W" = 1 ]; then timeout 1 wl-paste --list-types 2>/dev/null
+    elif command -v xclip >/dev/null; then xclip -o -selection clipboard -t TARGETS 2>/dev/null; fi ;;
+  image)
+    mkdir -p "$(dirname "$1")"
+    if [ "$W" = 1 ]; then wl-paste --type image/png > "$1"
+    else xclip -selection clipboard -t image/png -o > "$1"; fi ;;
+  set-image)
+    if [ "$W" = 1 ]; then wl-copy --type image/png < "$1"
+    else xclip -selection clipboard -t image/png -i "$1"; fi ;;
+  *) sed -n '2,8p' "$0"; exit 2 ;;
+esac

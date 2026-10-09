@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+"""friday-wm — one interface to whatever desktop you run, so the rest of Friday never assumes Hyprland.
+
+  friday-wm name                    hyprland | sway | niri | kde | gnome | cosmic | river | wayfire | labwc | x11 | wayland | unknown
+  friday-wm active                  focused window as JSON: {class, title, workspace, x, y, w, h} (whatever is knowable)
+  friday-wm windows                 open windows, one per line: "ws N | class | title"
+  friday-wm workspace N             switch to workspace N
+  friday-wm monitors                outputs as JSON (logical geometry, scale, focused)
+  friday-wm cursor X Y              move the pointer to global layout coordinates
+  friday-wm shot PATH [--window]    screenshot the focused monitor (or window) into PATH; prints the mapping JSON
+
+Best support: Hyprland, then Sway / niri / other wlroots compositors, then KDE Plasma, X11 desktops, and GNOME.
+Anything a desktop can't do returns empty output and exit code 1, and callers fall back gracefully.
+"""
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":/usr/local/bin:/usr/bin:" + os.environ.get("PATH", "")
+E = os.environ
+
+
+def sh(cmd, t=2.0):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=t)
+        return r.returncode, r.stdout.strip()
+    except Exception:
+        return 1, ""
+
+
+def js(cmd):
+    code, out = sh(cmd)
+    try:
+        return json.loads(out) if code == 0 and out else None
+    except ValueError:
+        return None
+
+
+def have(x):
+    return shutil.which(x) is not None
+
+
+def name():
+    if E.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "hyprland"
+    if E.get("SWAYSOCK"):
+        return "sway"
+    if E.get("NIRI_SOCKET"):
+        return "niri"
+    desk = (E.get("XDG_CURRENT_DESKTOP", "") + ":" + E.get("XDG_SESSION_DESKTOP", "") + ":" + E.get("DESKTOP_SESSION", "")).lower()
+    wayland = bool(E.get("WAYLAND_DISPLAY")) or E.get("XDG_SESSION_TYPE") == "wayland"
+    for key, label in (("kde", "kde"), ("plasma", "kde"), ("gnome", "gnome"), ("cosmic", "cosmic"), ("river", "river"),
+                       ("wayfire", "wayfire"), ("labwc", "labwc"), ("hyprland", "hyprland"), ("sway", "sway"), ("niri", "niri")):
+        if key in desk:
+            return label if (wayland or label in ("kde", "gnome")) else "x11"
+    if wayland:
+        return "wayland"
+    if E.get("DISPLAY"):
+        return "x11"
+    return "unknown"
+
+
+WLROOTS = {"hyprland", "sway", "niri", "river", "wayfire", "labwc", "cosmic", "wayland"}
+
+
+# ---------------------------------------------------------------- sway tree helpers
+def sway_walk(node, ws=None):
+    if node.get("type") == "workspace":
+        ws = node.get("name")
+    for k in ("nodes", "floating_nodes"):
+        for c in node.get(k, []):
+            yield from sway_walk(c, ws)
+    if node.get("pid") or node.get("app_id") or node.get("window_properties"):
+        yield node, ws
+
+
+def sway_cls(n):
+    return n.get("app_id") or (n.get("window_properties") or {}).get("class") or ""
+
+
+# ---------------------------------------------------------------- commands
+def active():
+    wm = name()
+    if wm == "hyprland":
+        w = js(["hyprctl", "activewindow", "-j"]) or {}
+        if w:
+            return {"class": w.get("class", ""), "title": w.get("title", ""), "workspace": (w.get("workspace") or {}).get("id"),
+                    "x": w["at"][0], "y": w["at"][1], "w": w["size"][0], "h": w["size"][1]}
+    elif wm == "sway":
+        t = js(["swaymsg", "-t", "get_tree", "-r"])
+        for n, ws in sway_walk(t or {}):
+            if n.get("focused"):
+                r = n.get("rect", {})
+                return {"class": sway_cls(n), "title": n.get("name") or "", "workspace": ws,
+                        "x": r.get("x"), "y": r.get("y"), "w": r.get("width"), "h": r.get("height")}
+    elif wm == "niri":
+        w = js(["niri", "msg", "-j", "focused-window"]) or {}
+        if w:
+            return {"class": w.get("app_id", ""), "title": w.get("title", ""), "workspace": w.get("workspace_id")}
+    elif wm == "kde" and have("kdotool"):
+        code, wid = sh(["kdotool", "getactivewindow"])
+        if code == 0 and wid:
+            return {"class": sh(["kdotool", "getwindowclassname", wid])[1], "title": sh(["kdotool", "getwindowname", wid])[1]}
+    elif wm == "x11" and have("xdotool"):
+        code, wid = sh(["xdotool", "getactivewindow"])
+        if code == 0 and wid:
+            out = {"title": sh(["xdotool", "getwindowname", wid])[1], "class": sh(["xdotool", "getwindowclassname", wid])[1]}
+            g = sh(["xdotool", "getwindowgeometry", "--shell", wid])[1]
+            kv = dict(x.split("=", 1) for x in g.splitlines() if "=" in x)
+            if kv:
+                out.update({"x": int(kv.get("X", 0)), "y": int(kv.get("Y", 0)), "w": int(kv.get("WIDTH", 0)), "h": int(kv.get("HEIGHT", 0))})
+            return out
+    return {}
+
+
+def windows():
+    wm = name()
+    rows = []
+    if wm == "hyprland":
+        for c in sorted(js(["hyprctl", "clients", "-j"]) or [], key=lambda c: (c["workspace"]["id"], c["class"])):
+            flags = [k for k in ("floating", "fullscreen", "pinned") if c.get(k)]
+            rows.append("ws %s | %s | %s%s" % (c["workspace"]["id"], c["class"], c["title"][:80], (" | " + ",".join(flags)) if flags else ""))
+    elif wm == "sway":
+        for n, ws in sway_walk(js(["swaymsg", "-t", "get_tree", "-r"]) or {}):
+            rows.append("ws %s | %s | %s%s" % (ws, sway_cls(n), (n.get("name") or "")[:80], " | focused" if n.get("focused") else ""))
+    elif wm == "niri":
+        for w in js(["niri", "msg", "-j", "windows"]) or []:
+            rows.append("ws %s | %s | %s%s" % (w.get("workspace_id"), w.get("app_id", ""), (w.get("title") or "")[:80], " | focused" if w.get("is_focused") else ""))
+    elif have("wmctrl") and (wm == "x11" or E.get("DISPLAY")):
+        for line in sh(["wmctrl", "-lx"])[1].splitlines():
+            p = line.split(None, 4)
+            if len(p) >= 5:
+                rows.append("ws %s | %s | %s" % (int(p[1]) + 1 if p[1].lstrip("-").isdigit() else p[1], p[2].split(".")[-1], p[4][:80]))
+    return rows
+
+
+def workspace(n):
+    wm = name()
+    if wm == "hyprland":
+        return sh(["hyprctl", "dispatch", "workspace", str(n)])[0] == 0
+    if wm == "sway":
+        return sh(["swaymsg", "workspace", "number", str(n)])[0] == 0
+    if wm == "niri":
+        return sh(["niri", "msg", "action", "focus-workspace", str(n)])[0] == 0
+    if wm == "kde":
+        for q in ("qdbus6", "qdbus"):
+            if have(q) and sh([q, "org.kde.KWin", "/KWin", "org.kde.KWin.setCurrentDesktop", str(n)])[0] == 0:
+                return True
+    if have("wmctrl") and E.get("DISPLAY") and wm in ("x11",):
+        return sh(["wmctrl", "-s", str(int(n) - 1)])[0] == 0
+    return False
+
+
+def monitors():
+    wm = name()
+    out = []
+    if wm == "hyprland":
+        for m in js(["hyprctl", "monitors", "-j"]) or []:
+            sc = m.get("scale", 1) or 1
+            out.append({"name": m["name"], "x": m["x"], "y": m["y"], "w": round(m["width"] / sc), "h": round(m["height"] / sc),
+                        "scale": sc, "focused": bool(m.get("focused"))})
+    elif wm == "sway":
+        for m in js(["swaymsg", "-t", "get_outputs", "-r"]) or []:
+            if m.get("active"):
+                r = m.get("rect", {})
+                out.append({"name": m["name"], "x": r.get("x", 0), "y": r.get("y", 0), "w": r.get("width"), "h": r.get("height"),
+                            "scale": m.get("scale", 1), "focused": bool(m.get("focused"))})
+    elif wm == "niri":
+        focused = (js(["niri", "msg", "-j", "focused-output"]) or {}).get("name")
+        outs = js(["niri", "msg", "-j", "outputs"]) or {}
+        for nm, m in (outs.items() if isinstance(outs, dict) else []):
+            lg = m.get("logical") or {}
+            if lg:
+                out.append({"name": nm, "x": lg.get("x", 0), "y": lg.get("y", 0), "w": lg.get("width"), "h": lg.get("height"),
+                            "scale": lg.get("scale", 1), "focused": nm == focused})
+    return out
+
+
+def cursor(x, y):
+    wm = name()
+    if wm == "hyprland":
+        return sh(["hyprctl", "dispatch", "movecursor", str(x), str(y)])[0] == 0
+    if wm == "sway":
+        return sh(["swaymsg", "seat", "-", "cursor", "set", str(x), str(y)])[0] == 0
+    if (wm == "x11" or (E.get("DISPLAY") and not E.get("WAYLAND_DISPLAY"))) and have("xdotool"):
+        return sh(["xdotool", "mousemove", str(x), str(y)])[0] == 0
+    if have("ydotool"):                                  # anywhere else: absolute move through uinput
+        return sh(["ydotool", "mousemove", "--absolute", "-x", str(x), "-y", str(y)])[0] == 0
+    return False
+
+
+def image_size(path):
+    try:
+        with open(path, "rb") as f:
+            d = f.read()
+    except OSError:
+        return 0, 0
+    if d[:8] == b"\x89PNG\r\n\x1a\n":
+        return struct.unpack(">II", d[16:24])
+    i = 2
+    while i < len(d) - 9:
+        if d[i] != 0xFF:
+            i += 1
+            continue
+        m = d[i + 1]
+        if m in (0xC0, 0xC1, 0xC2):
+            h, w = struct.unpack(">HH", d[i + 5:i + 9])
+            return w, h
+        i += 2 + struct.unpack(">H", d[i + 2:i + 4])[0]
+    return 0, 0
+
+
+def shot(path, window=False):
+    """Screenshot into path (.jpg on wlroots, .png elsewhere if that's all the tool makes). Returns mapping."""
+    wm = name()
+    jpeg = path.endswith((".jpg", ".jpeg"))
+    origin, logical, ok = [0, 0], None, False
+    if wm in WLROOTS and have("grim"):
+        fmt = ["-t", "jpeg", "-q", "85"] if jpeg else []
+        a = active() if window else {}
+        mons = monitors()
+        if window and a.get("w"):
+            ok = sh(["grim", *fmt, "-g", "%d,%d %dx%d" % (a["x"], a["y"], a["w"], a["h"]), path], t=8)[0] == 0
+            origin, logical = [a["x"], a["y"]], [a["w"], a["h"]]
+        else:
+            m = next((m for m in mons if m.get("focused")), None)
+            if m:
+                ok = sh(["grim", *fmt, "-o", m["name"], path], t=8)[0] == 0
+                origin, logical = [m["x"], m["y"]], [m["w"], m["h"]]
+            if not ok:
+                ok = sh(["grim", *fmt, path], t=8)[0] == 0
+    elif wm == "kde" and have("spectacle"):
+        ok = sh(["spectacle", "-b", "-n", "-a" if window else "-m", "-o", path], t=12)[0] == 0
+    elif wm == "gnome" and have("gnome-screenshot"):
+        ok = sh(["gnome-screenshot", *(["-w"] if window else []), "-f", path], t=12)[0] == 0
+    elif E.get("DISPLAY"):
+        if have("maim"):
+            cmd = ["maim"] + (["-i", sh(["xdotool", "getactivewindow"])[1]] if window and have("xdotool") else []) + [path]
+            ok = sh(cmd, t=8)[0] == 0
+        elif have("import"):
+            ok = sh(["import", "-window", "root", path], t=8)[0] == 0
+        elif have("scrot"):
+            ok = sh(["scrot", "-o", *(["-u"] if window else []), path], t=8)[0] == 0
+        if ok and window:
+            a = active()
+            if a.get("w"):
+                origin, logical = [a["x"], a["y"]], [a["w"], a["h"]]
+    if not ok or not os.path.exists(path):
+        return None
+    pw, ph = image_size(path)
+    return {"image": path, "origin": origin, "logical": logical or [pw, ph], "pixels": [pw, ph], "desktop": wm}
+
+
+def main():
+    a = sys.argv[1:]
+    cmd = a[0] if a else "name"
+    if cmd == "name":
+        print(name())
+    elif cmd == "active":
+        r = active()
+        print(json.dumps(r))
+        sys.exit(0 if r else 1)
+    elif cmd == "windows":
+        rows = windows()
+        print("\n".join(rows) if rows else "(this desktop doesn't let Friday list windows)")
+        sys.exit(0 if rows else 1)
+    elif cmd == "workspace" and len(a) > 1:
+        sys.exit(0 if workspace(a[1]) else 1)
+    elif cmd == "monitors":
+        print(json.dumps(monitors()))
+    elif cmd == "cursor" and len(a) > 2:
+        sys.exit(0 if cursor(int(float(a[1])), int(float(a[2]))) else 1)
+    elif cmd == "shot" and len(a) > 1:
+        m = shot(a[1], "--window" in a)
+        if not m:
+            print("friday-wm: no screenshot tool for %s (install grim on wlroots, spectacle on KDE, gnome-screenshot on GNOME, maim on X11)" % name(), file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(m))
+    else:
+        print(__doc__.strip())
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

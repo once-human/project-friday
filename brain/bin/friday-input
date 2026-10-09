@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Friday's hands: mouse and keyboard on Hyprland (Wayland).
+"""Friday's hands: mouse and keyboard on any Linux desktop (best on Hyprland/Sway; X11 via xdotool).
 
   friday-input click X Y [--right|--middle] [--double]   X,Y = pixels in the last friday-screen image
   friday-input click X Y --global                         X,Y = global layout coordinates instead
@@ -10,13 +10,16 @@
   friday-input where                                      cursor position (global)
   friday-input info                                       what's available + last screenshot mapping
 
-Moving uses hyprctl. Clicking uses ydotool (needs ydotoold) or wlrctl; typing and keys use wtype.
+Moving goes through friday-wm (hyprctl / swaymsg / xdotool / ydotool). Clicking uses ydotool (needs ydotoold),
+wlrctl or xdotool; typing and keys use wtype on Wayland, xdotool on X11.
 """
 import json, os, shutil, subprocess, sys, time
 sys.dont_write_bytecode = True
 os.environ["PATH"] = os.path.expanduser("~/.local/bin") + ":/usr/local/bin:/usr/bin:" + os.environ.get("PATH", "")
 
-SETUP = ("sudo pacman -S ydotool wtype   # then: systemctl --user enable --now ydotool  "
+X11 = bool(os.environ.get("DISPLAY")) and not os.environ.get("WAYLAND_DISPLAY")
+SETUP = ("install xdotool" if X11 else
+         "install ydotool and wtype (re-running Friday's install.sh does it), then: systemctl --user enable --now ydotool  "
          "(and add yourself to the 'input' group if /dev/uinput isn't writable)")
 
 
@@ -44,12 +47,16 @@ def to_global(x, y, is_global):
 
 
 def move(gx, gy):
-    ok, out = run(["hyprctl", "dispatch", "movecursor", str(gx), str(gy)])
+    ok, out = run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "friday-wm"), "cursor", str(gx), str(gy)])
     if not ok:
-        die("couldn't move the cursor: " + out)
+        die("couldn't move the cursor on this desktop (install ydotool and start ydotoold, or xdotool on X11)")
 
 
 def click(button="left", double=False):
+    if X11 and shutil.which("xdotool"):
+        ok, out = run(["xdotool", "click"] + (["--repeat", "2"] if double else []) + [{"left": "1", "middle": "2", "right": "3"}[button]])
+        if ok:
+            return
     code = {"left": "0xC0", "right": "0xC1", "middle": "0xC2"}[button]
     if shutil.which("ydotool"):
         cmd = ["ydotool", "click"] + (["--repeat", "2", "--next-delay", "90"] if double else []) + [code]
@@ -77,6 +84,15 @@ KEYS = {"enter": "Return", "return": "Return", "esc": "Escape", "escape": "Escap
 
 
 def key(chord):
+    if X11 and shutil.which("xdotool"):
+        parts = [p.strip().lower() for p in chord.split("+") if p.strip()]
+        xm = {"ctrl": "ctrl", "control": "ctrl", "shift": "shift", "alt": "alt", "super": "super", "win": "super", "meta": "super"}
+        k = parts[-1] if parts else ""
+        k = KEYS.get(k, k)
+        ok, out = run(["xdotool", "key", "+".join([xm[p] for p in parts[:-1] if p in xm] + [k])])
+        if ok:
+            return
+        die("key failed: " + out)
     if not shutil.which("wtype"):
         die("can't press keys: wtype isn't installed. " + SETUP)
     parts = [p.strip().lower() for p in chord.split("+") if p.strip()]
@@ -95,6 +111,10 @@ def key(chord):
 
 
 def type_text(text):
+    if X11 and shutil.which("xdotool"):
+        ok, out = run(["xdotool", "type", "--delay", "8", "--", text])
+        if ok:
+            return
     if shutil.which("wtype"):
         ok, out = run(["wtype", "--", text])
         if ok:
@@ -138,11 +158,17 @@ def main():
             time.sleep(0.05)
         print("scrolled %s x%d" % (direction, n))
     elif cmd == "where":
-        print(run(["hyprctl", "cursorpos"])[1])
+        if shutil.which("hyprctl") and os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
+            print(run(["hyprctl", "cursorpos"])[1])
+        elif X11 and shutil.which("xdotool"):
+            print(run(["xdotool", "getmouselocation"])[1])
+        else:
+            print("this desktop doesn't report the cursor position")
     elif cmd == "info":
-        print("move: hyprctl  | click: %s | type/keys: %s" % (
-            "ydotool" if shutil.which("ydotool") else ("wlrctl" if shutil.which("wlrctl") else "MISSING"),
-            "wtype" if shutil.which("wtype") else "MISSING"))
+        wm = run([os.path.join(os.path.dirname(os.path.realpath(__file__)), "friday-wm"), "name"])[1]
+        print("desktop: %s | click: %s | type/keys: %s" % (wm,
+            "xdotool" if X11 and shutil.which("xdotool") else "ydotool" if shutil.which("ydotool") else ("wlrctl" if shutil.which("wlrctl") else "MISSING"),
+            "xdotool" if X11 and shutil.which("xdotool") else "wtype" if shutil.which("wtype") else "MISSING"))
         try:
             print("last screenshot:", json.load(open("/tmp/friday/last-screen.json")))
         except Exception:

@@ -13,8 +13,8 @@ def sh(cmd, t=1.2):
 out = {"time": time.strftime("%-I:%M %p"), "date": time.strftime("%a %d %b")}
 
 try:
-    j = json.loads(sh(["hyprctl", "activewindow", "-j"]) or "{}")
-    out["win"] = {"class": j.get("class", ""), "title": j.get("title", ""), "ws": (j.get("workspace") or {}).get("id")}
+    j = json.loads(sh([os.path.join(os.path.dirname(os.path.realpath(__file__)), "friday-wm"), "active"]) or "{}")
+    out["win"] = {"class": j.get("class", ""), "title": j.get("title", ""), "ws": j.get("workspace")}
 except Exception:
     out["win"] = {}
 
@@ -94,11 +94,12 @@ for d in ("~/pixelos17", "~/sky17"):
         break
 
 # clipboard, as a short local preview only (never sent anywhere unless you ask Friday about it)
-types = sh(["wl-paste", "--list-types"], 0.6)
+CLIP = os.path.join(os.path.dirname(os.path.realpath(__file__)), "friday-clip")
+types = sh([CLIP, "types"], 0.8)
 if "image/" in types:
     out["clip"] = {"kind": "image", "preview": "An image"}
 elif types:
-    t = sh(["wl-paste", "--no-newline", "--type", "text"], 0.6)[:400]
+    t = sh([CLIP, "get", "--max", "400"], 0.8)[:400]
     t = " ".join(t.split())
     if t and not re.fullmatch(r"[A-Za-z0-9_\-.+/=]{24,}", t):     # looks like a token/password: don't surface it
         out["clip"] = {"kind": "text", "preview": t[:140]}

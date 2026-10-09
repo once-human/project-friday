@@ -921,22 +921,15 @@ def k_system(t):
 
 def k_desktop(t):
     if re.fullmatch(r"(take |grab |capture )?(a )?screen ?shot( of (my |the )?screen)?|screen ?shot( this)?|capture (my |the )?screen", t):
-        if not have("grim"):
-            return None
         d = os.path.join(HOME, "Pictures", "Screenshots")
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, now().strftime("Screenshot_%Y-%m-%d_%H-%M-%S.png"))
         run(["qs", "-c", "friday", "ipc", "call", "friday", "cloak", "1400"], timeout=3)
         time.sleep(0.45)
-        code, _ = run(["grim", path])
-        if code != 0:
+        code, _ = run([os.path.join(BIN, "friday-wm"), "shot", path], timeout=15)
+        if code != 0 or not os.path.exists(path):
             return None
-        if have("wl-copy"):
-            try:
-                with open(path, "rb") as f:
-                    subprocess.run(["wl-copy", "--type", "image/png"], stdin=f, timeout=3)
-            except Exception:
-                pass
+        run([os.path.join(BIN, "friday-clip"), "set-image", path], timeout=4)
         return reply("screenshot", say("screenshot"))
     if re.fullmatch(r"lock( the| my)? (screen|computer|laptop|pc)|lock (it|up)|lock", t):
         code, _ = run(["loginctl", "lock-session"])
@@ -944,12 +937,12 @@ def k_desktop(t):
             spawn(["hyprlock"])
         return reply("lock", say("lock"))
     m = re.fullmatch(r"(go to|switch to|move to|open|show( me)?|take me to)? ?(the )?workspace (\d{1,2}|[a-z]+)", t)
-    if m and have("hyprctl"):
+    if m:
         n = num(m.group(4))
         if not n or n < 1 or n > 20:
             return None
-        run(["hyprctl", "dispatch", "workspace", str(int(n))])
-        return reply("workspace", say("workspace", n=int(n)))
+        code, _ = run([os.path.join(BIN, "friday-wm"), "workspace", str(int(n))])
+        return reply("workspace", say("workspace", n=int(n))) if code == 0 else None
 
 
 # -- maths

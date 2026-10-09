@@ -20,7 +20,7 @@ echo "- Session: ${XDG_SESSION_TYPE:-?}, shell $(basename "${SHELL:-?}"), locale
 echo
 echo "## Displays"
 have hyprctl && hyprctl monitors 2>/dev/null | awk '/^Monitor/{n=$2} /^\t[0-9]+x[0-9]+@/{print "- " n ": " $1 " at " $3} /scale:/{print "  scale " $2}'
-have hyprctl && echo "- Compositor: $(hyprctl version 2>/dev/null | head -1)"
+echo "- Desktop: $("$(dirname "$(readlink -f "$0")")/friday-wm" name 2>/dev/null)$(have hyprctl && [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && echo " ($(hyprctl version 2>/dev/null | head -1))")"
 echo
 echo "## Storage"
 echo '```'; lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS 2>/dev/null | head -30; echo '```'
@@ -55,7 +55,7 @@ echo "## Android devices (adb)"
 have adb && adb devices -l 2>/dev/null | tail -n +2 | sed '/^$/d;s/^/- /' || echo "- adb not installed"
 echo
 echo "## Dotfiles & configs"
-echo "- Hyprland: ~/.config/hypr (user overrides in ~/.config/hypr/custom/, don't edit hyprland/ defaults)"
+[ -d "$HOME/.config/hypr" ] && echo "- Hyprland: ~/.config/hypr (user overrides in ~/.config/hypr/custom/, don't edit hyprland/ defaults)"
 echo "- Shell: Quickshell configs in ~/.config/quickshell/: $(ls "$HOME/.config/quickshell" 2>/dev/null | tr '\n' ' ') (illogical-impulse = ii; its settings: ~/.config/illogical-impulse/config.json)"
 echo "- hypr custom files: $(ls "$HOME/.config/hypr/custom" 2>/dev/null | grep -v bak | tr '\n' ' ')"
 echo

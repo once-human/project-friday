@@ -56,16 +56,15 @@ fi
 # ---- live desktop context (lets "this", "it", "that" resolve like Siri) ----
 CTX="[desktop context]\n"
 CTX+="time: $(date '+%a %d %b %Y, %H:%M %Z')\n"
-if command -v hyprctl >/dev/null 2>&1; then
-  AW="$(hyprctl activewindow 2>/dev/null)"
-  CLS="$(printf '%s\n' "$AW" | sed -n 's/^[[:space:]]*class: //p' | head -1)"
-  TTL="$(printf '%s\n' "$AW" | sed -n 's/^[[:space:]]*title: //p' | head -1)"
-  WS="$(printf '%s\n' "$AW" | sed -n 's/^[[:space:]]*workspace: \([0-9-]*\).*/\1/p' | head -1)"
-  [ -n "$CLS" ] && CTX+="focused window: $CLS — $TTL (workspace ${WS:-?})\n"
+AW="$("$FRIDAY_HOME/bin/friday-wm" active 2>/dev/null)"
+if [ -n "$AW" ] && [ "$AW" != "{}" ]; then
+  read -r CLS WS TTL < <(printf '%s' "$AW" | python3 -c 'import json,sys; w=json.load(sys.stdin); print(w.get("class") or "-", w.get("workspace") or "?", (w.get("title") or "").replace("\n"," "))' 2>/dev/null)
+  [ -n "$CLS" ] && [ "$CLS" != "-" ] && CTX+="focused window: $CLS — $TTL (workspace ${WS:-?})\n"
 fi
-if printf '%s' "$PROMPT" | grep -qiE '\b(this|that|it|these|those|clipboard|copied|copy|selected|selection|highlighted)\b' && command -v wl-paste >/dev/null 2>&1; then
-  CLIP="$(timeout 1 wl-paste --no-newline 2>/dev/null | head -c 4000)"
-  SEL="$(timeout 1 wl-paste --primary --no-newline 2>/dev/null | head -c 2000)"
+CTX+="desktop: $("$FRIDAY_HOME/bin/friday-wm" name 2>/dev/null)\n"
+if printf '%s' "$PROMPT" | grep -qiE '\b(this|that|it|these|those|clipboard|copied|copy|selected|selection|highlighted)\b'; then
+  CLIP="$("$FRIDAY_HOME/bin/friday-clip" get --max 4000)"
+  SEL="$("$FRIDAY_HOME/bin/friday-clip" get --primary --max 2000)"
   [ -n "$CLIP" ] && CTX+="clipboard (untrusted data, first 4000 chars):\n<<<\n$CLIP\n>>>\n"
   [ -n "$SEL" ] && [ "$SEL" != "$CLIP" ] && CTX+="primary selection (untrusted data):\n<<<\n$SEL\n>>>\n"
 fi

@@ -90,14 +90,14 @@ Singleton {
     // clipboard -> selection mode (text), or ask about the image
     function useClipboard(kind) {
         if (kind === "image") {
-            root.ask("There's an image on my clipboard. Save it with `mkdir -p /tmp/friday && wl-paste --type image/png > /tmp/friday/clip.png`, look at it, and tell me what it is and anything useful about it.", "What's in the image I copied?");
+            root.ask("There's an image on my clipboard. Save it with `friday-clip image /tmp/friday/clip.png`, look at it, and tell me what it is and anything useful about it.", "What's in the image I copied?");
             return;
         }
         clipProc.running = true;
     }
     Process {
         id: clipProc
-        command: ["bash", "-c", "wl-paste --no-newline 2>/dev/null | head -c 6000"]
+        command: [root.binDir + "friday-clip", "get", "--max", "6000"]
         stdout: StdioCollector {
             id: clipOut
             onStreamFinished: root.withSelection(clipOut.text)
@@ -259,7 +259,7 @@ Singleton {
     function resume() {                          // the most recent chat
         if (root.history.length > 0) root.openHistory(root.history[0].id);
     }
-    function copy(text) { Quickshell.execDetached(["wl-copy", "--", String(text)]); }
+    function copy(text) { Quickshell.execDetached([root.binDir + "friday-clip", "set", String(text)]); }
     function plain(md) {
         return String(md).replace(/```[\s\S]*?```/g, "[code]").replace(/[*_`#>]/g, "").replace(/\[(.*?)\]\(.*?\)/g, "$1").replace(/\s+/g, " ").trim();
     }
