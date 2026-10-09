@@ -1213,9 +1213,16 @@ def main():
             raise
         except Exception as e:
             print("friday-local: %s failed: %r" % (skill.__name__, e), file=sys.stderr)
-    if not online():
+    if not online() and not offline_brain():
         reply("offline", say("offline"))
-    decline()
+    decline()                                  # Claude, or offline: Friday's on-device model (friday-fallback)
+
+
+def offline_brain():
+    """Is Friday's offline brain (a local model through Ollama, or FRIDAY_LOCAL_URL) set up?"""
+    if os.environ.get("FRIDAY_FALLBACK", "auto").lower() == "off":
+        return False
+    return bool(shutil.which("ollama") or os.environ.get("FRIDAY_LOCAL_URL"))
 
 
 if __name__ == "__main__":

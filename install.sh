@@ -4,7 +4,8 @@
 #   curl -fsSL https://raw.githubusercontent.com/once-human/project-friday/main/install.sh | bash
 #   ./install.sh                 asks once before using sudo, and before the ~700 MB voice download
 #   ./install.sh --yes           no questions: installs everything, voice included
-#   ./install.sh --no-voice      skip voice ("Hey Friday"); add it later with friday-voice-setup
+#   ./install.sh --no-voice      skip voice ("Hey Friday"); add it later with: project-friday voice setup
+#   ./install.sh --no-offline    skip the offline brain; add it later with: project-friday offline setup
 #   ./install.sh --no-deps       don't install system packages (just link Friday in)
 #   ./install.sh --dry-run       print what would happen, change nothing
 #
@@ -23,13 +24,14 @@ REPO_URL="https://github.com/once-human/project-friday"
 QS_TAG="v0.3.2"; QS_COMMIT="4f508be500dea6e5732cc3d50382a0048b17e7b1"
 FONT_URL="https://raw.githubusercontent.com/google/material-design-icons/49d4db35df873165d6bd6ba09b063c7dafbac2f4/variablefont/MaterialSymbolsRounded%5BFILL%2CGRAD%2Copsz%2Cwght%5D.ttf"
 FONT_SHA256="32e4011709e055596eb8d2dd0f7cb547b47c1d40ac9ecb8fad54f7f7eac202e7"
-YES=0; VOICE=ask; DEPS=1; DRY=0
+YES=0; VOICE=ask; OFFLINE=ask; DEPS=1; DRY=0
 USER_PATH="$PATH"
 for a in "$@"; do
   case "$a" in
     -y|--yes) YES=1 ;;
     --no-voice) VOICE=no ;;
     --voice) VOICE=yes ;;
+    --no-offline) OFFLINE=no ;;
     --no-deps) DEPS=0 ;;
     --dry-run) DRY=1 ;;
     -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]:-$0}" 2>/dev/null || true; exit 0 ;;
@@ -494,6 +496,17 @@ if [ "$VOICE" = yes ]; then
     if [ "$DRY" = 1 ]; then note "$ curl -LsSf https://astral.sh/uv/install.sh | sh"; else curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 || warn "uv install failed; using system Python"; fi
   fi
   run "$BIN/friday-voice-setup" || warn "voice setup failed; run $BIN/friday-voice-setup again later"
+fi
+
+# ---------------------------------------------------------------- 9b. offline brain (optional)
+if [ "$OFFLINE" = ask ]; then
+  note "Offline brain: a free open model (Qwen3, via Ollama) on this laptop, so Friday keeps answering with no internet"
+  note "and when your Claude limit runs out. No account, no keys, no limits; nothing leaves the laptop. 1.4 to 9 GB, sized to your RAM."
+  ask "Set up the offline brain?" y && OFFLINE=yes || OFFLINE=no
+fi
+if [ "$OFFLINE" = yes ]; then
+  if [ "$DRY" = 1 ]; then note "$ $BIN/friday-offline-setup --yes"
+  else "$BIN/friday-offline-setup" --yes || warn "offline brain setup didn't finish; run: project-friday offline setup"; fi
 fi
 
 # ---------------------------------------------------------------- 10. start

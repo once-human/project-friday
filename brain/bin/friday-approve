@@ -125,6 +125,7 @@ HELPERS_FREE = {"friday-context", "friday-screen", "friday-windows", "friday-ope
                 "friday-music", "friday-sessions", "friday-continue", "friday-voice", "friday-do", "friday-usage",
                 "friday-notify", "friday-profile", "friday-wm", "friday-local", "friday-toggle", "friday-login"}
 HELPERS_ASK = {"friday-integrate": "re-patches illogical-impulse", "friday-phrases": "uses a little Claude usage",
+               "friday-offline-setup": "installs Ollama and downloads a local model (several GB)",
                "friday-voice-setup": "downloads ~700 MB of speech models", "friday-start": "restarts or stops Friday"}
 DENY_PROGS = {"sudo", "doas", "su", "pkexec", "run0"}
 DISK_DESTROY = {"dd", "mkfs", "fdisk", "sfdisk", "gdisk", "parted", "wipefs", "shred", "cryptsetup",
@@ -252,8 +253,8 @@ def policy_segment(toks, followed_by_pipe_from_fetch):
         prog = helper
         if prog == "project-friday":
             sub = args[0] if args else "help"
-            if sub in ("status", "version", "help", "-h", "--help", "logs", "log", "backup", "fallback", "usage", "music",
-                       "play", "open", "show", "close", "hide"):
+            if sub in ("status", "version", "help", "-h", "--help", "logs", "log", "usage", "music", "play", "open", "show",
+                       "close", "hide") or (sub in ("offline", "backup", "fallback") and args[1:2] in ([], ["status"])):
                 return redirect_verdict
             return worst(redirect_verdict, Q("project-friday %s changes Friday itself" % sub,
                                              "high" if sub in ("update", "upgrade", "uninstall") else "medium"))

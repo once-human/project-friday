@@ -25,7 +25,7 @@ ${B}Project Friday${N} — $ME <command>
   ${B}start${N}              start Friday (and keep it running)
   ${B}stop${N}               stop Friday until you start it again or log in
   ${B}restart${N}            restart Friday (use this if it ever gets stuck)
-  ${B}status${N}             is it running, signed in, voice, backup model, usage
+  ${B}status${N}             is it running, signed in, voice, offline brain, usage
   ${B}open${N} / ${B}close${N}       show or hide the panel
   ${B}ask${N} "…"            open Friday and ask something
   ${B}update${N}             pull the latest version, re-link, restart
@@ -34,7 +34,7 @@ ${B}Project Friday${N} — $ME <command>
   ${B}me${N}                 edit what Friday knows about you (me.md)
   ${B}music${N} "…"          play something ("something nice", "high energy fred again"); stop, next, like, taste
   ${B}voice${N} setup|test   install the speech models / check mic and voice
-  ${B}backup${N}             which backup model answers when Claude's limit is hit
+  ${B}offline${N} setup|test  the offline brain: a free model on this laptop for no internet / Claude limits
   ${B}usage${N}              your Claude plan usage
   ${B}version${N}            which version you're on
   ${B}uninstall${N}          remove everything Friday added (your brain/ files stay)
@@ -70,9 +70,9 @@ case "$cmd" in
       if "$BIN/friday-login" --check 2>/dev/null | grep -q ok; then ok "Claude Code signed in"; else bad "Claude Code not signed in  (run: claude, then /login)"; fi
     else bad "Claude Code not installed"; fi
     b="$("$BIN/friday-fallback" --status 2>/dev/null | python3 -c 'import json,sys
-d=json.load(sys.stdin); b=d.get("backup")
-print(", ".join("%s (%s)" % (x["name"], x["model"]) for x in b) if isinstance(b, list) else "")' 2>/dev/null)"
-    [ -n "$b" ] && ok "backup model: $b" || meh "no backup model for when Claude's limit is hit  ($ME backup)"
+d=json.load(sys.stdin); b=d.get("local")
+print(", ".join(x["name"] for x in b) if isinstance(b, list) else "")' 2>/dev/null)"
+    [ -n "$b" ] && ok "offline brain: $b (answers with no internet or Claude limit)" || meh "no offline brain yet  ($ME offline setup)"
     if [ -f "$RUNDIR/usage.json" ]; then
       python3 - "$RUNDIR/usage.json" <<'PY' 2>/dev/null
 import json, sys, time
@@ -110,7 +110,19 @@ for l in sys.stdin:
       test) exec "$BIN/friday-voice" --test ;;
       *) die "usage: $ME voice setup | test" ;;
     esac ;;
-  backup|fallback) "$BIN/friday-fallback" --status; echo; echo "Set one up in config.env ($ME config): GEMINI_API_KEY (free at https://aistudio.google.com/apikey), GROQ_API_KEY, OPENROUTER_API_KEY, or run Ollama." ;;
+  offline|backup|fallback)
+    case "${1:-status}" in
+      setup|install) exec "$BIN/friday-offline-setup" "${@:2}" ;;
+      test) printf '[request]\nSay hi in one short sentence.' | FRIDAY_SESSION="" "$BIN/friday-fallback" --run \
+              | python3 -c 'import json,sys
+for l in sys.stdin:
+    try: j=json.loads(l)
+    except Exception: continue
+    d=(j.get("event") or {}).get("delta") or {}
+    if d.get("type")=="text_delta": print(d["text"], end="", flush=True)
+print()' ;;
+      *) "$BIN/friday-fallback" --status ;;
+    esac ;;
   usage)     "$BIN/friday-usage" >/dev/null 2>&1; "$0" status | grep -i "usage" || echo "Couldn't read your Claude usage (signed in?)." ;;
   version|-v|--version)
     if [ -n "$REPO" ] && git -C "$REPO" rev-parse --short HEAD >/dev/null 2>&1; then

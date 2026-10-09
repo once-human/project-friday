@@ -104,15 +104,17 @@ Whether the mic stays open is your call. End EVERY voice reply with exactly one 
 Judge it like a person would from what they actually said and meant, not from keywords. If unsure, use [[listen]]."
 fi
 
-# ---- Claude out of usage? Friday's backup model (friday-fallback) answers instead, with the same guard.
+# ---- No internet, or Claude out of usage? Friday's offline brain (friday-fallback: a free model on this laptop,
+#      no keys, no limits) answers instead, through the same guard.
 FB="$FRIDAY_HOME/bin/friday-fallback"
 export FRIDAY_SURFACE_TEXT="$SURFACE" FRIDAY_VOICE FRIDAY_SESSION
 if [ "${FRIDAY_FALLBACK:-auto}" != off ] && [ -x "$FB" ]; then
+  "$FB" --online >/dev/null 2>&1 || exec "$FB" --run <<<"$FULL"
   if [[ "${FRIDAY_SESSION:-}" == fb-* ]]; then
     "$FB" --limited >/dev/null 2>&1 && exec "$FB" --run <<<"$FULL"
     # Claude's back: hand it the chat so far
     PREV="$("$FB" --transcript "$FRIDAY_SESSION" 2>/dev/null)"
-    [ -n "$PREV" ] && FULL="$(printf "[Earlier in this chat, answered by Friday's backup model while Claude was at its limit:]\n%s\n\n%s" "$PREV" "$FULL")"
+    [ -n "$PREV" ] && FULL="$(printf "[Earlier in this chat, answered by Friday's offline brain while Claude wasn't available:]\\n%s\\n\\n%s" "$PREV" "$FULL")"
     FRIDAY_SESSION=""
   elif "$FB" --limited >/dev/null 2>&1; then
     exec "$FB" --run <<<"$FULL"
@@ -135,6 +137,6 @@ fi
 
 cd "$FRIDAY_HOME" || fail 'Friday home missing.'
 if [ "${FRIDAY_FALLBACK:-auto}" != off ] && [ -x "$FB" ]; then
-  exec "$FB" --wrap "$CLAUDE" "${args[@]}" 2>&1 <<<"$FULL"     # passes Claude straight through unless it hits a limit
+  exec "$FB" --wrap "$CLAUDE" "${args[@]}" 2>&1 <<<"$FULL"     # passes Claude straight through unless it hits a limit or can't connect
 fi
 exec "$CLAUDE" "${args[@]}" 2>&1 <<<"$FULL"
