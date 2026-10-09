@@ -40,9 +40,13 @@ pw-record 16 kHz ─▶ IDLE: Vosk (Indian English) grammar ["hey friday", "okay
 LISTEN: Vosk partials, then Whisper re-reading every ~1.2 s → "partial" events (live words)
         raw-mic RMS vs a percentile noise floor → ends after 1.1 s of quiet
      ─▶ Whisper small.en (beam 5, vocabulary prompt) → "final" → Brain.ask(text) with FRIDAY_VOICE=1
-answer streams in ─▶ each block's first paragraph ─▶ "say+" ─▶ Piper, clause by clause with real pauses
-     ─▶ pacat; a "word" event as each word is heard (word-by-word highlight) ─▶ listens again for a follow-up
+answer streams in ─▶ each block's first paragraph ─▶ "say+" ─▶ Piper, one sentence per utterance (longer
+     comma breaths via repeated pause tokens, a pause after each full stop) ─▶ pacat; a "word" event as each
+     word is heard, snapped to the real pauses (word-by-word highlight)
+reply ends with a hidden [[listen]] / [[end]] tag (Claude's call): listen for a follow-up, or say goodbye and close
 ```
+
+The tag is stripped from the screen, from speech and from History; no tag means "listen".
 
 The mic is ignored while Friday speaks (and doesn't move the automatic gain), so it never wakes itself.
 
