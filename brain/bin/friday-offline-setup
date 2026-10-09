@@ -29,12 +29,14 @@ command -v nvidia-smi >/dev/null && VRAM_GB=$(nvidia-smi --query-gpu=memory.tota
 TIERS=(small balanced smart smartest)
 declare -A TAG=([small]=qwen3:1.7b [balanced]=qwen3:4b [smart]=qwen3:8b [smartest]=qwen3:14b)
 declare -A SIZE=([small]="1.4 GB" [balanced]="2.5 GB" [smart]="5.2 GB" [smartest]="9.3 GB")
-declare -A NEEDS=([small]="any laptop" [balanced]="8 GB RAM" [smart]="16 GB RAM or a 6 GB GPU" [smartest]="32 GB RAM or a 12 GB GPU")
+declare -A NEEDS=([small]="any laptop" [balanced]="8 GB RAM" [smart]="a 6 GB GPU (or 16 GB RAM, slow)" [smartest]="a 12 GB GPU (or 32 GB RAM, slow)")
 declare -A WHAT=([small]="quick answers, basic tasks; fast even on old CPUs" [balanced]="good everyday helper"
                  [smart]="noticeably smarter, slower without a GPU" [smartest]="best quality, needs a strong machine")
-if   [ "$VRAM_GB" -ge 12 ] || [ "$RAM_GB" -ge 30 ]; then REC=smartest
-elif [ "$VRAM_GB" -ge 6 ]  || [ "$RAM_GB" -ge 15 ]; then REC=smart
-elif [ "$RAM_GB" -ge 7 ]; then REC=balanced
+# Without a GPU every reply runs on your CPU, so the recommendation stays light: a bigger model is smarter but
+# makes the laptop work much harder for every answer. With a decent GPU the bigger ones are cheap.
+if   [ "$VRAM_GB" -ge 12 ]; then REC=smartest
+elif [ "$VRAM_GB" -ge 6 ];  then REC=smart
+elif [ "$RAM_GB" -ge 7 ];   then REC=balanced
 else REC=small; fi
 
 show_tiers() {
@@ -85,11 +87,19 @@ if ! command -v ollama >/dev/null; then
 fi
 
 # ---- 3. its server (Friday also starts it on demand, so no service is required)
+STARTED=""
 if ! up; then
   RT="${XDG_RUNTIME_DIR:-/tmp/friday-$(id -u)}/friday"; (umask 077; mkdir -p "$RT")
-  setsid -f ollama serve >>"$RT/ollama.log" 2>&1
+  ollama serve >>"$RT/ollama.log" 2>&1 &
+  STARTED=$!
   for _ in $(seq 1 40); do sleep 0.25; up && break; done
   up || { warn "Ollama's server didn't start (log: $RT/ollama.log)"; exit 1; }
+fi
+# Friday starts Ollama only when it needs it and stops it again when idle, so stop the one we started here
+trap '[ -n "$STARTED" ] && kill "$STARTED" 2>/dev/null' EXIT
+if systemctl is-enabled ollama.service >/dev/null 2>&1; then
+  note "Ollama's system service runs all the time; Friday doesn't need it (it starts Ollama on demand)."
+  note "To free those resources when Friday isn't thinking: sudo systemctl disable --now ollama"
 fi
 
 # ---- 4. the model
@@ -113,7 +123,7 @@ PY
 
 # ---- 6. say hi
 say "testing it…"
-reply=$(curl -fsS --max-time 180 "$HOST/api/chat" -d "{\"model\":\"$MODEL\",\"stream\":false,\"think\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: ready\"}]}" 2>/dev/null \
+reply=$(curl -fsS --max-time 180 "$HOST/api/chat" -d "{\"model\":\"$MODEL\",\"stream\":false,\"think\":false,\"keep_alive\":0,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: ready\"}]}" 2>/dev/null \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["message"]["content"].strip()[:60])' 2>/dev/null)
 if [ -n "$reply" ]; then say "Offline brain ready ($MODEL said: $reply). Friday now answers even with no internet or Claude limit."
 else warn "Installed, but the test didn't answer in time (the first load can be slow). Try: project-friday offline test"; fi

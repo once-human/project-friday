@@ -114,6 +114,56 @@ def when(reset):
 
 
 # ---------------------------------------------------------------- the backup model
+KEEP = os.environ.get("FRIDAY_LOCAL_KEEP", "2m")       # how long the model stays in memory after an answer
+OLLAMA_PID = os.path.join(RT, "ollama.pid")              # the Ollama server Friday started (and will stop)
+STAMP = os.path.join(RT, "local-brain-used")
+
+
+def threads():
+    """Leave half the CPU for you: the model is a guest on your laptop, not the main event."""
+    v = os.environ.get("FRIDAY_LOCAL_THREADS", "auto")
+    if v.isdigit() and int(v) > 0:
+        return int(v)
+    try:
+        cores = len({l.split(":")[1].strip() for l in open("/proc/cpuinfo") if l.startswith("core id")}) or os.cpu_count()
+    except OSError:
+        cores = os.cpu_count() or 4
+    return max(2, (cores or 4) // 2)
+
+
+def reap_later():
+    """Stop the Ollama server Friday started once nobody has used it for a while (zero cost when idle)."""
+    open(STAMP, "w").close()
+    secs = _secs(KEEP) + 90
+    subprocess.Popen([sys.executable, os.path.realpath(__file__), "--reap", str(secs)], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def _secs(v):
+    m = re.fullmatch(r"(\d+)\s*([smh]?)", str(v).strip())
+    if not m:
+        return 120
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def reap(wait):
+    try:
+        before = os.path.getmtime(STAMP)
+    except OSError:
+        before = 0
+    time.sleep(wait)
+    try:
+        if os.path.getmtime(STAMP) != before:
+            return                                         # used again since: a later reaper will handle it
+        pid = int(open(OLLAMA_PID).read().strip())
+        argv = open("/proc/%d/cmdline" % pid, "rb").read().split(b"\0")
+        if any(os.path.basename(a.decode(errors="replace")) == "ollama" for a in argv) and b"serve" in argv:
+            os.kill(pid, signal.SIGTERM)
+        os.unlink(OLLAMA_PID)
+    except (OSError, ValueError):
+        pass
+
+
 PREFERRED = ["qwen3", "gpt-oss", "gemma3", "llama3.2", "llama3.1", "qwen2.5", "mistral", "phi4"]
 
 
@@ -139,8 +189,18 @@ def ollama_up(host):
     if not exe or not re.match(r"https?://(127\.0\.0\.1|localhost)(:|/|$)", host):
         return None
     os.makedirs(RT, mode=0o700, exist_ok=True)
+    # gentle: low CPU and disk priority (your desktop stays smooth), one model and one request at a time,
+    # and Friday stops this server again once it's been idle for a while (see reap())
+    env = dict(os.environ, OLLAMA_MAX_LOADED_MODELS="1", OLLAMA_NUM_PARALLEL="1", OLLAMA_KEEP_ALIVE=KEEP)
+    cmd = [exe, "serve"]
+    if shutil.which("ionice"):
+        cmd = ["ionice", "-c3"] + cmd
+    if shutil.which("nice"):
+        cmd = ["nice", "-n", "15"] + cmd
     with open(os.path.join(RT, "ollama.log"), "ab") as log:
-        subprocess.Popen([exe, "serve"], stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        pr = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True, env=env)
+    with open(OLLAMA_PID, "w") as f:
+        f.write(str(pr.pid))
     for _ in range(40):
         time.sleep(0.25)
         names = ollama_models(host)
@@ -218,8 +278,8 @@ def to_ollama(messages):
 def call(p, messages, tools, on_text):
     """One model turn. Text is streamed to on_text as it's generated. -> assistant message (OpenAI-style)."""
     if p["kind"] == "ollama":
-        body = {"model": p["model"], "messages": to_ollama(messages), "stream": True, "keep_alive": "30m",
-                "options": {"temperature": 0.6}, "think": False}
+        body = {"model": p["model"], "messages": to_ollama(messages), "stream": True, "keep_alive": KEEP,
+                "options": {"temperature": 0.6, "num_thread": threads()}, "think": False}
         if tools:
             body["tools"] = tools
         try:
@@ -539,6 +599,8 @@ def answer(prompt, reason_note, reset=None):
             return 0
     finally:
         alive.set()
+        if any(p["kind"] == "ollama" for p in provs):
+            reap_later()
     msg = "The offline brain didn't answer (%s). Everyday things still work on-device." % last_err
     emit({"type": "result", "subtype": "error", "is_error": True, "result": msg, "session_id": sid})
     return 0
@@ -687,6 +749,9 @@ def main():
         if lim:
             print(when(reset))
         return 0 if lim else 1
+    if a[0] == "--reap":
+        reap(int(a[1]) if len(a) > 1 and a[1].isdigit() else 210)
+        return 0
     if a[0] == "--online":
         return 0 if online() else 1
     if a[0] == "--status":
