@@ -19,23 +19,35 @@ Item {
         try { return JSON.parse(spokenJson); } catch (e) { return null; }
     }
     readonly property bool live: Brain.speakingMsg === index
-    // word by word: what's been said is solid, the word you're hearing glows, the rest waits its turn
-    readonly property string karaoke: {
-        if (!d.spoken || !d.spoken.words || d.spoken.words.length === 0) return "";
-        const cur = d.live ? Brain.spokenIdx : 99999;
+    // The answer in its own order: paragraphs Friday reads aloud light up word by word (said = solid, the word
+    // you're hearing glows, the rest waits), and code, tables and anything unspoken stay normal formatted text.
+    readonly property var segments: {
+        const body = Brain.untag(d.body);
+        const sp = d.spoken;
+        if (!sp || !sp.ranges || sp.ranges.length === 0 || !sp.words || sp.words.length === 0)
+            return body.length > 0 ? [{ rich: false, text: body }] : [];
+        const cur = d.live ? Brain.spokenIdx : 999999;
         const esc = t => String(t).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        return d.spoken.words.map((w, i) => {
-            const c = i < cur ? Theme.text : (i === cur ? Theme.accent : Theme.textTertiary);
-            return '<span style="color:' + c + '">' + esc(w) + "</span>";
-        }).join(" ");
-    }
-    // everything that wasn't spoken (details, code, lists) stays as normal formatted text below
-    readonly property string rest: {
-        let b = Brain.untag(d.body);
-        // only cut the spoken paragraphs out once they're actually being shown as speech
-        const r = (d.karaoke.length > 0 && d.spoken.ranges) ? d.spoken.ranges : [];
-        for (let k = r.length - 1; k >= 0; k--) b = b.slice(0, r[k][0]) + b.slice(r[k][1]);
-        return b.trim();
+        const out = [];
+        let at = 0;
+        sp.ranges.forEach((r, k) => {
+            const a = Math.max(at, Math.min(r[0], body.length)), b = Math.min(r[1], body.length);
+            if (a > at && body.slice(at, a).trim().length > 0) out.push({ rich: false, text: body.slice(at, a).trim() });
+            const g = sp.groups ? sp.groups[k] : (sp.ranges.length === 1 ? [0, sp.words.length] : null);
+            if (g && g[1] > 0) {
+                const html = sp.words.slice(g[0], g[0] + g[1]).map((w, n) => {
+                    const i = g[0] + n;
+                    const c = i < cur ? Theme.text : (i === cur ? Theme.accent : Theme.textTertiary);
+                    return '<span style="color:' + c + '">' + esc(w) + "</span>";
+                }).join(" ");
+                out.push({ rich: true, text: html });
+            } else if (b > a) {
+                out.push({ rich: false, text: body.slice(a, b).trim() });
+            }
+            at = Math.max(at, b);
+        });
+        if (at < body.length && body.slice(at).trim().length > 0) out.push({ rich: false, text: body.slice(at).trim() });
+        return out;
     }
 
     readonly property bool isUser: role === "user"
@@ -190,33 +202,25 @@ Item {
             }
         }
 
-        // ---------------------------------------------------------------- what Friday said out loud
-        Text {
-            visible: !d.isUser && d.karaoke.length > 0
-            Layout.fillWidth: true
-            text: d.karaoke
-            textFormat: Text.RichText
-            wrapMode: Text.Wrap
-            font.family: Theme.sans
-            font.pixelSize: 16
-            lineHeight: 1.4
-        }
-
         // ---------------------------------------------------------------- the answer
-        Text {
-            visible: !d.isUser && (d.karaoke.length > 0 ? d.rest.length > 0 : d.body.length > 0)
-            Layout.fillWidth: true
-            // headings read as shouting in a small panel: render them as bold lines
-            text: (d.karaoke.length > 0 ? d.rest : Brain.untag(d.body)).replace(/^#{1,6}\s+(.+)$/gm, "**$1**")
-            textFormat: Text.MarkdownText
-            wrapMode: Text.Wrap
-            color: Theme.text
-            linkColor: Theme.accent
-            font.family: Theme.sans
-            font.pixelSize: 15
-            lineHeight: 1.45
-            onLinkActivated: link => Qt.openUrlExternally(link)
-            HoverHandler { cursorShape: parent.hoveredLink.length > 0 ? Qt.PointingHandCursor : Qt.ArrowCursor }
+        Repeater {
+            model: d.isUser ? [] : d.segments
+            delegate: Text {
+                id: seg
+                required property var modelData
+                Layout.fillWidth: true
+                // headings read as shouting in a small panel: render them as bold lines
+                text: seg.modelData.rich ? seg.modelData.text : seg.modelData.text.replace(/^#{1,6}\s+(.+)$/gm, "**$1**")
+                textFormat: seg.modelData.rich ? Text.RichText : Text.MarkdownText
+                wrapMode: Text.Wrap
+                color: Theme.text
+                linkColor: Theme.accent
+                font.family: Theme.sans
+                font.pixelSize: seg.modelData.rich ? 16 : 15
+                lineHeight: seg.modelData.rich ? 1.4 : 1.45
+                onLinkActivated: link => Qt.openUrlExternally(link)
+                HoverHandler { cursorShape: parent.hoveredLink.length > 0 ? Qt.PointingHandCursor : Qt.ArrowCursor }
+            }
         }
 
         // ---------------------------------------------------------------- quiet actions

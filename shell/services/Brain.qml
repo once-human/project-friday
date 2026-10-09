@@ -46,12 +46,11 @@ Singleton {
     property int spokenIdx: -1                  // sentence currently being heard
     property var speechParts: []                // sentences sent to the voice, in order
     property var speechRanges: []               // [start, end) spans of the message body they came from
-    property int speechFed: 0                   // how far into the current text block we've fed
-    property int blockStart: 0                  // where the current text block starts in the body
-    property bool blockDone: false              // the current block's spoken paragraph is finished
+    property int speechFed: 0                   // how far into the answer has been sent to the voice
     property int speechChars: 0
     property int speechBase: 0                  // words already spoken in earlier utterances of this answer
     property var speechWords: []                // exactly the words Friday says, for word-by-word highlighting
+    property var speechGroups: []               // [first word, word count] for each spoken range, in body order
     readonly property string restState: root.wakeEnabled ? "idle" : "muted"
     readonly property string wakeFile: (Quickshell.env("XDG_STATE_HOME") || (root.home + "/.local/state")) + "/friday/wake"
     readonly property bool voiceOn: ["idle", "listening", "transcribing", "speaking"].indexOf(root.voiceState) >= 0
@@ -360,7 +359,9 @@ Singleton {
             root.clearSpokenAfter = i;
             root.expectReply = !!r.listen;           // "how are you" keeps talking; "volume up" is done
             root.endAfterSpeaking = !r.listen;
-            root.voiceCmd("say " + JSON.stringify(String(r.say || text)));
+            root.voiceCmd("stop");
+            root.voiceCmd("say+ " + JSON.stringify({ text: String(r.say || text), id: 0 }));
+            root.voiceCmd("say-end");
         }
         root.voiceTurn = false;
         console.log("[Friday] on-device: " + r.intent);
@@ -378,11 +379,10 @@ Singleton {
             root.speechParts = [];
             root.speechRanges = [];
             root.speechFed = 0;
-            root.blockStart = 0;
-            root.blockDone = false;
             root.speechChars = 0;
             root.speechBase = 0;
             root.speechWords = [];
+            root.speechGroups = [];
         }
         root.steps = [];
         root.gotText = false;
@@ -476,12 +476,9 @@ Singleton {
         if (ev.type === "stream_event") {
             const se = ev.event ?? {};
             if (se.type === "content_block_start" && se.content_block?.type === "text" && root.gotText) {
-                root.feedSpeech(true);                         // finish speaking the previous block's paragraph
+                root.feedSpeech(true);                         // the previous text block is complete: say the rest of it
                 const cur = root.messages.get(root.assistantIndex)?.body ?? "";
                 if (!cur.endsWith("\n\n")) root.addText("\n\n");
-                root.blockStart = (root.messages.get(root.assistantIndex)?.body ?? "").length;
-                root.speechFed = 0;
-                root.blockDone = false;
             } else if (se.type === "content_block_delta" && se.delta?.type === "text_delta" && se.delta.text) {
                 root.gotText = true;
                 root.addText(se.delta.text);
@@ -550,20 +547,8 @@ Singleton {
                 // No tag means it didn't say, so it listens; a few seconds of silence still ends it.
                 root.expectReply = root.lastTag !== "end";
                 root.endAfterSpeaking = root.lastTag === "end";
-                if (root.speechParts.length > 0) {
-                    root.voiceCmd("say-end");
-                } else {
-                    const body = root.messages.get(i).body;
-                    const said = root.speakable(body);
-                    if (said.length > 0) {
-                        // the spoken part is shown word by word instead of as plain text
-                        const paras = body.split(/\n\s*\n/);
-                        const end = paras.length > 1 ? paras[0].length + body.slice(paras[0].length).search(/\S/) + paras[1].length : body.length;
-                        root.speechRanges = [[0, Math.min(body.length, Math.max(0, end))]];
-                        root.saveSpoken();
-                        root.voiceCmd("say " + JSON.stringify(said));
-                    } else root.afterSpeaking();
-                }
+                if (root.speechParts.length > 0) root.voiceCmd("say-end");   // everything readable is already queued
+                else root.afterSpeaking();                                   // nothing to say (only code, say)
             }
             if (root.queued === "") root.voiceTurn = false;
             root.lastActivity = Date.now();
@@ -747,34 +732,44 @@ Singleton {
         onLoaded: { root.wakeEnabled = text().trim() === "on"; root.voiceBooted = true; }
         onLoadFailed: root.voiceBooted = true      // never set: wake word stays off
     }
-    // Speak the first paragraph of each text block as one whole piece, as soon as that paragraph is complete
-    // (natural phrasing beats shaving off a second). Code and later paragraphs stay on screen only.
-    function feedSpeech(blockEnd) {
+    // Read the whole answer aloud, paragraph by paragraph, each one sent the moment it's complete (whole
+    // paragraphs sound natural; half sentences don't). Only code blocks and tables are screen-only.
+    function feedSpeech(final) {
         if (!root.voiceTurn || root.speakingMsg !== root.assistantIndex || root.assistantIndex < 0) return;
-        if (root.blockDone) return;
         const body = root.messages.get(root.assistantIndex)?.body ?? "";
-        const block = body.slice(root.blockStart);
-        const lead = block.length - block.replace(/^\s+/, "").length;
-        let stop = -1;
-        const para = block.indexOf("\n\n", lead + 1);
-        const fence = block.indexOf("```", lead);
-        if (para >= 0) stop = para;
-        if (fence >= 0 && (stop < 0 || fence < stop)) stop = fence;
-        if (!blockEnd && stop < 0) return;                 // paragraph still being written
-        const end = stop >= 0 ? stop : block.length;
-        root.blockDone = true;
-        const said = root.speakable(block.slice(lead, end));
-        if (said.length === 0 || root.speechChars > 900) return;
-        root.speechChars += said.length;
-        root.speechParts = [...root.speechParts, said];
-        root.speechRanges = [...root.speechRanges, [root.blockStart + lead, root.blockStart + end]];
-        root.saveSpoken();
-        root.voiceCmd("say+ " + JSON.stringify(said));
+        let pos = root.speechFed;
+        while (pos < body.length) {
+            while (pos < body.length && /\s/.test(body[pos])) pos++;
+            if (pos >= body.length) break;
+            if (body.startsWith("```", pos)) {               // code: shown, never read out
+                const close = body.indexOf("```", pos + 3);
+                if (close < 0) { if (final) pos = body.length; break; }
+                pos = close + 3;
+                continue;
+            }
+            let end = body.indexOf("\n\n", pos);
+            const fence = body.indexOf("```", pos);
+            if (fence >= 0 && (end < 0 || fence < end)) end = fence;
+            if (end < 0) {
+                if (!final) break;                           // this paragraph is still being written
+                end = body.length;
+            }
+            const said = root.speakable(body.slice(pos, end));
+            if (said.length > 0 && root.speechChars < 6000) {
+                root.speechChars += said.length;
+                root.speechParts = [...root.speechParts, said];
+                root.speechRanges = [...root.speechRanges, [pos, end]];
+                root.saveSpoken();
+                root.voiceCmd("say+ " + JSON.stringify({ text: said, id: root.speechRanges.length - 1 }));
+            }
+            pos = end;
+        }
+        root.speechFed = pos;
     }
     function saveSpoken() {
         if (root.speakingMsg < 0 || root.speakingMsg >= root.messages.count) return;
         root.messages.setProperty(root.speakingMsg, "spokenJson",
-            JSON.stringify({ words: root.speechWords, ranges: root.speechRanges }));
+            JSON.stringify({ words: root.speechWords, ranges: root.speechRanges, groups: root.speechGroups }));
     }
 
     // Voice replies end with a hidden [[listen]] / [[end]] tag: Claude's call on whether you'll answer.
@@ -784,17 +779,20 @@ Singleton {
         const m = String(t ?? "").match(/\[\[(listen|end)\]\]\s*$/i);
         return m ? m[1].toLowerCase() : "";
     }
-    // First paragraph or two, as plain sentences, capped so Friday doesn't read an essay aloud.
+    // Markdown -> what you'd actually say: no code, no tables, list items and headings become sentences.
     function speakable(md) {
-        let t = root.untag(String(md ?? "").replace(/\[\[(listen|end)\]\]/gi, "")).replace(/```[\s\S]*?```/g, " ").replace(/^\*\*Error:\*\*/, "Sorry, something went wrong.");
-        t = t.split(/\n\s*\n/).slice(0, 2).join(" ");
-        t = t.replace(/`([^`]*)`/g, "$1").replace(/[*_#>|]/g, "").replace(/\[(.*?)\]\(.*?\)/g, "$1").replace(/^\s*[-•]\s+/gm, "").replace(/\s+/g, " ").trim();
-        if (t.length > 420) {
-            const cut = t.slice(0, 420);
-            const end = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("? "), cut.lastIndexOf("! "));
-            t = end > 120 ? cut.slice(0, end + 1) : cut + "…";
-        }
-        return t;
+        let t = root.untag(String(md ?? "").replace(/\[\[(listen|end)\]\]/gi, ""));
+        t = t.replace(/```[\s\S]*?```/g, " ").replace(/```[\s\S]*$/, " ").replace(/^\*\*Error:\*\*/, "Sorry, something went wrong.");
+        t = t.split("\n")
+            .filter(l => !/^\s*\|/.test(l) && !/^\s*[-=*_]{3,}\s*$/.test(l))
+            .map(l => {
+                const listy = /^\s*([-•*+]|\d+[.)]|#{1,6})\s+/.test(l);
+                let x = l.replace(/^\s*#{1,6}\s+/, "").replace(/^\s*([-•*+]|\d+[.)])\s+/, "").trim();
+                if (listy && x.length > 0 && !/[.!?:;,…]["')\]]*$/.test(x)) x += ".";
+                return x;
+            })
+            .join("\n");
+        return t.replace(/`([^`]*)`/g, "$1").replace(/[*_#>|]/g, "").replace(/\[(.*?)\]\(.*?\)/g, "$1").replace(/\s+/g, " ").trim();
     }
     function onVoiceEvent(line) {
         let e;
@@ -826,6 +824,11 @@ Singleton {
         case "level": root.voiceLevel = e.v; break;
         case "words":
             if (root.speakingMsg >= 0) {
+                if (typeof e.id === "number" && e.id >= 0) {
+                    const g = root.speechGroups.slice();
+                    g[e.id] = [root.speechWords.length, (e.words ?? []).length];
+                    root.speechGroups = g;
+                }
                 root.speechWords = [...root.speechWords, ...(e.words ?? [])];
                 root.saveSpoken();
             }
@@ -879,7 +882,13 @@ Singleton {
                     root.messages.setProperty(root.clearSpokenAfter, "spokenJson", "");
                 root.clearSpokenAfter = -1;
                 root.speechBase = root.speechWords.length;
-                if (!root.running) { root.spokenIdx = 9999; root.speakingMsg = -1; }
+                if (!root.running) {
+                    // done talking: the answer goes back to its normal formatting (bullets, bold…)
+                    if (root.speakingMsg >= 0 && root.speakingMsg < root.messages.count)
+                        root.messages.setProperty(root.speakingMsg, "spokenJson", "");
+                    root.spokenIdx = 9999;
+                    root.speakingMsg = -1;
+                }
             }
             if (!e.on) root.afterSpeaking();
             break;
