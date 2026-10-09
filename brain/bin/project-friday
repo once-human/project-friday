@@ -22,22 +22,35 @@ usage() {
   cat <<EOF
 ${B}Project Friday${N} — $ME <command>
 
-  ${B}start${N}              start Friday (and keep it running)
-  ${B}stop${N}               stop Friday until you start it again or log in
-  ${B}restart${N}            restart Friday (use this if it ever gets stuck)
-  ${B}status${N}             is it running, signed in, voice, offline brain, usage
-  ${B}open${N} / ${B}close${N}       show or hide the panel
-  ${B}ask${N} "…"            open Friday and ask something
-  ${B}update${N}             pull the latest version, re-link, restart
-  ${B}logs${N} [-f]          recent logs (voice + shell); -f to follow
-  ${B}config${N}             edit your settings (config.env)
-  ${B}me${N}                 edit what Friday knows about you (me.md)
-  ${B}music${N} "…"          play something ("something nice", "high energy fred again"); stop, next, like, taste
-  ${B}voice${N} setup|test   install the speech models / check mic and voice
-  ${B}offline${N} setup|test  the offline brain: a free model on this laptop for no internet / Claude limits
-  ${B}usage${N}              your Claude plan usage
-  ${B}version${N}            which version you're on
-  ${B}uninstall${N}          remove everything Friday added (your brain/ files stay)
+${B}Run it${N}
+  start · stop · restart     start it (and keep it running) · stop until next login · restart if it's ever stuck
+  status                     running? signed in? mode, voice, offline brain, Claude usage
+  open · close · ask "…"     show/hide the panel · open it and ask something
+  update · version           pull the latest and restart · which version you're on
+  logs [-f]                  recent voice/shell logs and the guard's last decisions
+
+${B}Make it yours${N}
+  mode [default|local|private]   the big switch:  default: Claude, local model as backup
+                                 local: the model on this laptop for everything (no Claude usage)
+                                 private: local + on-device voice + no background calls
+  settings                   every setting, its value and its default
+  set NAME VALUE             change one ("default" puts it back), e.g.  $ME set tts piper
+  reset NAME|all             back to defaults ("all" keeps your name/music; "everything" doesn't)
+  config · me                edit config.env by hand · edit what Friday knows about you (me.md)
+
+${B}Offline brain${N} (free model on this laptop: works with no internet or Claude limits)
+  offline setup [TIER]       pick and install one: small (1.4 GB) · balanced (2.5) · smart (5.2) · smartest (9.3)
+  offline models             the sizes and which one suits this laptop
+  offline use MODEL          switch model (a tier or any Ollama model; downloads it if needed)
+  offline remove MODEL       delete a downloaded model
+  offline status · test      what's set up · ask it something
+
+${B}Voice & music${N}
+  voice setup · voice test   install the speech models · check mic and voice
+  music "…"                  play something ("something nice"); stop · next · like · more · taste
+
+  usage                      your Claude plan usage
+  uninstall                  remove everything Friday added (your brain/ files stay)
 EOF
 }
 
@@ -62,7 +75,7 @@ case "$cmd" in
     running || { "$0" start >/dev/null; sleep 1.5; }
     qs -c friday ipc call friday ask "$*" >/dev/null 2>&1 || die "Friday isn't responding; try: $ME restart" ;;
   status)
-    echo "${B}Project Friday${N} $("$0" version 2>/dev/null)"
+    echo "${B}Project Friday${N} $("$0" version 2>/dev/null)  ·  mode: $(NO_COLOR=1 "$BIN/friday-settings" mode 2>/dev/null | head -1 | sed 's/^Mode: //')"
     if running; then ok "running"; else bad "not running  ($ME start)"; fi
     pgrep -f -- "friday-start$" >/dev/null && ok "auto-restart on" || meh "auto-restart off (it starts at your next login)"
     pgrep -f -- "friday_voice.py" >/dev/null && ok "voice on" || { [ -d "$FH/.venv" ] && meh "voice installed, not running" || meh "voice not installed  ($ME voice setup)"; }
@@ -101,7 +114,7 @@ PY
 for l in sys.stdin:
     try: j=json.loads(l); print("  %s  %-5s %s" % (j["t"][11:], j["decision"], j.get("what","")[:90].replace("\n"," ")))
     except Exception: pass' ;;
-  config|settings) [ -f "$FH/config.env" ] || cp "$FH/config.example.env" "$FH/config.env"; "${EDITOR:-${VISUAL:-nano}}" "$FH/config.env" && echo "Saved. Most settings apply to the next request; voice ones after: $ME restart" ;;
+  config|edit) [ -f "$FH/config.env" ] || cp "$FH/config.example.env" "$FH/config.env"; "${EDITOR:-${VISUAL:-nano}}" "$FH/config.env" && echo "Saved. Most settings apply to the next request; voice ones after: $ME restart" ;;
   me)        [ -f "$FH/me.md" ] || cp "$FH/me.example.md" "$FH/me.md"; "${EDITOR:-${VISUAL:-nano}}" "$FH/me.md" ;;
   music|play) exec "$BIN/friday-music" "${@:-something nice}" ;;
   voice)
@@ -110,9 +123,30 @@ for l in sys.stdin:
       test) exec "$BIN/friday-voice" --test ;;
       *) die "usage: $ME voice setup | test" ;;
     esac ;;
+  settings|setting) exec "$BIN/friday-settings" list ;;
+  set)       [ $# -ge 2 ] || die "usage: $ME set NAME VALUE   (see: $ME settings)"; exec "$BIN/friday-settings" set "$@" ;;
+  get)       exec "$BIN/friday-settings" get "$@" ;;
+  reset)     [ $# -ge 1 ] || die "usage: $ME reset NAME | all | everything"; exec "$BIN/friday-settings" reset "$@" ;;
+  mode)      exec "$BIN/friday-settings" mode "$@" ;;
+  private)   exec "$BIN/friday-settings" mode private ;;
+  local)     exec "$BIN/friday-settings" mode local ;;
   offline|backup|fallback)
     case "${1:-status}" in
-      setup|install) exec "$BIN/friday-offline-setup" "${@:2}" ;;
+      setup|install)
+        shift
+        if [ -n "${1:-}" ] && [[ "$1" != -* ]]; then exec "$BIN/friday-offline-setup" --model "$1" "${@:2}"; fi
+        exec "$BIN/friday-offline-setup" "$@" ;;
+      models|sizes|list) exec "$BIN/friday-offline-setup" --models ;;
+      use|switch)
+        [ -n "${2:-}" ] || die "usage: $ME offline use small|balanced|smart|smartest|<ollama model>"
+        "$BIN/friday-offline-setup" --model "$2" --yes ;;
+      remove|rm|delete)
+        [ -n "${2:-}" ] || die "usage: $ME offline remove MODEL   (downloaded: ollama list)"
+        command -v ollama >/dev/null || die "Ollama isn't installed."
+        case "$2" in small) m=qwen3:1.7b ;; balanced) m=qwen3:4b ;; smart) m=qwen3:8b ;; smartest) m=qwen3:14b ;; *) m="$2" ;; esac
+        ollama rm "$m" || exit 1
+        [ "$("$BIN/friday-settings" get local-model)" = "$m" ] && "$BIN/friday-settings" set local-model default >/dev/null
+        echo "Removed $m." ;;
       test) printf '[request]\nSay hi in one short sentence.' | FRIDAY_SESSION="" "$BIN/friday-fallback" --run \
               | python3 -c 'import json,sys
 for l in sys.stdin:
