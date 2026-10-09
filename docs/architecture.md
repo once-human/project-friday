@@ -40,9 +40,9 @@ pw-record 16 kHz ─▶ IDLE: Vosk (Indian English) grammar ["hey friday", "okay
 LISTEN: Vosk partials, then Whisper re-reading every ~1.2 s → "partial" events (live words)
         raw-mic RMS vs a percentile noise floor → ends after 1.1 s of quiet
      ─▶ Whisper small.en (beam 5, vocabulary prompt) → "final" → Brain.ask(text) with FRIDAY_VOICE=1
-answer streams in ─▶ each block's first paragraph ─▶ "say+" ─▶ Piper, one sentence per utterance (longer
-     comma breaths via repeated pause tokens, a pause after each full stop) ─▶ pacat; a "word" event as each
-     word is heard, snapped to the real pauses (word-by-word highlight)
+answer streams in ─▶ every paragraph (code and tables skipped) ─▶ "say+ {text, id}" ─▶ sentence by sentence,
+     the next ones prepared while one plays: neural voice (edge-tts, with real word timings) when online,
+     Piper offline ─▶ pacat; a "word" event as each word is heard; the panel lights words up in place
 reply ends with a hidden [[listen]] / [[end]] tag (Claude's call): listen for a follow-up, or say goodbye and close
 ```
 
@@ -75,6 +75,13 @@ died (it gives up with a notification after 5 crashes in a row), and kicks off t
 
 Nothing calls Claude in the background except that weekly phrase refresh. Session titles are made locally, and
 `friday-usage` only reads the usage meter.
+
+## Any desktop (`friday-wm`, `friday-clip`)
+
+Nothing outside these two helpers assumes Hyprland. `friday-wm` answers "which desktop, focused window, window list,
+switch workspace, monitors, move the pointer, take a screenshot" for Hyprland, Sway, niri, KDE, GNOME, X11 and
+generic wlroots compositors. `friday-clip` does the clipboard with wl-clipboard on Wayland and xclip/xsel on X11.
+Anything a desktop can't do returns nothing, and Friday carries on without it.
 
 ## 3. The ii hooks (`friday-integrate`)
 
