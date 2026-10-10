@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""friday-doctor — checks everything Friday depends on and says exactly what to fix (project-friday doctor).
+
+    friday-doctor            the full check-up
+    friday-doctor --voice    just the voice: mic, speakers, models, and how the wake word has been doing
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+sys.dont_write_bytecode = True
+HOME = os.path.expanduser("~")
+FH = os.environ.get("FRIDAY_HOME", os.path.join(HOME, ".local/share/friday"))
+RT = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp/friday-%d" % os.getuid(), "friday")
+os.environ["PATH"] = ":".join([os.path.join(FH, "bin"), HOME + "/.local/bin", "/usr/local/bin", "/usr/bin",
+                               os.environ.get("PATH", "")])
+TTY = sys.stdout.isatty()
+G, Y, R, D, B, N = ("\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[1m", "\033[0m") if TTY else ("",) * 6
+problems = []
+
+
+def ok(msg):
+    print("  %s✓%s %s" % (G, N, msg))
+
+
+def warn(msg, fix=""):
+    print("  %s!%s %s" % (Y, N, msg) + ("\n      %s→ %s%s" % (D, fix, N) if fix else ""))
+    problems.append(msg)
+
+
+def bad(msg, fix=""):
+    print("  %s✗%s %s" % (R, N, msg) + ("\n      %s→ %s%s" % (D, fix, N) if fix else ""))
+    problems.append(msg)
+
+
+def sh(cmd, t=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=t)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except Exception as e:
+        return 1, str(e)
+
+
+def running(pat):
+    return sh(["pgrep", "-f", "--", pat])[0] == 0
+
+
+def config():
+    vals = {}
+    try:
+        for line in open(os.path.join(FH, "config.env")):
+            m = re.match(r"\s*(?:export\s+)?([A-Z][A-Z0-9_]*)=(.*)", line)
+            if m:
+                vals[m.group(1)] = m.group(2).split(" #")[0].strip().strip("'\"")
+    except OSError:
+        pass
+    return vals
+
+
+CFG = config()
+
+
+def section(t):
+    print("\n" + B + t + N)
+
+
+def check_core():
+    section("Friday")
+    if running(r"(^|/)(qs|quickshell)( [^ ]*)* -c friday( |$)"):
+        ok("panel running")
+    else:
+        bad("the panel isn't running", "project-friday start   (errors: qs -c friday)")
+    if not shutil.which("qs"):
+        bad("Quickshell (qs) isn't installed", "re-run install.sh")
+    if not os.path.isdir(os.path.join(HOME, ".config/quickshell/friday")):
+        bad("~/.config/quickshell/friday is missing", "re-run install.sh")
+    path_ok = os.path.join(HOME, ".local/bin") in os.environ.get("ORIG_PATH", os.environ.get("PATH", "")).split(":")
+    if shutil.which("project-friday") or path_ok:
+        ok("the project-friday command is on your PATH")
+    else:
+        warn("~/.local/bin isn't on your PATH", "add it in your shell config, or run ~/.local/bin/project-friday")
+    known = set(re.findall(r'"(FRIDAY_[A-Z_]+)"', open(os.path.join(FH, "bin", "friday-settings")).read()))
+    known |= {"FRIDAY_WAKE", "FRIDAY_VOSK_MODEL", "FRIDAY_PHRASES_MODEL", "FRIDAY_PAUSE_SENTENCE", "FRIDAY_COMMA_HOLD",
+              "FRIDAY_SPEECH_PACE", "FRIDAY_PAUSE_NEURAL", "FRIDAY_NEURAL_PITCH", "FRIDAY_MAX_GAIN", "FRIDAY_FALLBACK",
+              "FRIDAY_OLLAMA_MODEL", "FRIDAY_LOCAL_VISION", "FRIDAY_ONLINE", "FRIDAY_HOME"}
+    odd = [k for k in CFG if k.startswith("FRIDAY_") and k not in known]
+    if odd:
+        warn("config.env has settings Friday doesn't know (typos?): " + ", ".join(odd), "project-friday settings")
+
+
+def check_brain():
+    section("Brain")
+    brain = CFG.get("FRIDAY_BRAIN", "auto")
+    if brain != "local":
+        claude = shutil.which("claude") or (os.path.exists(HOME + "/.local/bin/claude") and HOME + "/.local/bin/claude")
+        if not claude:
+            bad("Claude Code isn't installed", "curl -fsSL https://claude.ai/install.sh | bash   (or: project-friday mode local)")
+        else:
+            st = sh([os.path.join(FH, "bin", "friday-login"), "--check"], 12)[1]
+            if "ok" in st:
+                ok("Claude Code signed in")
+            else:
+                bad("Claude Code isn't signed in", "run: claude   then /login")
+    else:
+        ok("local mode: no Claude account needed")
+    if shutil.which("ollama") or CFG.get("FRIDAY_LOCAL_URL"):
+        code, out = sh(["ollama", "list"], 8) if shutil.which("ollama") else (0, "")
+        models = [l.split()[0] for l in out.splitlines()[1:] if l.strip()] if code == 0 else []
+        if models or CFG.get("FRIDAY_LOCAL_URL"):
+            ok("offline brain ready: " + (", ".join(models[:3]) or CFG.get("FRIDAY_LOCAL_URL")))
+        elif code == 0:
+            warn("Ollama is installed but has no model", "project-friday offline setup")
+        if sh(["systemctl", "is-enabled", "ollama"])[1].strip() == "enabled":
+            warn("Ollama's system service runs all the time (Friday starts it on demand)", "sudo systemctl disable --now ollama")
+    elif brain == "local":
+        bad("local mode is on but there's no offline brain", "project-friday offline setup")
+    else:
+        warn("no offline brain: with no internet or no Claude usage, only everyday skills work", "project-friday offline setup")
+
+
+def wpctl(target):
+    code, out = sh(["wpctl", "get-volume", target])
+    if code != 0:
+        return None, None
+    m = re.search(r"([\d.]+)", out)
+    return (float(m.group(1)) if m else None), ("MUTED" in out)
+
+
+def check_voice():
+    section("Voice")
+    venv = os.path.join(FH, ".venv", "bin", "python")
+    vdir = os.path.join(FH, ".voice")
+    if not os.path.exists(venv):
+        warn("voice isn't installed", "project-friday voice setup")
+        return
+    for name, path in (("wake-word model", os.path.join(vdir, "vosk")), ("speech recognition", os.path.join(vdir, "whisper")),
+                       ("on-device voice", os.path.join(vdir, "piper"))):
+        if os.path.isdir(path) and os.listdir(path):
+            ok(name + " installed")
+        else:
+            bad(name + " is missing", "project-friday voice setup")
+    if not (shutil.which("pw-record") or shutil.which("parecord")):
+        bad("no microphone recorder (pw-record / parecord)", "install pipewire (or pulseaudio-utils)")
+    if shutil.which("wpctl"):
+        vol, muted = wpctl("@DEFAULT_AUDIO_SOURCE@")
+        if vol is None:
+            bad("no microphone found", "plug one in or pick one in your sound settings (pavucontrol)")
+        elif muted:
+            bad("your microphone is MUTED, so Friday can't hear you", "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ 0")
+        elif vol < 0.3:
+            warn("microphone volume is low (%d%%): Friday may miss you" % int(vol * 100), "wpctl set-volume @DEFAULT_AUDIO_SOURCE@ 0.8")
+        else:
+            ok("microphone on, %d%%" % int(vol * 100))
+        vol, muted = wpctl("@DEFAULT_AUDIO_SINK@")
+        if muted:
+            warn("your speakers are muted, so you won't hear Friday", "wpctl set-mute @DEFAULT_AUDIO_SINK@ 0")
+    if not (shutil.which("pacat") or shutil.which("pw-cat") or shutil.which("aplay")):
+        bad("no audio player for Friday's voice (pacat / pw-cat / aplay)", "install libpulse or pipewire")
+    if running(r"friday_voice[.]py"):
+        ok("voice running")
+    else:
+        warn("the voice isn't running", "project-friday restart")
+    stats()
+
+
+def stats():
+    log = os.path.join(FH, ".voice", "voice.log")
+    try:
+        lines = open(log, errors="replace").read().splitlines()[-4000:]
+    except OSError:
+        return
+    today = time.strftime("%H:%M")
+    conf = rej = tmo = heard = nospeech = drops = barge = 0
+    lat = []
+    for l in lines:
+        if "wake confirmed" in l:
+            conf += 1
+            m = re.search(r"([\d.]+)s after the word", l)
+            if m:
+                lat.append(float(m.group(1)))
+        elif "wake rejected" in l:
+            rej += 1
+            if "(timeout)" in l:
+                tmo += 1
+        elif "heard:" in l:
+            heard += 1
+        elif "listening ended: no speech" in l:
+            nospeech += 1
+        elif "speech output" in l and ("dropped" in l or "stopped" in l):
+            drops += 1
+        elif "barge-in" in l:
+            barge += 1
+    if not (conf or rej):
+        return
+    avg = sum(lat) / len(lat) if lat else 0
+    print("  %swake word (recent log): %d heard you, %d false alarms filtered, %d timed out; %.1fs to confirm on average%s"
+          % (D, conf, rej, tmo, avg, N))
+    if tmo > max(3, 0.1 * (conf + rej)):
+        warn("the wake check often runs out of time: your CPU is busy when it runs",
+             "project-friday set stt-threads 4, or a lighter recognizer: project-friday set stt-model base.en")
+    if avg > 3.5:
+        warn("confirming 'Hey Friday' is slow (%.1fs)" % avg, "project-friday set stt-model base.en (faster, a bit less accurate)")
+    if drops:
+        warn("Friday's voice output dropped %d times (audio server hiccups); it now reconnects on its own" % drops)
+    if conf and nospeech > conf:
+        warn("it often stops listening before you speak", "project-friday set silence 1.6   (seconds of quiet before it stops)")
+
+
+def check_desktop():
+    section("Desktop")
+    wm = sh([os.path.join(FH, "bin", "friday-wm"), "name"])[1] or "unknown"
+    ok("desktop: " + wm)
+    if wm == "hyprland":
+        code, out = sh(["hyprctl", "binds"])
+        if code == 0 and "friday" not in out.lower():
+            bad("no Friday keybinds in Hyprland", "re-run install.sh (it sources hypr/friday.conf)")
+        elif code == 0:
+            ok("Super+Space is bound")
+    for tool, why in (("playerctl", "media controls"), ("wl-copy" if os.environ.get("WAYLAND_DISPLAY") else "xclip", "clipboard"),
+                      ("mpv", "background music"), ("yt-dlp", "picking music")):
+        if not shutil.which(tool):
+            warn("%s isn't installed (%s)" % (tool, why), "install it with your package manager")
+    try:
+        st = os.statvfs(HOME)
+        free = st.f_bavail * st.f_frsize / 1e9
+        if free < 3:
+            warn("only %.1f GB free on your home disk" % free)
+    except OSError:
+        pass
+
+
+def main():
+    if "--voice" in sys.argv:
+        check_voice()
+    else:
+        check_core()
+        check_brain()
+        check_voice()
+        check_desktop()
+    print()
+    if problems:
+        print("%s%d thing%s to look at.%s Fix the ✗ ones first." % (B, len(problems), "" if len(problems) == 1 else "s", N))
+    else:
+        print("%sAll good.%s" % (G + B, N))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

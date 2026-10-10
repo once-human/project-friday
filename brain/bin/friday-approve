@@ -121,7 +121,7 @@ xxd od strings cd unset read dmesg lsns numfmt expr seq rev fold paste comm join
 fastfetch neofetch grim slurp notify-send playerctl journalctl""".split())
 # Friday's own helpers that are safe to run without asking (anything else in bin/ asks). Matched by real path,
 # so a file that merely has the same name somewhere else is NOT trusted.
-HELPERS_FREE = {"friday-context", "friday-screen", "friday-windows", "friday-open", "friday-remind", "friday-focus",
+HELPERS_FREE = {"friday-doctor", "friday-context", "friday-screen", "friday-windows", "friday-open", "friday-remind", "friday-focus",
                 "friday-music", "friday-sessions", "friday-continue", "friday-voice", "friday-do", "friday-usage",
                 "friday-notify", "friday-profile", "friday-wm", "friday-local", "friday-toggle", "friday-login"}
 HELPERS_ASK = {"friday-integrate": "re-patches illogical-impulse", "friday-phrases": "uses a little Claude usage",
@@ -255,7 +255,9 @@ def policy_segment(toks, followed_by_pipe_from_fetch):
         if prog == "project-friday":
             sub = args[0] if args else "help"
             if sub in ("status", "version", "help", "-h", "--help", "logs", "log", "usage", "music", "play", "open", "show",
-                       "close", "hide") or (sub in ("offline", "backup", "fallback") and args[1:2] in ([], ["status"])):
+                       "close", "hide", "doctor", "check", "diagnose", "say") or \
+                    (sub in ("offline", "backup", "fallback") and args[1:2] in ([], ["status"])) or \
+                    (sub == "voice" and args[1:2] in (["check"], ["stats"])) or (sub == "wake" and len(args) == 1):
                 return redirect_verdict
             if sub in ("get", "settings", "setting") or (sub == "mode" and len(args) == 1) or \
                     (sub in ("offline", "backup", "fallback") and args[1:2] in (["models"], ["test"])):
@@ -271,6 +273,8 @@ def policy_segment(toks, followed_by_pipe_from_fetch):
             if sub == "open" and not re.match(r"^https?://", url):
                 return Q("opens something that isn't a web page: " + url[:100], "medium")
             return redirect_verdict
+        if prog == "friday-wm" and args[:2] == ["window", "close"]:
+            return worst(redirect_verdict, Q("closes the window you're in (unsaved work could be lost)", "low"))
         if prog == "friday-clip":
             return redirect_verdict if (args[:1] in (["get"], ["types"], ["image"]) or not args) else Q("changes your clipboard", "low")
         if prog == "friday-input":

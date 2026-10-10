@@ -1032,6 +1032,8 @@ Singleton {
         function ping(): string { return "pong"; }
         function listen(): void { root.listen(); }
         function toggleWake(): void { root.toggleWake(); }
+        function setWake(on: string): void { if ((on === "on") !== root.wakeEnabled) root.toggleWake(); }
+        function wake(): string { return root.wakeEnabled ? "on" : "off"; }
         function stopSpeaking(): void { root.voiceCmd("stop"); }
         function withSelection(text: string): void { root.withSelection(text); }
         function approval(payload: string): void { root.requestApproval(payload); }

@@ -47,6 +47,9 @@ S = [
     ("stt-device", "FRIDAY_STT_DEVICE", ["auto", "cpu", "cuda"], "auto", "where speech recognition runs", True),
     ("silence", "FRIDAY_SILENCE_END", None, "1.1", "seconds of quiet that end what you're saying", True),
     ("vocab", "FRIDAY_VOCAB", None, "", "names and jargon speech recognition should expect (comma separated)", True),
+    ("wake-sensitivity", "FRIDAY_WAKE_SENSITIVITY", ["normal", "low", "high"], "normal",
+     "how eager \"Hey Friday\" is: low = only clear calls (noisy rooms, videos) · high = also quiet or half-heard ones", True),
+    ("barge-in", "FRIDAY_BARGE_IN", ["on", "off"], "on", "say \"Hey Friday\" while Friday is talking to cut in", True),
     ("stt-threads", "FRIDAY_STT_THREADS", None, "auto", "CPU threads speech recognition may use (auto = half, max 4)", True),
     ("voice-unload", "FRIDAY_VOICE_UNLOAD", None, "5", "minutes before unused speech models leave memory (the wake word keeps "
      "recognition loaded)", True),

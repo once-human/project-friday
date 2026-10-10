@@ -28,6 +28,7 @@ ${B}Run it${N}
   open · close · ask "…"     show/hide the panel · open it and ask something
   update · version           pull the latest and restart · which version you're on
   logs [-f]                  recent voice/shell logs and the guard's last decisions
+  doctor                     check everything (mic muted? signed in? models? keybinds?) and say how to fix it
 
 ${B}Make it yours${N}
   mode [default|local|private]   the big switch:  default: Claude, local model as backup
@@ -48,6 +49,9 @@ ${B}Offline brain${N} (free model on this laptop: works with no internet or Clau
 
 ${B}Voice & music${N}
   voice setup · voice test   install the speech models · check mic and voice
+  voice check                mic, speakers, models, and how the wake word has been doing lately
+  wake on|off                the "Hey Friday" wake word (off = no mic, nothing loaded until you press the talk key)
+  listen · say "…"           start listening now (push-to-talk) · make Friday say something
   music "…"                  play something ("something nice"); stop · next · like · more · taste
 
   usage                      your Claude plan usage
@@ -128,8 +132,18 @@ for l in sys.stdin:
     case "${1:-}" in
       setup|install) exec "$BIN/friday-voice-setup" ;;
       test) exec "$BIN/friday-voice" --test ;;
-      *) die "usage: $ME voice setup | test" ;;
+      check|stats|doctor) exec "$BIN/friday-doctor" --voice ;;
+      *) die "usage: $ME voice setup | test | check" ;;
     esac ;;
+  doctor|check|diagnose) exec "$BIN/friday-doctor" ;;
+  wake)
+    running || die "Friday isn't running ($ME start)"
+    case "${1:-}" in
+      on|off) qs -c friday ipc call friday setWake "$1" >/dev/null 2>&1 && echo "Wake word $1." ;;
+      *) echo "Wake word: $(qs -c friday ipc call friday wake 2>/dev/null || echo unknown)   ($ME wake on|off)" ;;
+    esac ;;
+  listen|talk) running || "$0" start >/dev/null; qs -c friday ipc call friday listen >/dev/null 2>&1 ;;
+  say)       [ $# -gt 0 ] || die "usage: $ME say \"text\""; qs -c friday ipc call friday announce "$*" >/dev/null 2>&1 ;;
   settings|setting) exec "$BIN/friday-settings" list ;;
   set)       [ $# -ge 2 ] || die "usage: $ME set NAME VALUE   (see: $ME settings)"; exec "$BIN/friday-settings" set "$@" ;;
   get)       exec "$BIN/friday-settings" get "$@" ;;
