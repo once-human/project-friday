@@ -2,7 +2,10 @@
 
 | Symptom | Try |
 |---|---|
-| Anything at all | `project-friday status` first, then `project-friday logs`. |
+| Anything at all | `project-friday doctor`: it checks the mic, sign-in, models, keybinds and more, and prints the fix. Then `project-friday logs`. |
+| "Hey Friday" misses me | `project-friday voice check` shows how the wake word has been doing. Mic muted or quiet is the usual cause; then try `project-friday set wake-sensitivity high`. |
+| It wakes up by itself during videos | `project-friday set wake-sensitivity low` (only clear "Hey Friday"s), or turn the wake word off: `project-friday wake off`. |
+| It stops listening while I'm still talking | `project-friday set silence 1.6` (it already waits longer after "and…", "um…"). |
 | Friday is stuck on screen | `project-friday restart`. It also stops a request on its own after 3 minutes of silence. |
 | `project-friday: command not found` | `~/.local/bin` isn't on your PATH: open a new terminal after installing, or run `~/.local/bin/project-friday`. |
 | Nothing happens on Super+Space | `qs -c friday` in a terminal shows QML errors. `hyprctl binds \| grep -i friday` checks the key. |

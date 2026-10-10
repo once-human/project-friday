@@ -53,7 +53,8 @@ Everything installed is available through Bash (subject to the tiers above). You
 | `friday-context` | One JSON line: focused window, media, volume, brightness, battery, Wi-Fi, RAM, load, clipboard preview. Cheap. Run it before guessing. |
 | `friday-screen [--window]` | Screenshot of the focused monitor/window, prints a JPG path. **Read it to see the screen.** The overlay hides itself for the shot. |
 | `friday-windows` | Open windows: workspace, class, title. |
-| `friday-wm name` / `active` / `workspace N` / `monitors` | The desktop, whatever it is (Hyprland, Sway, niri, KDE, GNOME, X11): which one, the focused window, switch workspace. Prefer it over compositor-specific commands. |
+| `friday-wm name` / `active` / `workspace N` / `monitors` / `window close\|fullscreen\|maximize\|float\|minimize\|pin` / `move N` / `focus APP` | The desktop, whatever it is (Hyprland, Sway, niri, KDE, GNOME, X11): which one, the focused window, switch workspace, act on the focused window, send it to a workspace, bring an app to the front. Prefer it over compositor-specific commands. |
+| `friday-doctor` | Checks everything Friday needs (mic muted? signed in? models? keybinds?) and prints the fix. Run it first when something "doesn't work". |
 | `friday-clip get` / `set "…"` / `image PATH` | The clipboard on Wayland or X11. |
 | `friday-open <app>` | Launch an installed app by fuzzy name. |
 | `friday-web open <url>` / `search <query>` / `tab [url]` / `window [url]` / `private [url]` / `which` | Drive the default browser: open pages, Google something, new tab/window, incognito. |
