@@ -57,6 +57,12 @@ DEBUG = os.environ.get("FRIDAY_VOICE_DEBUG", "") == "1"
 # Efficiency: speech models leave memory after this many minutes unused (the wake word keeps Whisper loaded,
 # since it needs it), and transcription uses at most this many CPU threads (leave the rest for you).
 UNLOAD_AFTER = float(os.environ.get("FRIDAY_VOICE_UNLOAD", "5")) * 60
+# How eager the wake word is. low: only a clear "Hey Friday" · normal · high: also quieter / partly-heard ones.
+SENSITIVITY = os.environ.get("FRIDAY_WAKE_SENSITIVITY", "normal")
+# Say "Hey Friday" while Friday is talking to cut in (strict check, so its own voice doesn't trigger it).
+BARGE_IN = os.environ.get("FRIDAY_BARGE_IN", "on") != "off"
+VERIFY_AFTER = 0.6        # keep listening this long after the wake word before checking it (so "…Friday" isn't cut off)
+VERIFY_TIMEOUT = 10.0
 
 
 def _stt_threads():
@@ -73,6 +79,10 @@ WAKE_RE = re.compile(r"\b(hey|hi|okay|ok|hay)\W{0,2}\s*fri\s*-?\s*day\b(?!'?s)",
 # Plain "Friday" counts when you're addressing it: at the start of what you say ("Friday, open Chrome",
 # "Friday?"), not in the middle of a sentence ("see you Friday", "Friday's left" on a video).
 ADDRESS_RE = re.compile(r"(?:^|[.!?…]\s+)\W*fri\s*-?\s*day\b(?!'?s)", re.I)
+TRAILING = {"and", "but", "or", "so", "um", "uh", "umm", "uhh", "hmm", "like", "the", "a", "an", "to", "of", "for",
+            "with", "my", "your", "is", "are", "was", "if", "because", "then", "that", "which", "about", "in", "on",
+            "at", "from", "into", "can", "could", "would", "should", "will", "i", "we", "you", "it's", "it", "also"}
+NEAR_WAKE_RE = re.compile(r"\b(hey|hi|okay|ok|hay)\W{0,2}\s*(fri\w*|fry\w*|fre\w*|phra\w*)", re.I)
 LEADING_WAKE_RE = re.compile(r"^\W*((hey|hi|okay|ok|hay)\W*\s*)?fri\s*-?\s*day\b(?!s)\W*", re.I)
 # Words Whisper should expect from you. Biasing the decoder like this fixes most jargon errors.
 # Add your own names, projects and jargon with FRIDAY_VOCAB in config.env (your name is added automatically).
@@ -570,6 +580,12 @@ class Voice:
         self.last_wake = 0.0
         self.last_check = 0.0
         self.rejects = collections.deque(maxlen=8)    # recent false wakes: a video talking? check less often
+        self.wake_hold_until = 0.0                    # just sent a request: don't mistake its tail for a new wake
+        self.held = []                                # speech that arrived while you were talking: said after
+        self.verify_due = None
+        self.verify_pre = b""
+        self.barge_due = None
+        self.barge_result = None
         self.media_until = 0.0
         self.media_on = False
         self.levels = collections.deque(maxlen=60)    # last ~6 s of idle levels, for the noise floor
@@ -610,8 +626,21 @@ class Voice:
             self.cmds.put(line.rstrip("\n"))
         self.cmds.put("quit")
 
+    def talking(self):
+        """You're mid-request (a confirmed listen, not a silent wake check)."""
+        return self.state == self.LISTEN and not getattr(self, "pending", False)
+
     def handle(self, c):
+        if c.startswith(("say+ ", "say-end", "say ")) and self.state == self.LISTEN:
+            if self.talking():
+                self.held.append(c)              # don't talk over you: this waits until you're done
+                return
+            self.abort_check()                   # an unconfirmed wake check (probably our own echo): drop it
         if c.startswith("listen"):
+            if self.talking():
+                return                           # already listening: never throw away what you're saying
+            if self.state == self.LISTEN:
+                self.abort_check()
             self.stop_speaking()
             self.begin_listen(chime_on=True, followup=c.endswith("followup"))
         elif c in ("cancel", "stop"):
@@ -619,6 +648,7 @@ class Voice:
                 self.state = self.IDLE if self.wake_on else self.MUTED
                 emit("cancel")
                 self.after_listen()
+            self.held = []
             self.stop_speaking()
         elif c == "mute":
             self.stop_speaking()
@@ -654,6 +684,21 @@ class Voice:
             self.mic.stop()
             sys.exit(0)
 
+    def abort_check(self):
+        """Quietly drop an unconfirmed wake check (nothing was shown for it)."""
+        self.listen_id = getattr(self, "listen_id", 0) + 1
+        self.state = self.IDLE if self.wake_on else self.MUTED
+        self.pending = self.quiet = False
+        self.verify_due = None
+        self.reset_partials()
+        self.after_listen()
+
+    def release_held(self, discard):
+        held, self.held = self.held, []
+        if not discard:
+            for c in held:
+                self.cmds.put(c)
+
     # ----- listening
     def begin_listen(self, chime_on, followup=False, pending=False, quiet=False):
         if not self.mic.start():
@@ -669,6 +714,7 @@ class Voice:
         self.quiet = quiet                      # ...and don't even show the panel until it is
         self.listen_id = getattr(self, "listen_id", 0) + 1
         self.verify = None
+        self.verify_due = None
         self.voiced = 0.0
         self.heard_at = None
         self.last_voice = None
@@ -694,6 +740,10 @@ class Voice:
         now = time.time()
         # still confirming the wake word in the background?
         if self.pending:
+            if self.verify is None and self.verify_due is not None and now >= self.verify_due:
+                self.verify_due = None
+                audio = self.verify_pre + bytes(self.utt)
+                threading.Thread(target=self._verify, args=(audio, self.listen_id), daemon=True).start()
             if self.verify is not None:
                 ok, heard = self.verify
                 if ok:
@@ -716,7 +766,7 @@ class Voice:
                     self.reset_partials()
                     self.after_listen()
                     return
-            elif now - self.started > 6:            # verification hung: give up quietly
+            elif now - self.started > VERIFY_TIMEOUT:   # verification hung: give up quietly
                 self.verify = (False, "(timeout)")
         self.utt += chunk
         # Loudness is judged on the raw mic signal: the automatic gain moves around (Friday's own voice
@@ -765,9 +815,13 @@ class Voice:
             play(self.sound_off)
             self.reset_partials()
             self.after_listen()
+            self.release_held(discard=False)      # you didn't say anything after all: finish the old answer
             return
         quiet_for = now - (self.last_voice or now)
-        if (self.heard_at is not None and quiet_for >= SILENCE_END) or now - self.started > MAX_UTTERANCE:
+        # a pause after "and…", "um…", "the…" means you're still thinking, not done: give it longer
+        last = (cur.split() or [""])[-1].lower()
+        need = SILENCE_END + (0.9 if last in TRAILING else 0.0)
+        if (self.heard_at is not None and quiet_for >= need) or now - self.started > MAX_UTTERANCE:
             self.finish()
 
     def reset_partials(self):
@@ -790,6 +844,7 @@ class Voice:
     def finish(self):
         play(self.sound_off)
         emit("transcribing")
+        self.wake_hold_until = time.time() + 1.5
         pcm = bytes(self.utt)
         fallback = self.partial
         self.reset_partials()
@@ -803,6 +858,7 @@ class Voice:
         except Exception as e:
             log("whisper failed:", e)
         text = self.clean(text if text else fallback)
+        self.release_held(discard=bool(text))      # you said something new: the old answer's speech is stale
         if text:
             log("heard: %s" % said(text))
             emit("final", text=text)
@@ -847,8 +903,14 @@ class Voice:
             return
         # Each check runs Whisper, which is the expensive part. When something keeps sounding like "Friday"
         # (a video, a call, music), only clear "hey Friday"s are checked, and less often.
+        if now < self.wake_hold_until:
+            self.wake_rec.Reset()
+            return
         recent = [t for t in self.rejects if now - t < 90]
-        if (len(recent) >= 2 or self.media_playing(now)) and not strong:
+        if SENSITIVITY == "low" and not strong:
+            self.wake_rec.Reset()
+            return
+        if (len(recent) >= (4 if SENSITIVITY == "high" else 2) or self.media_playing(now)) and not strong:
             self.wake_rec.Reset()
             return
         if len(recent) >= 4 and now - self.last_check < 4.0:
@@ -857,7 +919,7 @@ class Voice:
         self.last_check = now
         if self.e.whisper is None:
             return                                  # still warming up: never wake on a guess
-        ring = b"".join(list(self.ring)[-20:])
+        pre = b"".join(list(self.ring)[-20:])
         # Every candidate is checked by Whisper *before* anything shows: no panel, no chime, until it's
         # confirmed it was really you calling Friday. (Showing first and hiding on a miss made the panel
         # flash on videos and random talk.) Audio keeps buffering meanwhile, so "Friday, open Chrome" in
@@ -865,7 +927,48 @@ class Voice:
         self.cand_peak = max(list(self.raw_ring)[-15:] or [raw])
         debug("candidate: strong=%s level %.4f noise %.4f -> checking" % (strong, self.cand_peak, self.noise))
         self.begin_listen(chime_on=True, pending=True, quiet=True)
-        threading.Thread(target=self._verify, args=(ring,), daemon=True).start()
+        # check a moment later, with the audio after the word too: a "Hey Fri-" cut short was the main reason
+        # real wakes were heard as just "Hey."
+        self.verify_pre = pre
+        self.verify_due = now + VERIFY_AFTER
+
+    def on_speak_chunk(self, chunk):
+        """While Friday talks: a strict "Hey Friday" (checked by Whisper) stops it and listens to you."""
+        now = time.time()
+        self.ring.append(chunk)
+        if self.barge_result is not None:
+            ok, heard = self.barge_result
+            self.barge_result = None
+            if ok:
+                log("barge-in: %s" % said(heard))
+                self.stop_speaking()
+                self.held = []
+                self.begin_listen(chime_on=True)
+                self.last_wake = now
+            return
+        if self.barge_due is not None:
+            if now >= self.barge_due:
+                self.barge_due = None
+                audio = b"".join(list(self.ring)[-26:])
+                threading.Thread(target=self._barge_verify, args=(audio,), daemon=True).start()
+            return
+        if self.wake_rec is None:
+            self.wake_rec = self.new_wake_rec()
+        if self.wake_rec.AcceptWaveform(bytes(chunk)):
+            txt = json.loads(self.wake_rec.Result()).get("text", "")
+        else:
+            txt = json.loads(self.wake_rec.PartialResult()).get("partial", "")
+        if any(ph in txt for ph in WAKE_PHRASES[:3]) and now - self.last_check > 2.0:   # "hey/okay/hi friday" only
+            self.wake_rec.Reset()
+            self.last_check = now
+            self.barge_due = now + VERIFY_AFTER
+
+    def _barge_verify(self, audio):
+        try:
+            heard = self.e.transcribe(audio, quick=True) or ""
+        except Exception:
+            heard = ""
+        self.barge_result = (bool(WAKE_RE.search(heard)), heard)
 
     def media_playing(self, now):
         """Is something playing right now (video, music)? Asked at most every 10 s."""
@@ -878,12 +981,16 @@ class Voice:
                 self.media_on = False
         return self.media_on
 
-    def _verify(self, ring):
+    def _verify(self, audio, lid):
         try:
-            heard = self.e.transcribe(ring, quick=True) or ""
+            heard = self.e.transcribe(audio, quick=True) or ""
         except Exception as e:
             heard = "(error %s)" % e
-        self.verify = (bool(WAKE_RE.search(heard) or ADDRESS_RE.search(heard.strip())), heard)
+        ok = bool(WAKE_RE.search(heard) or ADDRESS_RE.search(heard.strip()))
+        if not ok and SENSITIVITY == "high" and NEAR_WAKE_RE.search(heard):
+            ok = True                              # "Hey, Fri…", "hey Freddy": close enough when you asked for eager
+        if lid == self.listen_id:                  # a late answer about an older check must not decide this one
+            self.verify = (ok, heard)
 
     # ----- speaking: a stream of sentences, spoken as they arrive (Friday starts talking while it's still thinking)
     _END = object()
@@ -941,11 +1048,11 @@ class Voice:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=None)   # errors -> voice.log
         log("speaking via %s" % cmd[0])
         self.speak_proc = p
-        prev = self.state
         if self.state != self.LISTEN:
             self.state = self.SPEAK
         emit("speaking", on=True)
         idx, written, t0, waited = 0, 0, None, 0.0
+        restarts = 0
         timers = []
         import concurrent.futures
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)   # the next sentence is ready before this one ends
@@ -995,8 +1102,19 @@ class Voice:
                     for k in range(0, len(audio), step):
                         if stop.is_set():
                             break
-                        p.stdin.write(audio[k:k + step])
-                        p.stdin.flush()
+                        try:
+                            p.stdin.write(audio[k:k + step])
+                            p.stdin.flush()
+                        except (BrokenPipeError, OSError) as e:
+                            if stop.is_set() or restarts >= 2:
+                                raise
+                            # the audio server dropped us (PipeWire restarting, a device switch): reconnect and carry on
+                            restarts += 1
+                            log("speech output dropped (%s); reconnecting" % e)
+                            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=None)
+                            self.speak_proc = p
+                            p.stdin.write(audio[k:k + step])
+                            p.stdin.flush()
                         self.speak_beat = time.time()
                     written += len(audio) // 2
             p.stdin.close()
@@ -1016,10 +1134,13 @@ class Voice:
                 p.terminate()
             if self.speaker is me:      # an abandoned thread must not reset the new one's state
                 if self.state == self.SPEAK:
-                    self.state = prev if prev != self.SPEAK else (self.IDLE if self.wake_on else self.MUTED)
+                    self.state = self.IDLE if self.wake_on else self.MUTED
                 self.mic.drain()                    # don't hear ourselves
                 self.ring.clear()
                 self.raw_ring.clear()
+                self.barge_due = self.barge_result = None
+                if self.wake_rec is not None:
+                    self.wake_rec.Reset()
                 emit("speaking", on=False)
 
     def stop_speaking(self):
@@ -1065,7 +1186,9 @@ class Voice:
             if chunk is None:
                 continue
             if self.state == self.SPEAK:
-                continue                    # drop audio so Friday doesn't wake itself (or turn its gain down)
+                if BARGE_IN and self.wake_on and self.e.whisper is not None:
+                    self.on_speak_chunk(chunk)      # only a clear "Hey Friday" from you can cut in
+                continue                    # otherwise drop audio so Friday doesn't wake itself
             raw = rms(chunk)
             # the start of a listen is mostly our own chime: don't let it teach the gain control
             chunk = self.agc(chunk, learn=not (self.state == self.LISTEN and time.time() - self.started < 0.3))
