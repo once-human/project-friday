@@ -7,6 +7,9 @@
   friday-wm workspace N             switch to workspace N
   friday-wm monitors                outputs as JSON (logical geometry, scale, focused)
   friday-wm cursor X Y              move the pointer to global layout coordinates
+  friday-wm window ACTION           the focused window: close | fullscreen | maximize | float | minimize | pin
+  friday-wm move N                  send the focused window to workspace N
+  friday-wm focus NAME              bring an open app to the front (matched by class/title); exit 1 if none
   friday-wm shot PATH [--window]    screenshot the focused monitor (or window) into PATH; prints the mapping JSON
 
 Best support: Hyprland, then Sway / niri / other wlroots compositors, then KDE Plasma, X11 desktops, and GNOME.
@@ -155,6 +158,68 @@ def workspace(n):
     return False
 
 
+def window(action):
+    """Act on the focused window. Returns True if the desktop did it."""
+    wm = name()
+    if wm == "hyprland":
+        cmd = {"close": ["killactive"], "fullscreen": ["fullscreen", "0"], "maximize": ["fullscreen", "1"],
+               "float": ["togglefloating"], "pin": ["pin"],
+               "minimize": ["movetoworkspacesilent", "special:minimized"]}.get(action)
+        return bool(cmd) and sh(["hyprctl", "dispatch"] + cmd)[0] == 0
+    if wm == "sway":
+        cmd = {"close": "kill", "fullscreen": "fullscreen toggle", "maximize": "fullscreen toggle",
+               "float": "floating toggle", "pin": "sticky toggle", "minimize": "move scratchpad"}.get(action)
+        return bool(cmd) and sh(["swaymsg", cmd])[0] == 0
+    if wm == "niri":
+        cmd = {"close": "close-window", "fullscreen": "fullscreen-window", "maximize": "maximize-column",
+               "float": "toggle-window-floating"}.get(action)
+        return bool(cmd) and sh(["niri", "msg", "action", cmd])[0] == 0
+    if E.get("DISPLAY") and wm in ("x11",):
+        if action == "close" and have("xdotool"):
+            return sh(["xdotool", "getactivewindow", "windowclose"])[0] == 0 or \
+                sh(["xdotool", "getactivewindow", "windowkill"])[0] == 0
+        if action == "minimize" and have("xdotool"):
+            return sh(["xdotool", "getactivewindow", "windowminimize"])[0] == 0
+        if have("wmctrl"):
+            b = {"fullscreen": "toggle,fullscreen", "maximize": "toggle,maximized_vert,maximized_horz",
+                 "pin": "toggle,above"}.get(action)
+            return bool(b) and sh(["wmctrl", "-r", ":ACTIVE:", "-b", b])[0] == 0
+    return False
+
+
+def move_to(n):
+    wm = name()
+    if wm == "hyprland":
+        return sh(["hyprctl", "dispatch", "movetoworkspace", str(n)])[0] == 0
+    if wm == "sway":
+        return sh(["swaymsg", "move container to workspace number %s; workspace number %s" % (n, n)])[0] == 0
+    if wm == "niri":
+        return sh(["niri", "msg", "action", "move-window-to-workspace", str(n)])[0] == 0
+    if E.get("DISPLAY") and wm == "x11" and have("wmctrl"):
+        return sh(["wmctrl", "-r", ":ACTIVE:", "-t", str(int(n) - 1)])[0] == 0
+    return False
+
+
+def focus(q):
+    """Bring an open window to the front by app name (class first, then title)."""
+    q = q.lower().strip()
+    wm = name()
+    if wm == "hyprland":
+        cl = js(["hyprctl", "clients", "-j"]) or []
+        hit = next((c for c in cl if q in (c.get("class") or "").lower()), None) or \
+            next((c for c in cl if q in (c.get("title") or "").lower()), None)
+        return bool(hit) and sh(["hyprctl", "dispatch", "focuswindow", "address:" + hit["address"]])[0] == 0
+    if wm == "sway":
+        tree = js(["swaymsg", "-t", "get_tree"]) or {}
+        for n, _ws in sway_walk(tree):
+            if q in sway_cls(n).lower() or q in (n.get("name") or "").lower():
+                return sh(["swaymsg", "[con_id=%d] focus" % n["id"]])[0] == 0
+        return False
+    if E.get("DISPLAY") and have("wmctrl"):
+        return sh(["wmctrl", "-a", q])[0] == 0
+    return False
+
+
 def monitors():
     wm = name()
     out = []
@@ -272,6 +337,12 @@ def main():
         sys.exit(0 if workspace(a[1]) else 1)
     elif cmd == "monitors":
         print(json.dumps(monitors()))
+    elif cmd == "window" and len(a) > 1:
+        sys.exit(0 if window(a[1]) else 1)
+    elif cmd == "move" and len(a) > 1:
+        sys.exit(0 if move_to(a[1]) else 1)
+    elif cmd == "focus" and len(a) > 1:
+        sys.exit(0 if focus(" ".join(a[1:])) else 1)
     elif cmd == "cursor" and len(a) > 2:
         sys.exit(0 if cursor(int(float(a[1])), int(float(a[2]))) else 1)
     elif cmd == "shot" and len(a) > 1:

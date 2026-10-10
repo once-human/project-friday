@@ -177,6 +177,19 @@ P = {
     "time": ["It's {time}.", "{time} right now.", "It's {time}, {part}.", "Right now it's {time}."],
     "time_late": ["It's {time}. Bit late, no?", "{time}. Shouldn't you be asleep?", "It's {time}. Night owl mode, I see."],
     "date": ["It's {weekday}, {date}.", "Today's {weekday}, {date}.", "{weekday}, {date}."],
+    "date_rel": ["{when_cap} is {weekday}, {date}.", "That's {weekday}, {date}."],
+    "win_close": ["Closed it.", "Done, it's closed."],
+    "win_full": ["Fullscreen.", "Done."],
+    "win_max": ["Maximized.", "Done, it's maximized."],
+    "win_float": ["Toggled floating.", "Done."],
+    "win_min": ["Tucked it away.", "Minimized."],
+    "win_pin": ["Pinned it on top.", "Done, it stays on top."],
+    "win_move": ["Moved it to workspace {n}.", "Sent it to workspace {n}."],
+    "win_focus": ["Here's {app}.", "Switched to {app}."],
+    "ip": ["Your local IP is {local}{public}.", "You're {local} on this network{public}."],
+    "currency": ["{amount} {src} is about {result} {dst}.", "That's roughly {result} {dst}."],
+    "alarm": ["Alarm set for {when}.", "Okay, I'll wake you {when}.", "Done, alarm {when}."],
+    "weather_tmrw": ["Tomorrow in {place}: {desc}, {lo} to {hi} degrees{rain}.", "Tomorrow looks {desc} in {place}, between {lo} and {hi} degrees{rain}."],
     "time_city": ["It's {time} in {city}.", "In {city} it's {time} right now.", "{city}: {time}, {cityday}."],
     "greet": ["Hey {name}. What's up?", "Hey! What do you need?", "Hi. What can I do for you?", "Yo. What's the plan?"],
     "greet_tod": ["Good {part}, {name}. What's on your mind?", "Good {part}! What are we doing?"],
@@ -493,6 +506,22 @@ CITIES = {
 
 
 def k_date(t):
+    m = re.fullmatch(r"(what('s| is) )?(the )?(date|day)( is it)? (tomorrow|yesterday|the day after tomorrow|in (\w+) days?)|"
+                     r"what (date|day) (is it|is|was|will it be) (tomorrow|yesterday|the day after tomorrow|in (\w+) days?)|"
+                     r"(tomorrow|yesterday)('s date| is what day)", t)
+    if m:
+        rel = m.group(6) or m.group(10) or m.group(12) or ""
+        if rel.startswith("in "):
+            n = num(m.group(7) or m.group(11) or "")
+            if not n or n > 3650:
+                return None
+            d, when = now() + dt.timedelta(days=int(n)), "in %d days" % int(n)
+        else:
+            off = {"tomorrow": 1, "yesterday": -1, "the day after tomorrow": 2}[rel]
+            d, when = now() + dt.timedelta(days=off), rel
+        txt = say("date_rel", when_cap=when[:1].upper() + when[1:], weekday=d.strftime("%A"),
+                  date="%s %d" % (d.strftime("%B"), d.day))
+        return reply("date", txt.replace("Yesterday is", "Yesterday was") if rel == "yesterday" else txt)
     if re.fullmatch(r"(what('s| is) )?(the |today's )?(date|day)( today| is it( today)?)?|what day is (it|today)|"
                     r"what('s| is) today('s date)?|today's date|which day is (it|today)|what date is it( today)?", t):
         n = now()
@@ -720,6 +749,10 @@ def k_open(t):
     if m.group(1) not in ("open", "launch") and (len(what.split()) > 1 or re.fullmatch(
             r"build|server|tests?|project|recording|download|update|install|backup|sync|game|deploy|dev|app|it|over", what)):
         return None          # "start the build": a task, not an app
+    if what in ("files", "file manager", "my files", "home folder", "downloads", "documents", "pictures"):
+        folder = {"downloads": "Downloads", "documents": "Documents", "pictures": "Pictures"}.get(what, "")
+        spawn(["xdg-open", os.path.join(HOME, folder)])
+        return reply("open", say("open", app=what.title() if what != "files" else "Files"))
     if " and " in what or len(what.split()) > 3 or re.match(r"(my |the )?(last|latest|recent|project|file|folder|repo|chat|session)", what):
         return None          # "open chrome and search…", "open my last project": Claude's job
     if what.startswith(("workspace", "focus", "pomodoro", "a timer", "timer")):
@@ -781,6 +814,35 @@ def k_timer(t):
     return reply("timer", say("timer", dur=human_duration(sec)))
 
 
+def k_alarm(t):
+    m = re.fullmatch(r"(set |make |create )?(an |my )?alarm (for |at )?(.+?)( please)?|wake me( up)? (at |in )(.+?)( please)?", t)
+    if not m:
+        return None
+    when = (m.group(4) or ((m.group(8) if m.group(7) == "at " else "in " + m.group(8)))).strip()
+    when = re.sub(r"^(at|for) ", "", when)
+    if re.match(r"in ", when):
+        sec = parse_duration(when[3:])
+        target = now() + dt.timedelta(seconds=sec) if sec else None
+    else:
+        day = "tomorrow" if "tomorrow" in when else ""
+        h = re.match(r"(\d{1,2})", when)
+        if h and int(h.group(1)) < 12 and not re.search(r"am|pm|a\.m|p\.m|evening|night|tonight", when):
+            when += " am"                          # an alarm at "6:30" means the morning
+        target = parse_clock(re.sub(r"\b(tomorrow|today|in the morning)\b", "", when).strip()
+                             + (" am" if "morning" in when and not re.search(r"am|pm", when) else ""))
+        if target and (day or target <= now()):
+            if target.date() == now().date() and (day or target <= now()):
+                target += dt.timedelta(days=1)
+    if not target:
+        return None
+    secs = int((target - now()).total_seconds())
+    spec = ["%ds" % secs] if secs < 6 * 3600 else [target.strftime("%Y-%m-%d %H:%M")]
+    if secs < 5 or not remind(spec, "Alarm"):
+        return None
+    w = when_words(target)
+    return reply("alarm", say("alarm", when=w))
+
+
 def k_remind(t):
     m = re.fullmatch(r"remind me (to |about |that )?(.+)", t)
     if not m:
@@ -837,7 +899,7 @@ def load_reminders():
 
 
 def k_reminders(t):
-    if re.fullmatch(r"(what are |show |list |tell me )?(my |all |any )?(reminders|timers|alarms)( do i have)?( set| running)?|"
+    if re.fullmatch(r"(what are |show( me)? |list |tell me )?(my |all |any )?(reminders|timers|alarms)( do i have)?( set| running)?|"
                     r"do i have any (reminders|timers)|what('s| is) (coming up|scheduled)", t):
         items = sorted(load_reminders(), key=lambda r: r["at"])
         if not items:
@@ -918,7 +980,18 @@ def ssid():
 
 
 def k_network(t):
-    if re.fullmatch(r"(am i|are we|is (the )?(internet|wifi|wi-fi)) (online|connected|working|up)( to (the )?internet)?|"
+    if re.fullmatch(r"(what('s| is) )?(my |the )?(local |public )?ip( address)?|what ip am i on", t):
+        code, out = run(["ip", "-4", "-o", "addr", "show", "scope", "global"])
+        local = (re.findall(r"inet (\d+\.\d+\.\d+\.\d+)", out or "") or ["unknown"])[0]
+        public = ""
+        if online():
+            try:
+                req = urllib.request.Request("https://ifconfig.me/ip", headers={"User-Agent": "curl/8"})
+                public = ", and the internet sees you as %s" % urllib.request.urlopen(req, timeout=3).read().decode().strip()
+            except Exception:
+                pass
+        return reply("network", say("ip", local=local, public=public))
+    if re.fullmatch(r"(am i|are we|is (the )?(internet|wifi|wi-fi)) (online|connected|working|up)( to (the )?(internet|wifi|wi-fi|network))?|am i connected|"
                     r"(do i|do we) have (internet|wifi|wi-fi)|is the internet working|internet status|wi-?fi status", t):
         if online():
             s = ssid()
@@ -1007,6 +1080,85 @@ def k_desktop(t):
             return None
         code, _ = run([os.path.join(BIN, "friday-wm"), "workspace", str(int(n))])
         return reply("workspace", say("workspace", n=int(n))) if code == 0 else None
+
+
+def k_window(t):
+    wm = os.path.join(BIN, "friday-wm")
+    acts = [(r"close (this|the|that|my|current)?\s*(window|app)|close it|kill (this|the) (window|app)", "close", "win_close"),
+            (r"(make (it|this|the window) |go |toggle )?full ?screen( (it|this|the window))?|exit full ?screen", "fullscreen", "win_full"),
+            (r"maximi[sz]e( (it|this|the window))?", "maximize", "win_max"),
+            (r"minimi[sz]e( (it|this|the window))?|hide (this|the) window", "minimize", "win_min"),
+            (r"(make (it|this|the window) )?float(ing)?( (it|this|the window))?|toggle float(ing)?", "float", "win_float"),
+            (r"pin (it|this|the window)( on top)?|keep (it|this) on top", "pin", "win_pin")]
+    for pat, act, phrase in acts:
+        if re.fullmatch(pat, t):
+            code, _ = run([wm, "window", act])
+            return reply("window", say(phrase)) if code == 0 else None
+    m = re.fullmatch(r"(move|send|throw) (it|this|this window|the window|that) to (workspace )?(\d{1,2}|[a-z]+)", t)
+    if m:
+        n = num(m.group(4))
+        if not n or not 1 <= n <= 20:
+            return None
+        code, _ = run([wm, "move", str(int(n))])
+        return reply("window", say("win_move", n=int(n))) if code == 0 else None
+    m = re.fullmatch(r"(switch|go|jump|take me) (back )?to (my )?(.+?)( window| app)?|(focus|show me) (my )?(.+?)( window| app)?", t)
+    if m:
+        app = (m.group(4) or m.group(8) or "").strip()
+        if not app or app.startswith("workspace") or len(app.split()) > 2:
+            return None
+        code, _ = run([wm, "focus", APP_ALIAS.get(app, app)])
+        if code != 0 and APP_ALIAS.get(app, app) != app:
+            code, _ = run([wm, "focus", app])
+        return reply("window", say("win_focus", app=app.title())) if code == 0 else None
+
+
+# -- currency (live rates, cached for a day; needs internet the first time)
+CURRENCY = {"dollar": "USD", "dollars": "USD", "usd": "USD", "buck": "USD", "bucks": "USD", "rupee": "INR", "rupees": "INR",
+            "inr": "INR", "rs": "INR", "euro": "EUR", "euros": "EUR", "eur": "EUR", "pound": "GBP", "pounds": "GBP",
+            "gbp": "GBP", "yen": "JPY", "jpy": "JPY", "dirham": "AED", "dirhams": "AED", "aed": "AED", "yuan": "CNY",
+            "cny": "CNY", "cad": "CAD", "aud": "AUD", "sgd": "SGD", "chf": "CHF", "won": "KRW", "krw": "KRW"}
+
+
+def rates(base):
+    cache = os.path.join(STATE, "rates-%s.json" % base)
+    try:
+        with open(cache) as f:
+            j = json.load(f)
+        if time.time() - j.get("_t", 0) < 86400:
+            return j
+    except Exception:
+        j = None
+    if not online():
+        return j                              # yesterday's rates beat none
+    try:
+        req = urllib.request.Request("https://open.er-api.com/v6/latest/" + base, headers={"User-Agent": "friday"})
+        r = json.loads(urllib.request.urlopen(req, timeout=5).read().decode())
+        if r.get("result") == "success":
+            out = dict(r["rates"], _t=time.time())
+            os.makedirs(STATE, exist_ok=True)
+            with open(cache, "w") as f:
+                json.dump(out, f)
+            return out
+    except Exception:
+        pass
+    return j
+
+
+def k_currency(t):
+    names = "|".join(sorted(CURRENCY, key=len, reverse=True))
+    m = re.fullmatch(r"(convert |how much is |what('s| is) )?([\d.,]+) ?(" + names + r") (in|to|into) (" + names + r")( please)?", t)
+    if not m:
+        return None
+    try:
+        amount = float(m.group(3).replace(",", ""))
+    except ValueError:
+        return None
+    src, dst = CURRENCY[m.group(4)], CURRENCY[m.group(6)]
+    r = rates(src)
+    if not r or dst not in r:
+        return reply("need_online", say("need_online")) if not online() else None
+    val = amount * float(r[dst])
+    return reply("convert", say("currency", amount=fmt_num(amount), src=src, result=fmt_num(round(val, 2)), dst=dst))
 
 
 # -- maths
@@ -1153,8 +1305,7 @@ def k_weather(t):
                      r"(do i need|should i (take|carry)) an umbrella( today)?|how (hot|cold) is it( outside)?( in ([a-z .'-]+))?", t)
     if not m:
         return None
-    if "tomorrow" in t:
-        return None                       # forecasts beyond today: Claude handles nuance
+    tomorrow = "tomorrow" in t
     if not online():
         return reply("need_online", say("need_online"))
     place = (m.group(8) or m.group(14) or m.group(21) or "").strip()
@@ -1168,6 +1319,18 @@ def k_weather(t):
         rain = max(int(h.get("chanceofrain", 0)) for h in day.get("hourly", [])) if day.get("hourly") else 0
     except Exception:
         return None                       # couldn't fetch: Claude (with web search) can try
+    if tomorrow:
+        try:
+            d2 = j["weather"][1]
+            hourly = d2.get("hourly", [])
+            rain2 = max(int(h.get("chanceofrain", 0)) for h in hourly) if hourly else 0
+            desc2 = (hourly[4] if len(hourly) > 4 else hourly[0])["weatherDesc"][0]["value"].lower().strip()
+        except Exception:
+            return None
+        if re.search(r"rain|umbrella", t):
+            return reply("weather", say("rain_yes" if rain2 >= 45 else "rain_no", pct=rain2, place=name).replace("today", "tomorrow"))
+        return reply("weather", say("weather_tmrw", place=name, desc=desc2, lo=d2["mintempC"], hi=d2["maxtempC"],
+                                    rain=(", %d percent chance of rain" % rain2) if rain2 >= 40 else ""))
     if re.search(r"rain|umbrella", t):
         return reply("weather", say("rain_yes" if rain >= 45 else "rain_no", pct=rain, place=name))
     desc = cur["weatherDesc"][0]["value"].lower().strip()
@@ -1179,7 +1342,9 @@ def k_weather(t):
 def k_usage(t):
     if not re.fullmatch(r"(how much )?(claude )?(usage|limit|quota)( (do i have )?(left|remaining))?|how much (claude|usage) (do i have )?(left|remaining)?|"
                         r"(what('s| is) my |check my )(claude )?(usage|limit|quota)|how much claude( is)?( left| remaining)?( do i have)?|"
-                        r"how much of (my )?claude( have i used| is left)?", t):
+                        r"how much of (my )?claude( have i used| is left)?|"
+                        r"(how much time|how long) (till|until|before) (my )?(claude )?(usage|limits?|session)( limits?)? (resets?|is back|comes back|back)|"
+                        r"when (does|will) (my )?(claude )?(usage|limits?|session)( limits?)? reset", t):
         return None
     try:
         with open(os.path.join(RUNTIME, "usage.json")) as f:
@@ -1195,8 +1360,9 @@ def k_usage(t):
     return reply("usage", say("usage", five=int(round(five["pct"])), week=int(round(week.get("pct", 0))), reset=reset))
 
 
-SKILLS = [k_smalltalk, k_time, k_date, k_timer, k_remind, k_reminders, k_focus, k_volume, k_brightness, k_media,
-          k_desktop, k_search, k_open, k_battery, k_network, k_system, k_usage, k_weather, k_random, k_convert, k_calc]
+SKILLS = [k_smalltalk, k_time, k_date, k_timer, k_alarm, k_remind, k_reminders, k_focus, k_volume, k_brightness, k_media,
+          k_desktop, k_window, k_search, k_open, k_battery, k_network, k_system, k_usage, k_weather, k_random,
+          k_currency, k_convert, k_calc]
 
 
 def main():
