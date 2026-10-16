@@ -3,11 +3,14 @@
 q="$*"; [ -z "$q" ] && { echo "usage: friday-open <app name>"; exit 2; }
 dirs=("$HOME/.local/share/applications" /usr/share/applications /var/lib/flatpak/exports/share/applications "$HOME/.local/share/flatpak/exports/share/applications")
 # match the name literally (your words are never treated as a pattern or an option)
+# an exact name wins ("whatsapp" opens WhatsApp, not WhatsApp Business), then any name containing it
 f=""
-for d in "${dirs[@]}"; do
-  for df in "$d"/*.desktop; do
-    [ -f "$df" ] || continue
-    if grep -i -m1 -E '^Name(\[[^]]*\])?=' "$df" | cut -d= -f2- | grep -qiF -- "$q"; then f="$df"; break 2; fi
+for how in -qixF -qiF; do
+  for d in "${dirs[@]}"; do
+    for df in "$d"/*.desktop; do
+      [ -f "$df" ] || continue
+      if grep -i -m1 -E '^Name(\[[^]]*\])?=' "$df" | cut -d= -f2- | grep "$how" -- "$q"; then f="$df"; break 3; fi
+    done
   done
 done
 [ -z "$f" ] && f="$(ls -1 "${dirs[@]}" 2>/dev/null | grep '\.desktop$' | grep -iF -- "$q" | head -1)"
