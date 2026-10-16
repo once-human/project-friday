@@ -737,7 +737,7 @@ SITES = {
     "spotify web": "https://open.spotify.com", "hacker news": "https://news.ycombinator.com", "wikipedia": "https://wikipedia.org",
     "stack overflow": "https://stackoverflow.com", "vercel": "https://vercel.com", "figma": "https://figma.com",
 }
-APP_ALIAS = {"whatsapp": "whatsie", "browser": "chrome", "terminal": "kitty", "files": "files", "file manager": "files",
+APP_ALIAS = {"whatsapp": "whatsapp", "browser": "chrome", "terminal": "kitty", "files": "files", "file manager": "files",
              "music": "spotify", "code": "code", "vs code": "code", "vscode": "code", "settings": "settings"}
 
 
